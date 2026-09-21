@@ -1,0 +1,114 @@
+"""只读 /proc 查询：进程代际、祖先链与打开的文件，用于端点发现和报告归属。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import os
+from pathlib import Path
+
+DEFAULT_PROC = Path("/proc")
+_MAX_ANCESTRY = 64
+# 识别启动模式用的有界读取：只比较已知选项与子命令名，不保存也不输出（DESIGN §45.33.2）。
+# 窗口要够宽：`codex -c a=1 … -c a=16 exec` 这类长选项串若把子命令挤出窗口，就会把非交互进程当成可投递目标。
+_MAX_ARGV_BYTES = 16384
+_MAX_ARGV_TOKENS = 64
+_MAX_ARGV_TOKEN_BYTES = 256
+
+
+@dataclass(frozen=True)
+class ProcessInfo:
+    """一个进程的最小身份：PID 加启动时刻（clock ticks）才能排除 PID 复用。"""
+
+    pid: int
+    ppid: int
+    comm: str
+    start_ticks: str
+    tty_nr: int = 0  # 控制终端设备号，0 表示没有控制终端
+
+
+def read_process(pid: int, proc_root: Path = DEFAULT_PROC) -> ProcessInfo | None:
+    """读取进程身份；进程不存在或格式异常时返回 None。"""
+    try:
+        raw = (proc_root / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    open_at = raw.find("(")
+    close_at = raw.rfind(")")
+    if open_at < 0 or close_at < open_at:
+        return None
+    # comm 可含空格和括号，只能以最后一个右括号切分
+    fields = raw[close_at + 2 :].split()
+    if len(fields) < 20:
+        return None
+    try:
+        ppid = int(fields[1])
+    except ValueError:
+        return None
+    try:
+        tty_nr = int(fields[4])
+    except ValueError:
+        tty_nr = 0
+    return ProcessInfo(
+        pid=pid, ppid=ppid, comm=raw[open_at + 1 : close_at], start_ticks=fields[19], tty_nr=tty_nr
+    )
+
+
+def ancestry(pid: int, proc_root: Path = DEFAULT_PROC) -> list[ProcessInfo]:
+    """返回从自身到 init 的祖先链（自身在前），有长度上限防环。"""
+    chain: list[ProcessInfo] = []
+    seen: set[int] = set()
+    current = pid
+    while current > 0 and current not in seen and len(chain) < _MAX_ANCESTRY:
+        seen.add(current)
+        info = read_process(current, proc_root)
+        if info is None:
+            break
+        chain.append(info)
+        current = info.ppid
+    return chain
+
+
+def list_pids(proc_root: Path = DEFAULT_PROC) -> list[int]:
+    """列出当前可见进程 PID。"""
+    try:
+        names = os.listdir(proc_root)
+    except OSError:
+        return []
+    return sorted(int(name) for name in names if name.isdigit())
+
+
+def open_file_targets(pid: int, proc_root: Path = DEFAULT_PROC) -> list[str]:
+    """列出进程打开的文件路径（只读 fd 链接，不读取文件内容）。"""
+    fd_dir = proc_root / str(pid) / "fd"
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        return []
+    targets: list[str] = []
+    for name in names:
+        try:
+            targets.append(os.readlink(fd_dir / name))
+        except OSError:
+            continue
+    return targets
+
+
+def launch_tokens(pid: int, proc_root: Path = DEFAULT_PROC) -> list[str]:
+    """取 argv[1:] 的前若干个 token 用于识别启动模式；数量与长度都有上限，只在内存里比较。
+
+    其中可能含 prompt 与配置取值，调用方只拿它和已知选项、子命令名比对，不保存也不输出（DESIGN §45.33.2）。
+    """
+    try:
+        # 有界读取：cmdline 可以很长，不整份读进内存再截断
+        with (proc_root / str(pid) / "cmdline").open("rb") as stream:
+            raw = stream.read(_MAX_ARGV_BYTES)
+    except OSError:
+        return []
+    parts = raw.split(b"\0")[1 : _MAX_ARGV_TOKENS + 1]
+    return [item[:_MAX_ARGV_TOKEN_BYTES].decode("utf-8", errors="replace") for item in parts if item]
+
+
+def is_same_generation(pid: int, start_ticks: str, proc_root: Path = DEFAULT_PROC) -> bool:
+    """判断 PID 是否仍是记录时的同一进程。"""
+    info = read_process(pid, proc_root)
+    return info is not None and info.start_ticks == start_ticks

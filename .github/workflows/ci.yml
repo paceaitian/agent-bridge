@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # 只用标准库：不装任何依赖，这本身就是「独立可跑」的门禁
+      - name: unittest
+        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -t tests -v
+      - name: import manifest matches the imported files
+        run: python3 scripts/check-import-manifest.py

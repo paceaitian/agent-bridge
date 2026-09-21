@@ -1,0 +1,349 @@
+"""agent 汇报处理：归属核验、状态推进，以及复核流程与发起方通知的后续消息。
+
+归属规则（DESIGN §45.5）：调用者所在的 agent 会话必须就是该尝试的接收会话，同一会话有多个
+存活进程时还须是实际投递到的那个进程；有 agent 迹象却对不上任何端点的一律拒绝；用户终端需
+显式 `--manual` 代为补记。只推进当前尝试，陈旧尝试、已交结果后的重复结果都拒绝。
+
+原子性：文件 hash 与提交校验在事务外完成；随后在一个事务内重新校验并写入汇报、复核结论与
+后续请求。中断或并发重复时整体回滚或被拒，不会出现“结果已交但复核请求缺失”。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+import hashlib
+from pathlib import Path
+import re
+import subprocess
+
+from . import procfs
+from .ids import short
+from .endpoints import Caller
+from .model import (
+    Attempt,
+    Delivery,
+    Flow,
+    ReportKind,
+    Role,
+    Task,
+    Verdict,
+    Work,
+    work_attempts,
+)
+from .store import MAX_BODY_BYTES, Store, StoreError
+
+MAX_NOTE_CHARS = 4000
+MAX_FILES = 16
+MAX_HASH_BYTES = 256 * 1024 * 1024
+_COMMIT = re.compile(r"[0-9a-fA-F]{7,64}")
+_UNSENT = (Delivery.PENDING, Delivery.SENDING, Delivery.CANCELLED)
+
+REPORT_LABELS: dict[ReportKind, str] = {
+    ReportKind.ACK: "已开始处理",
+    ReportKind.PROGRESS: "进展",
+    ReportKind.RESULT: "已完成",
+    ReportKind.BLOCKED: "受阻",
+    ReportKind.FAILED: "无法完成",
+    ReportKind.APPROVE: "复核通过",
+    ReportKind.CHANGES: "复核要求修改",
+}
+
+
+class ReportError(Exception):
+    """汇报被拒绝，带固定原因码。"""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class ReportInput:
+    task_ref: str
+    kind: ReportKind
+    attempt_seq: int | None = None
+    note: str | None = None
+    files: tuple[str, ...] = ()
+    commit: str | None = None
+    manual: bool = False
+
+
+@dataclass
+class ReportOutcome:
+    task: Task
+    attempt: Attempt
+    followups: list[Attempt] = field(default_factory=list)
+
+
+GitRunner = Callable[[Path, str], str | None]
+
+
+def _git_resolve_commit(cwd: Path, value: str) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--verify", "--quiet", f"{value}^{{commit}}"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    resolved = completed.stdout.strip()
+    return resolved if completed.returncode == 0 and _COMMIT.fullmatch(resolved) else None
+
+
+def file_reference(path: str, *, cwd: Path) -> dict[str, object]:
+    """固定一个结果文件：绝对路径、大小与 sha256（流式计算，不读入内存）。"""
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = cwd / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_file():
+            raise ReportError("file_unreadable")
+        size = resolved.stat().st_size
+        if size > MAX_HASH_BYTES:
+            raise ReportError("file_too_large")
+        digest = hashlib.sha256()
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise ReportError("file_unreadable") from error
+    return {"path": str(resolved), "size": size, "sha256": digest.hexdigest()}
+
+
+def _commit_reference(value: str, *, cwd: Path, git: GitRunner) -> dict[str, object]:
+    text = value.strip()
+    if not _COMMIT.fullmatch(text):
+        raise ReportError("commit_invalid")
+    resolved = git(cwd, text)
+    return {"commit": (resolved or text).lower(), "verified": resolved is not None}
+
+
+def _describe_result(result: dict[str, object]) -> list[str]:
+    lines: list[str] = []
+    note = result.get("note")
+    if isinstance(note, str) and note:
+        lines.append(f"结论：{note}")
+    files = result.get("files")
+    if isinstance(files, list):
+        for item in files:
+            if isinstance(item, dict):
+                digest = str(item.get("sha256", ""))[:12]
+                lines.append(f"文件：{item.get('path')}（sha256 {digest}）")
+    commit = result.get("commit")
+    if isinstance(commit, dict) and isinstance(commit.get("commit"), str):
+        lines.append(f"提交：{commit['commit']}")
+    return lines
+
+
+def _fit_body(lines: list[str], tail: str) -> str:
+    head = "\n".join(lines)
+    budget = MAX_BODY_BYTES - len(head.encode("utf-8")) - 64
+    encoded = tail.encode("utf-8")
+    if len(encoded) > budget:
+        tail = encoded[: max(budget, 0)].decode("utf-8", errors="ignore") + "\n…（原始任务过长，已截断）"
+    return f"{head}\n{tail}" if tail else head
+
+
+def review_request_body(implement: Attempt, result: dict[str, object]) -> str:
+    """复核请求：固定结果在前，原始任务要求在后。"""
+    lines = [f"请复核 {implement.target.display()} 完成的这项工作。", "", "【结果】"]
+    lines.extend(_describe_result(result) or ["（对方未附说明）"])
+    lines.extend(["", "【原始任务要求】"])
+    return _fit_body(lines, implement.body.rstrip())
+
+
+def notice_body(
+    task: Task, attempt: Attempt, kind: ReportKind, result: dict[str, object], *, next_text: str | None = None
+) -> str:
+    """回告发起方的结果通知；next_text 是写入后任务阶段对应的下一步（DESIGN §45.28.2）。"""
+    title = f"「{task.title}」" if task.title else ""
+    lines = [f"你发起的任务{title}{REPORT_LABELS[kind]}（{attempt.target.display()}）。"]
+    lines.extend(_describe_result(result))
+    if next_text:
+        lines.append(f"下一步：{next_text}")
+    return "\n".join(lines)
+
+
+def _select_attempt(task: Task, attempts: list[Attempt], report: ReportInput) -> Attempt:
+    if task.finished:
+        raise ReportError("task_finished")
+    working = work_attempts(attempts)
+    if not working:
+        raise ReportError("attempt_not_found")
+    current = working[-1]
+    if report.attempt_seq is None:
+        return current
+    found = next((item for item in attempts if item.seq == report.attempt_seq), None)
+    if found is None:
+        raise ReportError("attempt_not_found")
+    if found.role is Role.NOTICE:
+        raise ReportError("attempt_not_reportable")
+    if found.seq != current.seq:
+        raise ReportError("stale_attempt")
+    return found
+
+
+def _attribute(attempt: Attempt, report: ReportInput, caller: Caller, proc_root: Path) -> str:
+    """核验汇报来源，返回 agent 或 manual。"""
+    if caller.endpoint is not None:
+        ref = caller.endpoint.ref
+        if not ref.same_session(attempt.target):
+            raise ReportError("reporter_mismatch")
+        detail = attempt.delivery_detail
+        expected_pid = detail.get("deliveredPid", attempt.target.pid)
+        expected_start = detail.get("deliveredStart", attempt.target.start_ticks)
+        if (
+            isinstance(expected_pid, int)
+            and isinstance(expected_start, str)
+            and (ref.pid, ref.start_ticks) != (expected_pid, expected_start)
+            and procfs.is_same_generation(expected_pid, expected_start, proc_root)
+        ):
+            # 实际收到消息的进程仍在，另一个同会话进程不能替它汇报
+            raise ReportError("reporter_generation_mismatch")
+        return "agent"
+    if caller.agent_process is not None or caller.agent_env:
+        raise ReportError("reporter_unattributed")
+    if report.manual:
+        return "manual"
+    raise ReportError("manual_flag_required")
+
+
+def _check_kind(attempt: Attempt, report: ReportInput) -> None:
+    kind = report.kind
+    if kind in (ReportKind.APPROVE, ReportKind.CHANGES) and attempt.role is not Role.REVIEW:
+        raise ReportError("verdict_requires_review")
+    if kind is ReportKind.RESULT and attempt.role is Role.REVIEW:
+        raise ReportError("review_requires_verdict")
+    if attempt.delivery in _UNSENT:
+        raise ReportError("attempt_not_sent")
+    if attempt.work in (Work.RESULT, Work.FAILED):
+        raise ReportError("result_already_submitted")
+    if len(report.files) > MAX_FILES:
+        raise ReportError("too_many_files")
+
+
+def apply_report(
+    store: Store,
+    report: ReportInput,
+    *,
+    caller: Caller,
+    caller_class: str | None,
+    now: float,
+    cwd: Path,
+    git: GitRunner = _git_resolve_commit,
+    proc_root: Path = procfs.DEFAULT_PROC,
+) -> ReportOutcome:
+    """核验并原子记录一条汇报；必要时一并排队复核请求或发起方通知（由 worker 发送）。"""
+    task = store.resolve_task(report.task_ref)
+    # 事务外先做一次校验：尽早给出可读错误，避免无谓的文件 hash
+    preview = _select_attempt(task, store.attempts(task.id), report)
+    _attribute(preview, report, caller, proc_root)
+    _check_kind(preview, report)
+    # 固定首次选定的尝试：hash/提交校验期间若出现新尝试，事务内按 stale_attempt 拒绝，不会改投
+    report = replace(report, attempt_seq=preview.seq)
+
+    files = [file_reference(path, cwd=cwd) for path in report.files]
+    note = (report.note or "").strip()[:MAX_NOTE_CHARS]
+    commit = _commit_reference(report.commit, cwd=cwd, git=git) if report.commit else None
+
+    followups: list[Attempt] = []
+    with store.transaction():
+        # 事务内重新读取并校验：并发的重复汇报在这里被拒绝
+        current_task = store.get_task(task.id)
+        if current_task is None:
+            raise ReportError("task_not_found")
+        attempts = store.attempts(task.id)
+        attempt = _select_attempt(current_task, attempts, report)
+        source = _attribute(attempt, report, caller, proc_root)
+        _check_kind(attempt, report)
+        kind = report.kind
+        detail: dict[str, object] = {"source": source}
+        if note:
+            detail["note"] = note
+
+        # 接收方汇报本身就证明消息已送达
+        if attempt.delivery is not Delivery.DELIVERED:
+            store.transition_delivery(
+                attempt.id,
+                expected=tuple(state for state in Delivery if state not in (*_UNSENT, Delivery.DELIVERED)),
+                new=Delivery.DELIVERED,
+                reason="receiver_reported",
+                now=now,
+            )
+
+        result: dict[str, object] = {"note": note, "files": files, "source": source, "reportedAt": now}
+        if commit is not None:
+            result["commit"] = commit
+        if kind is ReportKind.ACK:
+            if attempt.work is Work.AWAITING_ACK:
+                store.set_work(attempt.id, work=Work.ACKNOWLEDGED, result=None, now=now, event="ack", detail=detail)
+            else:
+                store.add_event(task.id, "ack", now=now, attempt_seq=attempt.seq, detail=detail)
+        elif kind is ReportKind.PROGRESS:
+            store.set_work(attempt.id, work=Work.IN_PROGRESS, result=None, now=now, event="progress", detail=detail)
+        elif kind is ReportKind.BLOCKED:
+            store.set_work(attempt.id, work=Work.BLOCKED, result=None, now=now, event="blocked", detail=detail)
+        elif kind is ReportKind.FAILED:
+            store.set_work(attempt.id, work=Work.FAILED, result=result, now=now, event="failed", detail=detail)
+        else:
+            store.set_work(attempt.id, work=Work.RESULT, result=result, now=now, event=kind.value, detail=detail)
+            if kind is ReportKind.APPROVE:
+                store.update_task(task.id, now=now, event="verdict_approved", verdict=Verdict.APPROVED.value)
+            elif kind is ReportKind.CHANGES:
+                store.update_task(task.id, now=now, event="verdict_changes", verdict=Verdict.CHANGES.value)
+
+        first = work_attempts(attempts)[0]
+        if (
+            kind is ReportKind.RESULT
+            and attempt.role is Role.HANDOFF
+            and current_task.flow is Flow.REVIEW
+            and current_task.reviewer is not None
+        ):
+            followups.append(
+                store.add_attempt(
+                    task.id,
+                    role=Role.REVIEW,
+                    target=current_task.reviewer,
+                    body=review_request_body(attempt, result),
+                    refs=files,
+                    now=now,
+                    sender=first.sender,
+                    sender_class=first.sender_class,
+                    # 登记工作流时对共享 thread 的放行同样适用于复核目标
+                    options={"allowShared": first.allow_shared or current_task.options.get("allowShared") is True},
+                )
+            )
+        elif (
+            kind in (ReportKind.RESULT, ReportKind.BLOCKED, ReportKind.FAILED, ReportKind.APPROVE, ReportKind.CHANGES)
+            and current_task.origin is not None
+            and current_task.notify_origin
+            and not current_task.origin.same_session(attempt.target)
+        ):
+            # 发起方最容易忘的是收尾：按本次写入后的阶段写明下一步（验收/返工/关闭），事务内读得到刚写入的状态
+            from .labels import next_step  # labels 依赖本模块的 MAX_FILES，放在函数内避免循环导入
+
+            written_task = store.get_task(task.id) or current_task
+            step = next_step(written_task, store.attempts(task.id), ref=short(task.id))
+            followups.append(
+                store.add_attempt(
+                    task.id,
+                    role=Role.NOTICE,
+                    target=current_task.origin,
+                    body=notice_body(current_task, attempt, kind, result, next_text=step.text if step else None),
+                    refs=files,
+                    now=now,
+                    sender=caller.endpoint.ref if caller.endpoint else None,
+                    sender_class=caller_class,
+                )
+            )
+    refreshed = store.get_task(task.id)
+    updated = store.get_attempt(attempt.id)
+    if refreshed is None or updated is None:
+        raise StoreError("corrupt_record")
+    return ReportOutcome(task=refreshed, attempt=updated, followups=followups)

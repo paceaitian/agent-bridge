@@ -1,0 +1,1346 @@
+"""协作桥命令行：在本机 Codex/Claude 会话之间交接任务、查看进展、复核与验收（DESIGN §45.9）。
+
+终端、SSH 与 agent 会话使用同一套命令，不需要图形界面批准。退出码是桥自己的合同：
+0 完成；2 目标不存在/歧义；3 校验或策略拒绝、可证明未送达；4 等待超时；5 对方报告失败或受阻；
+6 能力不可用；7 投递结果不明；8 账本/协议错误。
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+import json
+import os
+import sqlite3
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+from . import __version__, procfs, summary
+from .endpoints import (
+    Caller,
+    ResolveError,
+    agentstatus_panes,
+    discover,
+    identify_caller,
+    permission_class,
+    resolve_target,
+)
+from .hints import PaneState, stopped_without_report, target_session_missing
+from .ids import short
+from .labels import (  # 标签表移至 labels 供摘要与 worker 共用；此处保留同名导出
+    CONSUMPTION_LABELS,
+    DELIVERY_LABELS,
+    EVENT_LABELS,
+    ISSUE_LABELS,
+    ROLE_LABELS,
+    RUNTIME_LABELS,
+    WORK_LABELS,
+    next_step,
+    reason_text,
+    role_label,
+)
+from .model import (
+    CLOSURE_KIND,
+    CLOSURE_STATE_OPTION,
+    DELIVERY_NEEDS_ATTENTION,
+    HANDED_OVER,
+    PHASE_LABELS,
+    PROVEN_UNDELIVERED,
+    Attempt,
+    Consumption,
+    Delivery,
+    Endpoint,
+    EndpointRef,
+    Flow,
+    Phase,
+    Provider,
+    ReportKind,
+    Role,
+    Runtime,
+    Task,
+    Verdict,
+    Work,
+    describe,
+    work_attempts,
+)
+from .naming import command_name
+from .paths import device_name, state_dir
+from .reports import ReportError, ReportInput, apply_report, file_reference
+from .store import DB_NAME, MAX_BODY_BYTES, Store, StoreError
+from .transports.codex_queue import VERIFIED_VERSION_PREFIX, cli_version
+from .closure import ACCEPTED, CLOSED, ClosureOutcome, queue_closures
+from .dispatch import needs_worker, select_generation
+from .worker import ensure_worker, read_log_tail, run_worker, wait_for_worker, worker_running
+
+EXIT_OK = 0
+EXIT_TARGET = 2
+EXIT_REJECTED = 3
+EXIT_TIMEOUT = 4
+EXIT_FAILURE_REPORTED = 5
+EXIT_UNAVAILABLE = 6
+EXIT_UNKNOWN = 7
+EXIT_STORE = 8
+
+SEND_WAIT_SECONDS = 15.0
+# 新拉起的 worker 取得单实例锁前的等待上限
+WORKER_START_SECONDS = 2.0
+
+_RESULT_PHASES = frozenset({Phase.AWAITING_ACCEPTANCE, Phase.DONE, Phase.CLOSED})
+# held 可能随对方批准而变化，继续等；其余需处理的状态立即返回
+_KEEP_WAITING = frozenset({"delivery_held"})
+
+
+class CliError(Exception):
+    """命令失败：固定原因码与退出码。"""
+
+    def __init__(self, code: str, exit_code: int = EXIT_REJECTED) -> None:
+        super().__init__(code)
+        self.code = code
+        self.exit_code = exit_code
+
+
+def _exit_for_store_error(code: str) -> int:
+    if code.startswith("store_") or code in {"schema_too_new", "corrupt_record"}:
+        return EXIT_STORE
+    if code in {"task_not_found", "task_ambiguous"}:
+        return EXIT_TARGET
+    return EXIT_REJECTED
+
+
+def _open_store() -> Store:
+    try:
+        return Store.open()
+    except StoreError as error:
+        raise CliError(error.code, _exit_for_store_error(error.code)) from error
+    except PermissionError as error:
+        raise CliError("store_unavailable", EXIT_STORE) from error
+
+
+def _print_json(document: object) -> None:
+    print(json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def _age(timestamp: float | None, now: float) -> str:
+    if timestamp is None:
+        return ""
+    seconds = max(0, int(now - timestamp))
+    if seconds < 60:
+        return f"{seconds} 秒前"
+    if seconds < 3600:
+        return f"{seconds // 60} 分钟前"
+    if seconds < 86400:
+        return f"{seconds // 3600} 小时前"
+    return f"{seconds // 86400} 天前"
+
+
+def _clock(timestamp: float) -> str:
+    return time.strftime("%m-%d %H:%M:%S", time.localtime(timestamp))
+
+
+# ---- 目标与调用者 ----
+
+
+def _selectors(endpoints: list[Endpoint]) -> dict[int, str]:
+    """为每个端点给出最短且唯一的 `--to` 写法。"""
+    counts: dict[tuple[str, str], int] = {}
+    for item in endpoints:
+        if item.ref.label:
+            key = (item.ref.provider.value, item.ref.label)
+            counts[key] = counts.get(key, 0) + 1
+    selectors: dict[int, str] = {}
+    for item in endpoints:
+        label = item.ref.label
+        if label and counts[(item.ref.provider.value, label)] == 1:
+            # tmux 会话名可含空格；显示成可直接复制的连字符形式（解析时同样归一化）
+            candidate = item.ref.token()
+        elif item.ref.pane:
+            candidate = item.ref.pane
+        else:
+            # 没有会话名也没有 pane（不经 tmux）：用 provider@<原生 ID 前缀>，与展示名一致且可直接复制
+            candidate = item.ref.token()
+        # 一律验算一遍：短写法撞上别人的会话名、同前缀会话，或同一 pane 里有多个会话（Grok resume 之后）时，
+        # 退回完整原生 ID，保证复制过去解析到的就是这一行
+        try:
+            selectors[id(item)] = candidate if resolve_target(candidate, endpoints) is item else item.ref.native_id
+        except ResolveError:
+            selectors[id(item)] = item.ref.native_id
+    return selectors
+
+
+def _receiver_class(endpoint: Endpoint) -> str | None:
+    info = procfs.read_process(endpoint.ref.pid)
+    if info is None or info.start_ticks != endpoint.ref.start_ticks:
+        return None
+    return permission_class(Caller(None, info))
+
+
+def _check_target(endpoint: Endpoint, *, allow_shared: bool) -> None:
+    blocking = endpoint.blocking_issues
+    if blocking:
+        raise CliError(f"target_{blocking[0]}")
+    if "shared_thread" in endpoint.issues and not allow_shared:
+        raise CliError("target_shared_thread")
+
+
+def _resolve(selector: str, endpoints: list[Endpoint]) -> Endpoint:
+    try:
+        return resolve_target(selector, endpoints)
+    except ResolveError as error:
+        if error.candidates and all("no_inbox" in item.blocking_issues for item in error.candidates):
+            # 候选全是只读会话（例如 resume 之后同 pane 两个 Grok 会话）：改哪个候选都投不进去，
+            # 报「不唯一」会让人以为换个写法就能发（Opus 复审 N1）
+            raise CliError("target_no_inbox") from error
+        if error.candidates:
+            names = _selectors(list(error.candidates))
+            options = "、".join(names[id(item)] for item in error.candidates)
+            print(f"{command_name()}: 可选目标：{options}", file=sys.stderr)
+        raise CliError(error.code, EXIT_TARGET) from error
+
+
+def _hold_hint(target: Endpoint, sender_class: str | None) -> str | None:
+    if target.ref.provider.value != "claude":
+        return None
+    receiver = _receiver_class(target)
+    if receiver == "bypass" and sender_class != "bypass":
+        return "对方是 bypass 会话、发送方不是：消息会先等对方会话批准（默认 5 分钟过期）"
+    if receiver != "bypass" and sender_class == "bypass":
+        return "发送方是 bypass、对方不是：消息会先等对方会话批准（默认 5 分钟过期）"
+    return None
+
+
+# ---- 文档与显示 ----
+
+
+def _ref_document(ref: EndpointRef | None) -> dict[str, object] | None:
+    if ref is None:
+        return None
+    return {
+        "provider": ref.provider.value,
+        "name": ref.display(),
+        "pane": ref.pane,
+        "nativeId": ref.native_id,
+    }
+
+
+def _attempt_document(attempt: Attempt, *, include_body: bool) -> dict[str, object]:
+    document: dict[str, object] = {
+        "seq": attempt.seq,
+        "role": attempt.role.value,
+        "target": _ref_document(attempt.target),
+        "sender": _ref_document(attempt.sender),
+        "senderClass": attempt.sender_class,
+        "messageId": attempt.message_id,
+        "createdAt": attempt.created_at,
+        "delivery": attempt.delivery.value,
+        "deliveryReason": attempt.delivery_reason,
+        "deliveryAt": attempt.delivery_at,
+        "providerRef": attempt.provider_ref,
+        "consumption": attempt.consumption.value,
+        "work": attempt.work.value,
+        "workAt": attempt.work_at,
+        "result": attempt.result,
+        "refs": attempt.refs,
+        "bodyBytes": len(attempt.body.encode("utf-8")),
+    }
+    if attempt.is_closure:
+        # 结束回执（DESIGN §45.31）：role 仍是 notice，另标类别与终态
+        document["kind"] = CLOSURE_KIND
+        document["closure"] = attempt.options.get(CLOSURE_STATE_OPTION)
+    if include_body:
+        document["body"] = attempt.body
+    return document
+
+
+@dataclass(frozen=True)
+class _TargetHint:
+    """查询时派生的对方提示：停下未汇报的轮次结束时刻（§45.9），或当前未发现对方会话（§45.32）；两者互斥。"""
+
+    stopped_at: float | None = None
+    missing: bool = False
+
+
+_NO_HINT = _TargetHint()
+
+
+def _target_hint(
+    attempts: list[Attempt], endpoints: list[Endpoint], panes: Mapping[str, PaneState], now: float
+) -> _TargetHint:
+    """当前工作尝试的接收方是否已停下却未汇报，或当前未发现其会话。"""
+    working = work_attempts(attempts)
+    if not working:
+        return _NO_HINT
+    current = working[-1]
+    live, problem = select_generation(current.target, endpoints)
+    if target_session_missing(current, live, problem, discovered=bool(endpoints)):
+        return _TargetHint(missing=True)
+    pane = panes.get(live.ref.pane) if live is not None and live.ref.pane else None
+    return _TargetHint(stopped_at=stopped_without_report(current, live, pane, now=now))
+
+
+def _observations() -> tuple[list[Endpoint], dict[str, PaneState]]:
+    """查询命令用的只读观察：活端点与 AgentStatus pane 快照；任一不可用时提示自然缺席。"""
+    return discover(), agentstatus_panes()
+
+
+def _task_document(
+    store: Store,
+    task: Task,
+    *,
+    include_body: bool = False,
+    events: bool = False,
+    hint: _TargetHint = _NO_HINT,
+) -> dict[str, object]:
+    attempts = store.attempts(task.id)
+    view = describe(task, attempts)
+    document: dict[str, object] = {
+        "id": task.id,
+        "title": task.title,
+        "flow": task.flow.value,
+        "phase": view.phase.value,
+        "phaseLabel": PHASE_LABELS[view.phase],
+        "reason": view.reason,
+        "reasonText": reason_text(view.reason),
+        "origin": _ref_document(task.origin),
+        "reviewer": _ref_document(task.reviewer),
+        "control": task.control,
+        "verdict": task.verdict.value if task.verdict else None,
+        "createdAt": task.created_at,
+        "updatedAt": task.updated_at,
+        "acceptedAt": task.accepted_at,
+        "closedAt": task.closed_at,
+        "targetStoppedWithoutReport": hint.stopped_at is not None,
+        "targetTurnEndedAt": hint.stopped_at,
+        "targetSessionMissing": hint.missing,
+        "attempts": [_attempt_document(item, include_body=include_body) for item in attempts],
+    }
+    if events:
+        document["events"] = store.events(task.id)
+    return document
+
+
+def _next_step(task: Task, attempts: list[Attempt]) -> str | None:
+    step = next_step(task, attempts, ref=short(task.id))
+    return step.text if step is not None else None
+
+
+def _describe_result(result: dict[str, Any] | None) -> list[str]:
+    if not result:
+        return []
+    lines: list[str] = []
+    note = result.get("note")
+    if isinstance(note, str) and note:
+        lines.append(f"说明：{note}")
+    files = result.get("files")
+    if isinstance(files, list):
+        for item in files:
+            if isinstance(item, dict):
+                lines.append(f"文件：{item.get('path')}（sha256 {str(item.get('sha256', ''))[:12]}）")
+    commit = result.get("commit")
+    if isinstance(commit, dict):
+        mark = "" if commit.get("verified") else "（本机未找到该提交）"
+        lines.append(f"提交：{commit.get('commit')}{mark}")
+    return lines
+
+
+def _print_task(
+    store: Store, task: Task, *, now: float, show_body: bool, hint: _TargetHint = _NO_HINT
+) -> None:
+    attempts = store.attempts(task.id)
+    view = describe(task, attempts)
+    cmd = command_name()
+    title = f"「{task.title}」" if task.title else ""
+    print(f"任务 {short(task.id)} {title} {PHASE_LABELS[view.phase]}：{reason_text(view.reason)}")
+    flow = "交接" if task.flow is Flow.HANDOFF else f"实现 → 复核（{task.reviewer.display() if task.reviewer else '?'}）"
+    origin = task.origin.display() if task.origin else "用户"
+    print(f"流程：{flow}；发起：{origin}；创建于 {_age(task.created_at, now)}")
+    for attempt in attempts:
+        delivery = DELIVERY_LABELS[attempt.delivery]
+        if attempt.delivery_reason and attempt.delivery is not Delivery.PENDING:
+            text = reason_text(attempt.delivery_reason)
+            if text and text != delivery:
+                delivery = f"{delivery}（{text}）"
+        consumption = CONSUMPTION_LABELS[attempt.consumption]
+        if consumption:
+            delivery = f"{delivery}，{consumption}"
+        work = "" if attempt.role is Role.NOTICE else f"；工作：{WORK_LABELS[attempt.work]}"
+        print(f"  #{attempt.seq} {role_label(attempt)} → {attempt.target.display()}：{delivery}{work}")
+        for line in _describe_result(attempt.result):
+            print(f"      {line}")
+        if show_body:
+            for line in attempt.body.splitlines():
+                print(f"      | {line}")
+    if hint.stopped_at is not None and view.current is not None:
+        print(
+            f"提示：{view.current.target.display()} 这一轮已在 {_clock(hint.stopped_at)} 结束，但还没有汇报"
+            f"（可能忘了运行 {cmd} report，或在等人回复）；可去对方会话查看或请它补报；确需重发用 "
+            f"{cmd} retry {short(task.id)} --force（对方可能已在执行），不再需要可 {cmd} close {short(task.id)}"
+        )
+    if hint.missing and view.current is not None:
+        current = view.current
+        ref = short(task.id)
+        # 未确证离开 Codex 队列时消息可能还在原生队列里，恢复同一 thread 后会继续执行（docs/ab.md §7）
+        maybe_queued = (
+            current.target.provider is Provider.CODEX
+            and current.delivery is Delivery.QUEUED
+            and current.consumption is not Consumption.LEFT_QUEUE
+        )
+        if maybe_queued:
+            action = (
+                f"消息尚未确认离开 Codex 队列，若仍在，恢复同一 thread 后可能继续执行，勿直接重发；"
+                f"确需 {cmd} retry {ref} --force 重发或加 --to 改派，都可能重复执行"
+            )
+        else:
+            action = f"确已退出可恢复该会话后 {cmd} retry {ref} --force 重发（对方可能已处理过），或加 --to 改派"
+        print(
+            f"提示：当前未发现 {current.target.display()} 的会话（可能已退出，也可能暂时无法识别），还没有汇报，"
+            f"先去确认；{action}；不再需要可 {cmd} close {ref}"
+        )
+    step = _next_step(task, attempts)
+    if step:
+        print(f"下一步：{step}")
+    events = store.events(task.id, limit=20)
+    if events:
+        print("时间线：")
+        for event in events:
+            kind = str(event["kind"])
+            label = EVENT_LABELS.get(kind)
+            if label is None and kind.startswith("delivery_"):
+                label = reason_text(kind)
+            if label is None and kind.startswith("consumption_"):
+                try:
+                    label = CONSUMPTION_LABELS[Consumption(kind.removeprefix("consumption_"))] or kind
+                except ValueError:
+                    label = kind
+            detail = event["detail"] if isinstance(event["detail"], dict) else {}
+            extra = detail.get("note") or detail.get("text") or reason_text(detail.get("reason"))
+            suffix = f"：{str(extra)[:160]}" if extra else ""
+            seq = f" #{event['attemptSeq']}" if event["attemptSeq"] else ""
+            print(f"  {_clock(float(event['at']))}{seq} {label or kind}{suffix}")
+
+
+# ---- 命令 ----
+
+
+def cmd_peers(args: argparse.Namespace) -> int:
+    endpoints = discover()
+    caller = identify_caller(endpoints)
+    selectors = _selectors(endpoints)
+    # 设备只是路由属性：今天发现到的端点全在本机，所以每行都是同一个值（DESIGN §45.35）
+    device = device_name()
+    rows: list[dict[str, object]] = []
+    for item in endpoints:
+        rows.append(
+            {
+                "target": selectors[id(item)],
+                "device": device,
+                "provider": item.ref.provider.value,
+                "session": item.ref.label,
+                "pane": item.ref.pane,
+                "nativeId": item.ref.native_id,
+                "runtime": item.runtime.value,
+                "permissionClass": _receiver_class(item),
+                "issues": list(item.issues),
+                "self": caller.endpoint is item,
+            }
+        )
+    if args.json:
+        _print_json({"peers": rows})
+        return EXIT_OK
+    if not rows:
+        print("没有发现正在运行的 agent 终端会话（Claude/Codex/Grok）")
+        return EXIT_OK
+    # 列宽按最长的目标写法算：同一 pane 里有多个会话时目标会退回 36 字符的完整会话 ID，固定列宽会把后面挤歪
+    width = max(28, *(len(str(row["target"])) for row in rows))
+    for row, item in zip(rows, endpoints):
+        mark = "  ← 当前会话" if row["self"] else ""
+        issues = "，".join(ISSUE_LABELS.get(issue, issue) for issue in item.issues)
+        extra = f"  [{issues}]" if issues else ""
+        mode = f"  {row['permissionClass']}" if row["permissionClass"] else ""
+        print(
+            f"{str(row['target']):<{width}} {item.ref.pane or '-':<5} {RUNTIME_LABELS[item.runtime]:<6}"
+            f" {item.ref.native_id[:8]}{mode}{extra}{mark}"
+        )
+    return EXIT_OK
+
+
+# 本次命令是否真的新拉起过 worker：main 结束时的补拉据此跳过。新 worker 还没拿到锁时再拉一次会多起一个进程（Opus 审计 F2）。
+# 只在确实启动了新进程后置真：启动失败，或当时旧 worker 仍在（随后可能退出），都保留结束时的补拉（Codex 复审 S02 / Opus 复审 P3-1）
+_worker_ensured = False
+
+
+def _ensure_worker() -> bool:
+    """拉起后台 worker（已在运行则不动）；新启动了进程才记下，结束时不再补拉。"""
+    global _worker_ensured
+    started = ensure_worker(state_dir())
+    _worker_ensured = _worker_ensured or started
+    return started
+
+
+def _start_worker() -> bool | None:
+    """拉起后台 worker；返回是否新启动，启动失败返回 None。"""
+    try:
+        return _ensure_worker()
+    except (OSError, StoreError):
+        return None
+
+
+def _queued_without_worker(started: bool | None) -> bool:
+    """结果已记入账本、后续消息排队，但 worker 没能启动：说明情况，返回 True 供命令给出退出码 6（DESIGN §45.29）。"""
+    if started is not None:
+        return False
+    cmd = command_name()
+    # 退出码 6 不代表没记上：写明勿重复执行（重复汇报受阻会再排一条通知），并只承诺真的会补拉的入口（Codex F03 / Opus P3-4）
+    print(
+        f"注意：{reason_text('worker_start_failed')}。上面的操作已记入账本，请勿重复执行；"
+        "排队消息、发送恢复与待办提醒要等后台 worker 拉起后才继续。"
+        f"本命令结束时会再试一次，之后运行 {cmd} status / {cmd} tasks 等命令（普通 {cmd} summary 除外）也会再试，"
+        f"AgentStatus 扩展定时补查摘要时也会按需再试；{cmd} doctor 可检查 worker 状态",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _worker_up(root: Path) -> bool:
+    """worker 是否在运行；锁文件异常（例如被替换成目录）按未运行处理，不打断已提交的命令（Opus 审计 P3-6）。"""
+    try:
+        return worker_running(root)
+    except OSError:
+        return False
+
+
+def _wait_worker_up(root: Path, timeout: float) -> bool:
+    """等新拉起的 worker 持锁；锁文件异常时按未运行处理。"""
+    try:
+        return wait_for_worker(root, timeout=timeout)
+    except OSError:
+        return False
+
+
+def _revive_worker(store: Store, now: float) -> None:
+    """有待办而 worker 不在（例如异常退出）时重新拉起；查询命令也能让排队恢复流动。"""
+    try:
+        if needs_worker(store, now) and not _worker_up(state_dir()):
+            _ensure_worker()
+    except (OSError, StoreError):
+        pass
+
+
+def _read_body(args: argparse.Namespace) -> str:
+    if args.file and args.message is not None:
+        raise CliError("message_and_file_conflict")
+    if args.file:
+        path = Path(args.file).expanduser()
+        try:
+            data = path.read_bytes() if path.stat().st_size <= MAX_BODY_BYTES else None
+        except OSError as error:
+            raise CliError("file_unreadable") from error
+        if data is None:
+            raise CliError("message_too_large")
+        return data.decode("utf-8", errors="replace")
+    if args.message == "-" or (args.message is None and not sys.stdin.isatty()):
+        return sys.stdin.read(MAX_BODY_BYTES + 1)
+    if args.message is None:
+        raise CliError("empty_message")
+    return args.message
+
+
+def _wait_first_delivery(store: Store, task_id: str, timeout: float) -> Attempt | None:
+    deadline = time.monotonic() + timeout
+    current: Attempt | None = None
+    while True:
+        attempts = work_attempts(store.attempts(task_id))
+        current = attempts[-1] if attempts else None
+        if current is None or current.delivery not in (Delivery.PENDING, Delivery.SENDING):
+            return current
+        if time.monotonic() >= deadline:
+            return current
+        time.sleep(0.25)
+
+
+def _delivery_exit(delivery: Delivery) -> int:
+    if delivery is Delivery.UNKNOWN:
+        return EXIT_UNKNOWN
+    if delivery in PROVEN_UNDELIVERED and delivery is not Delivery.PENDING:
+        return EXIT_REJECTED
+    return EXIT_OK
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    body = _read_body(args)
+    cwd = Path.cwd()
+    refs = [file_reference(path, cwd=cwd) for path in args.ref]
+    endpoints = discover()
+    caller = identify_caller(endpoints)
+    target = _resolve(args.to, endpoints)
+    _check_target(target, allow_shared=args.allow_shared)
+    if caller.endpoint is not None and caller.endpoint.ref.same_session(target.ref):
+        raise CliError("target_is_self")
+    reviewer: Endpoint | None = None
+    if args.review_by:
+        reviewer = _resolve(args.review_by, endpoints)
+        _check_target(reviewer, allow_shared=args.allow_shared)
+        if reviewer.ref.same_session(target.ref):
+            raise CliError("reviewer_is_target")
+    origin = caller.endpoint.ref if caller.endpoint is not None else None
+    origin_class = permission_class(caller)
+    first_line = body.strip().splitlines()[0] if body.strip() else ""
+    title = (args.title or first_line)[:60]
+    now = time.time()
+    with _open_store() as store:
+        try:
+            task, attempt = store.create_task(
+                title=title,
+                flow=Flow.REVIEW if reviewer else Flow.HANDOFF,
+                origin=origin,
+                origin_class=origin_class,
+                reviewer=reviewer.ref if reviewer else None,
+                target=target.ref,
+                body=body,
+                refs=refs,
+                now=now,
+                task_options={"notify": not args.no_notify, "allowShared": bool(args.allow_shared)},
+                attempt_options={"allowShared": bool(args.allow_shared)},
+            )
+        except StoreError as error:
+            raise CliError(error.code, _exit_for_store_error(error.code)) from error
+        started = _start_worker()
+        current = attempt
+        if not args.no_wait:
+            current = _wait_first_delivery(store, task.id, SEND_WAIT_SECONDS) or attempt
+        worker_up = (
+            current.delivery is not Delivery.PENDING
+            or _worker_up(state_dir())
+            or (bool(started) and _wait_worker_up(state_dir(), WORKER_START_SECONDS))
+        )
+        hint = _hold_hint(target, origin_class)
+        if args.json:
+            document = _task_document(store, task)
+            document["hint"] = hint
+            _print_json(document)
+        else:
+            print(f"任务 {short(task.id)} 已交给 {target.ref.display()}：{DELIVERY_LABELS[current.delivery]}")
+            if current.delivery is Delivery.PENDING:
+                if target.runtime in (Runtime.BUSY, Runtime.WAITING):
+                    print(f"对方{RUNTIME_LABELS[target.runtime]}，桥会在对方空闲后发送")
+                elif worker_up:
+                    print(f"后台 worker 正在发送；稍后用 {command_name()} status 查看投递结果")
+                if not worker_up:
+                    code = "worker_start_failed" if started is None else "worker_not_running"
+                    print(f"注意：{reason_text(code)}")
+            elif current.delivery_reason and current.delivery_reason not in {"codex_queued", "claude_written"}:
+                print(reason_text(current.delivery_reason))
+            if current.delivery is Delivery.QUEUED:
+                print("Codex 会在空闲时按顺序执行队列消息；已入队的消息无法由桥撤回")
+            if hint:
+                print(f"提示：{hint}")
+            cmd = command_name()
+            print(f"查看进展：{cmd} status {short(task.id)}；等待结果：{cmd} wait {short(task.id)}")
+        if not worker_up:
+            return EXIT_UNAVAILABLE
+        return _delivery_exit(current.delivery)
+
+
+def cmd_tasks(args: argparse.Namespace) -> int:
+    now = time.time()
+    with _open_store() as store:
+        # 待办而 worker 不在时的补拉由 main 结束时统一做（DESIGN §45.28.3），这里不重复拉起
+        tasks = store.list_tasks(include_finished=args.all)
+        endpoints, panes = _observations() if any(not task.finished for task in tasks) else ([], {})
+        hints = {
+            task.id: _target_hint(store.attempts(task.id), endpoints, panes, now)
+            for task in tasks
+            if not task.finished
+        }
+        if args.json:
+            _print_json({"tasks": [_task_document(store, task, hint=hints.get(task.id, _NO_HINT)) for task in tasks]})
+            return EXIT_OK
+        if not tasks:
+            print("没有进行中的协作任务" if not args.all else "没有协作任务")
+            return EXIT_OK
+        for task in tasks:
+            attempts = store.attempts(task.id)
+            view = describe(task, attempts)
+            target = view.current.target.display() if view.current else "-"
+            hint = hints.get(task.id, _NO_HINT)
+            flag = "，未发现对方会话" if hint.missing else "，对方已停下未汇报" if hint.stopped_at is not None else ""
+            print(
+                f"{short(task.id)}  {PHASE_LABELS[view.phase]:<4} {target:<28}"
+                f" {task.title[:40]}  （{reason_text(view.reason)}{flag}，{_age(task.updated_at, now)}）"
+            )
+    return EXIT_OK
+
+
+def _task(store: Store, reference: str) -> Task:
+    try:
+        return store.resolve_task(reference)
+    except StoreError as error:
+        raise CliError(error.code, _exit_for_store_error(error.code)) from error
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    now = time.time()
+    with _open_store() as store:
+        # 待办而 worker 不在时的补拉由 main 结束时统一做（DESIGN §45.28.3），这里不重复拉起
+        task = _task(store, args.task)
+        hint = _NO_HINT
+        if not task.finished:
+            endpoints, panes = _observations()
+            hint = _target_hint(store.attempts(task.id), endpoints, panes, now)
+        if args.json:
+            _print_json(_task_document(store, task, include_body=args.body, events=True, hint=hint))
+        else:
+            _print_task(store, task, now=now, show_body=args.body, hint=hint)
+    return EXIT_OK
+
+
+_REPORT_KINDS: tuple[tuple[str, ReportKind], ...] = (
+    ("ack", ReportKind.ACK),
+    ("progress", ReportKind.PROGRESS),
+    ("result", ReportKind.RESULT),
+    ("blocked", ReportKind.BLOCKED),
+    ("failed", ReportKind.FAILED),
+    ("approve", ReportKind.APPROVE),
+    ("changes", ReportKind.CHANGES),
+)
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    kind = next(value for name, value in _REPORT_KINDS if getattr(args, name))
+    endpoints = discover()
+    caller = identify_caller(endpoints)
+    with _open_store() as store:
+        try:
+            outcome = apply_report(
+                store,
+                ReportInput(
+                    task_ref=args.task,
+                    kind=kind,
+                    attempt_seq=args.attempt,
+                    note=args.note,
+                    files=tuple(args.file),
+                    commit=args.commit,
+                    manual=args.manual,
+                ),
+                caller=caller,
+                caller_class=permission_class(caller),
+                now=time.time(),
+                cwd=Path.cwd(),
+            )
+        except ReportError as error:
+            raise CliError(error.code) from error
+        except StoreError as error:
+            raise CliError(error.code, _exit_for_store_error(error.code)) from error
+        # 汇报已提交：拉起 worker 失败不能以异常堆栈退出，让人误以为没记上（DESIGN §45.29）
+        unavailable = _queued_without_worker(_start_worker()) if outcome.followups else False
+        exit_code = EXIT_UNAVAILABLE if unavailable else EXIT_OK
+        if args.json:
+            _print_json(_task_document(store, outcome.task))
+            return exit_code
+        print(f"已记录：{EVENT_LABELS.get(kind.value, kind.value)}（任务 {short(outcome.task.id)} #{outcome.attempt.seq}）")
+        for followup in outcome.followups:
+            label = "已排队发给复核方" if followup.role is Role.REVIEW else "已排队通知发起方"
+            print(f"{label} {followup.target.display()}")
+    return exit_code
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    deadline = time.monotonic() + args.timeout
+    rounds = 0
+    with _open_store() as store:
+        while True:
+            if rounds % 10 == 0:
+                _revive_worker(store, time.time())
+            rounds += 1
+            task = _task(store, args.task)
+            attempts = store.attempts(task.id)
+            view = describe(task, attempts)
+            current = view.current
+            reached: int | None = None
+            if args.until == "sent":
+                if current is not None and current.delivery in (*HANDED_OVER, Delivery.HELD):
+                    reached = EXIT_OK
+            elif args.until == "ack":
+                if current is not None and current.work in (Work.ACKNOWLEDGED, Work.IN_PROGRESS, Work.RESULT):
+                    reached = EXIT_OK
+            if reached is None:
+                if view.phase in _RESULT_PHASES and args.until in {"result", "ack", "sent"}:
+                    reached = EXIT_OK
+                elif view.phase is Phase.NEEDS_ATTENTION and view.reason not in _KEEP_WAITING:
+                    if view.reason == "delivery_unknown":
+                        reached = EXIT_UNKNOWN
+                    elif view.reason in {
+                        "blocked_reported",
+                        "failure_reported",
+                        "changes_requested",
+                        "review_verdict_missing",
+                    }:
+                        reached = EXIT_FAILURE_REPORTED
+                    else:
+                        reached = EXIT_REJECTED
+            if reached is not None:
+                if args.json:
+                    _print_json(_task_document(store, task))
+                else:
+                    _print_task(store, task, now=time.time(), show_body=False)
+                return reached
+            if time.monotonic() >= deadline:
+                if not args.json:
+                    print(f"等待超时：{PHASE_LABELS[view.phase]}（{reason_text(view.reason)}）")
+                return EXIT_TIMEOUT
+            time.sleep(1.0)
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        task = _task(store, args.task)
+        if task.finished:
+            raise CliError("task_finished")
+        store.update_task(task.id, now=time.time(), event="paused", control="paused")
+        print(f"任务 {short(task.id)} 已暂停发送；已发出的消息不受影响")
+    return EXIT_OK
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    with _open_store() as store:
+        task = _task(store, args.task)
+        if task.finished:
+            raise CliError("task_finished")
+        if not task.paused:
+            raise CliError("not_paused")
+        store.update_task(task.id, now=time.time(), event="resumed", control="active")
+        started = _start_worker()
+        print(f"任务 {short(task.id)} 继续发送")
+        # 按全账本的实际后台需求判断（排队、发送恢复、观察窗口、待办提醒；worker 全局只有一个），不只看本任务排队消息（Codex 复审 R01）
+        needed = False
+        if started is None:
+            try:
+                needed = needs_worker(store, time.time())
+            except (StoreError, sqlite3.Error):  # 读账本出错时按需要处理，不以堆栈退出（Opus 第二轮复审）
+                needed = True
+    return EXIT_UNAVAILABLE if needed and _queued_without_worker(started) else EXIT_OK
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    now = time.time()
+    with _open_store() as store:
+        task = _task(store, args.task)
+        cancelled = 0
+        for attempt in store.attempts(task.id):
+            if store.transition_delivery(
+                attempt.id, expected=(Delivery.PENDING,), new=Delivery.CANCELLED, reason="cancelled", now=now
+            ):
+                cancelled += 1
+        if cancelled == 0:
+            raise CliError("nothing_to_cancel")
+        print(f"已取消 {cancelled} 条尚未发送的消息（任务 {short(task.id)}）")
+    return EXIT_OK
+
+
+def _may_decide(caller: Caller, task: Task) -> bool:
+    """用户本人，或代表用户发起任务的会话，可以验收；执行方和复核方不能。"""
+    if caller.is_user_shell:
+        return True
+    return caller.endpoint is not None and task.origin is not None and caller.endpoint.ref.same_session(task.origin)
+
+
+def _closure_decider(caller: Caller) -> tuple[EndpointRef | None, str]:
+    """结束回执以谁的名义发出：决定者所在会话（用户在终端时为空）与正文里的显示名。"""
+    if caller.endpoint is not None:
+        return caller.endpoint.ref, caller.endpoint.ref.display()
+    return None, "用户"
+
+
+def _closure_document(outcome: ClosureOutcome) -> dict[str, object]:
+    return {
+        "queued": [
+            {"seq": item.seq, "target": item.target.display()} for item in outcome.queued
+        ],
+        "skipped": [
+            {"role": recipient.source.role.value, "target": recipient.target.display(), "capacity": capacity}
+            for recipient, capacity in outcome.skipped
+        ],
+    }
+
+
+def _print_closure(outcome: ClosureOutcome) -> None:
+    if outcome.queued:
+        names = "、".join(item.target.display() for item in outcome.queued)
+        print(f"已排队结束回执 → {names}（对方空闲后发送，不需要汇报）")
+    for recipient, _capacity in outcome.skipped:
+        print(f"排队容量已满，未给 {recipient.target.display()} 排结束回执")
+
+
+def _cancel_ordinary_pending(store: Store, attempts: list[Attempt], *, reason: str, now: float) -> None:
+    """取消尚未发出的普通消息；已排队的结束回执照发（DESIGN §45.31.2）。"""
+    for attempt in attempts:
+        if attempt.is_closure:
+            continue
+        store.transition_delivery(
+            attempt.id, expected=(Delivery.PENDING,), new=Delivery.CANCELLED, reason=reason, now=now
+        )
+
+
+def cmd_accept(args: argparse.Namespace) -> int:
+    endpoints = discover()
+    caller = identify_caller(endpoints)
+    with _open_store() as store:
+        task = _task(store, args.task)
+        if task.finished:
+            raise CliError("task_finished")
+        if not _may_decide(caller, task):
+            raise CliError("accept_not_allowed")
+        view = describe(task, store.attempts(task.id))
+        if view.phase is not Phase.AWAITING_ACCEPTANCE and not args.force:
+            raise CliError("no_result_to_accept")
+        sender, decider = _closure_decider(caller)
+        sender_class = permission_class(caller)
+        now = time.time()
+        with store.transaction():
+            # 事务内重读：并发的另一个 accept/close 已先提交时，这里不再生成第二份结束回执
+            current = store.get_task(task.id)
+            if current is None or current.finished:
+                raise CliError("task_finished")
+            attempts = store.attempts(task.id)
+            # 验收后不会再发送：尚在桥内排队的消息一并取消，不占用排队容量
+            _cancel_ordinary_pending(store, attempts, reason="accepted", now=now)
+            outcome = queue_closures(
+                store, current, store.attempts(task.id), ACCEPTED,
+                now=now, decider=decider, reason=None, sender=sender, sender_class=sender_class,
+            )
+            store.update_task(task.id, now=now, event="accepted", accepted_at=now)
+        if args.json:
+            _print_json({"ok": True, "id": task.id, "phase": Phase.DONE.value, "closure": _closure_document(outcome)})
+        else:
+            print(f"任务 {short(task.id)} 已验收")
+            _print_closure(outcome)
+    return EXIT_OK
+
+
+_NATIVE_RISK = frozenset({Delivery.WRITTEN, Delivery.QUEUED, Delivery.HELD, Delivery.UNKNOWN, Delivery.DELIVERED})
+
+
+def cmd_close(args: argparse.Namespace) -> int:
+    endpoints = discover()
+    caller = identify_caller(endpoints)
+    now = time.time()
+    with _open_store() as store:
+        task = _task(store, args.task)
+        if task.closed_at is not None:
+            raise CliError("task_finished")
+        if not _may_decide(caller, task):
+            raise CliError("accept_not_allowed")
+        sender, decider = _closure_decider(caller)
+        sender_class = permission_class(caller)
+        with store.transaction():
+            current = store.get_task(task.id)
+            if current is None or current.closed_at is not None:
+                raise CliError("task_finished")
+            attempts = store.attempts(task.id)
+            _cancel_ordinary_pending(store, attempts, reason="closed", now=now)
+            at_risk = any(
+                attempt.delivery in _NATIVE_RISK and attempt.work not in (Work.RESULT, Work.FAILED, Work.NONE)
+                for attempt in attempts
+            )
+            if at_risk:
+                store.note_archived_risk()
+            # 只在第一次进入终态时生成；已验收后补记关闭不再发第二份
+            outcome = (
+                ClosureOutcome([], [])
+                if current.finished
+                else queue_closures(
+                    store, current, store.attempts(task.id), CLOSED,
+                    now=now, decider=decider, reason=args.reason, sender=sender, sender_class=sender_class,
+                )
+            )
+            store.update_task(
+                task.id, now=now, event="closed", closed_at=now, close_reason=args.reason or "closed"
+            )
+        print(f"任务 {short(task.id)} 已停止追踪")
+        if at_risk:
+            print("注意：已发出的消息无法撤回，对方仍可能继续执行")
+        _print_closure(outcome)
+    return EXIT_OK
+
+
+def _rework_body(first: Attempt, current: Attempt, task: Task, extra: str | None) -> str:
+    lines = ["【返工】"]
+    if current.role is Role.REVIEW and task.verdict is Verdict.CHANGES:
+        lines.append(f"复核方 {current.target.display()} 要求修改。")
+    elif current.work is Work.BLOCKED:
+        lines.append("上次处理受阻，情况已处理，请继续。")
+    elif current.work is Work.FAILED:
+        lines.append("上次未能完成，请按下面的要求重新处理。")
+    else:
+        lines.append("请按下面的意见继续修改。")
+    result = current.result or {}
+    note = result.get("note") if isinstance(result, dict) else None
+    if isinstance(note, str) and note:
+        lines.append(f"意见：{note}")
+    for line in _describe_result(result if isinstance(result, dict) else None):
+        if not line.startswith("说明："):
+            lines.append(line)
+    if extra:
+        lines.append(f"补充：{extra}")
+    lines.extend(["", "【原始任务要求】", first.body.rstrip()])
+    text = "\n".join(lines)
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_BODY_BYTES:
+        text = encoded[: MAX_BODY_BYTES - 64].decode("utf-8", errors="ignore") + "\n…（已截断）"
+    return text
+
+
+def cmd_retry(args: argparse.Namespace) -> int:
+    endpoints = discover()
+    caller = identify_caller(endpoints)
+    now = time.time()
+    with _open_store() as store:
+        task = _task(store, args.task)
+        if task.finished:
+            raise CliError("task_finished")
+        if not _may_decide(caller, task):
+            raise CliError("accept_not_allowed")
+        attempts = work_attempts(store.attempts(task.id))
+        if not attempts:
+            raise CliError("attempt_not_found")
+        first = attempts[0]
+        current = attempts[-1]
+        if current.delivery is Delivery.PENDING:
+            raise CliError("still_pending")
+        undelivered = current.delivery in PROVEN_UNDELIVERED
+        rework = current.work in (Work.BLOCKED, Work.FAILED) or (
+            current.role is Role.REVIEW and task.verdict is Verdict.CHANGES
+        ) or (current.work is Work.RESULT and current.role is Role.HANDOFF)
+        if not (undelivered or rework or args.force):
+            raise CliError("retry_requires_force")
+        role = current.role
+        target_ref = current.target
+        if undelivered and not rework:
+            body = current.body
+            if args.message:
+                body = f"{body}\n\n补充：{args.message}"
+        else:
+            if current.role is Role.REVIEW and task.verdict is Verdict.CHANGES:
+                role = Role.HANDOFF
+                implementer = next((item for item in reversed(attempts) if item.role is Role.HANDOFF), first)
+                target_ref = implementer.target
+            body = _rework_body(first, current, task, args.message)
+        allow_shared = bool(args.allow_shared or current.allow_shared)
+        if args.to:
+            target = _resolve(args.to, endpoints)
+            _check_target(target, allow_shared=allow_shared)
+            target_ref = target.ref
+        else:
+            live, problem = select_generation(target_ref, endpoints)
+            if problem is not None:
+                raise CliError(f"target_{problem}")
+            if live is not None:
+                _check_target(live, allow_shared=allow_shared)
+                target_ref = live.ref
+        try:
+            attempt = store.add_attempt(
+                task.id,
+                role=role,
+                target=target_ref,
+                body=body,
+                refs=first.refs if role is Role.HANDOFF else current.refs,
+                now=now,
+                sender=first.sender,
+                sender_class=first.sender_class,
+                options={"allowShared": allow_shared},
+            )
+        except StoreError as error:
+            raise CliError(error.code, _exit_for_store_error(error.code)) from error
+        fields: dict[str, object] = {"control": "active"}
+        if task.verdict is not None:
+            fields["verdict"] = None
+        store.update_task(task.id, now=now, event="retry", **fields)
+        started = _start_worker()
+        print(f"已排队第 {attempt.seq} 次{ROLE_LABELS[attempt.role]} → {attempt.target.display()}（任务 {short(task.id)}）")
+        if args.force and not undelivered and not rework:
+            print("注意：上一条消息可能已送达，对方可能重复执行")
+    return EXIT_UNAVAILABLE if _queued_without_worker(started) else EXIT_OK
+
+
+def cmd_worker(args: argparse.Namespace) -> int:
+    return run_worker(once=args.once)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from .endpoints import agentstatus_runtime
+    from .paths import claude_sessions_dir, state_dir_source
+    from .transports.claude_peer import inbox_directory
+
+    version = cli_version()
+    root = state_dir()
+    # 账本根与命令名是「这套装置到底在用哪个账本」的可读事实：默认值是独立版的，
+    # 集成版由入口脚本绑回现役根，绑没绑上只看这两行（DESIGN §45.36）
+    checks: dict[str, object] = {
+        "abVersion": __version__,
+        "command": command_name(),
+        "device": device_name(),
+        "ledger": str(root),
+        "stateRoot": str(root),
+        "stateRootSource": state_dir_source(),
+    }
+    try:
+        checks["workerRunning"] = worker_running(root)
+    except OSError as error:
+        # 锁文件异常时给出原因，拉起失败的提示把人指到这里（Opus 复审 P3-b）
+        checks["workerRunning"] = False
+        checks["workerLockError"] = f"{type(error).__name__}（errno {error.errno}）"
+    checks.update({
+        "codexVersion": version,
+        "codexVersionVerified": bool(version and version.startswith(VERIFIED_VERSION_PREFIX)),
+        "claudeRegistryReadable": os.access(claude_sessions_dir(), os.R_OK),
+        "claudeInboxDirectory": inbox_directory().is_dir(),
+        "agentstatusRuntimeAvailable": bool(agentstatus_runtime()),
+        "workerLog": read_log_tail(root, lines=5),
+    })
+    try:
+        with Store.open(root) as store:
+            checks["ledgerOk"] = True
+            checks["archivedWithNativeRisk"] = store.archived_risk_count()
+            checks["summaryState"] = summary.STATE_LABELS.get(summary.status(root, store)["state"], "未知")
+    except StoreError as error:
+        checks["ledgerOk"] = False
+        checks["ledgerError"] = error.code
+    if args.json:
+        _print_json(checks)
+        return EXIT_OK
+    labels = {
+        "abVersion": f"{command_name()} 版本",
+        "command": "对外命令名",
+        "device": "本机设备名",
+        "ledger": "任务账本目录",
+        "stateRoot": "状态根目录",
+        "stateRootSource": "状态根来源",
+        "workerRunning": "后台 worker 运行中",
+        "workerLockError": "worker 锁文件异常",
+        "codexVersion": "Codex CLI 版本",
+        "codexVersionVerified": "Codex 版本已核对排队协议",
+        "claudeRegistryReadable": "Claude 会话注册表可读",
+        "claudeInboxDirectory": "Claude 回执目录存在",
+        "agentstatusRuntimeAvailable": "AgentStatus 忙闲状态可读",
+        "ledgerOk": "任务账本正常",
+        "ledgerError": "账本错误",
+        "archivedWithNativeRisk": "已关闭但对方可能仍在执行的任务",
+        "summaryState": "协作摘要",
+        "workerLog": "worker 最近日志",
+    }
+    for key, value in checks.items():
+        if isinstance(value, list):
+            print(f"{labels.get(key, key)}：" + ("（无）" if not value else ""))
+            for line in value:
+                print(f"  {line}")
+            continue
+        shown = "是" if value is True else "否" if value is False else value
+        print(f"{labels.get(key, key)}：{shown}")
+    return EXIT_OK
+
+
+def _refresh_summary(*, force: bool = False, revive: bool = False) -> summary.PublishResult | None:
+    """账本存在时发布摘要（默认 if-stale）；失败不改变命令结果，交给 worker 补写（DESIGN §45.14）。
+
+    revive：命令结束后若还有待办（含未到期的发起方提醒）而 worker 不在（崩溃、重启），顺手拉起（DESIGN §45.28.3）。
+    """
+    try:
+        root = state_dir()
+        if not (root / DB_NAME).is_file():
+            return None  # 没用过协作桥的机器不创建账本
+        with Store.open(root) as store:
+            try:
+                return summary.publish(store, root, force=force)
+            finally:
+                if revive and not _worker_ensured:
+                    _revive_worker(store, time.time())
+    except Exception:  # 摘要是可重建投影：任何失败都不能阻止命令或覆盖已提交的结果（3A-F02）
+        if not _worker_ensured:  # 与正常结束同一口径：本次已新拉起过就不重复（Codex 复审 S03）
+            _start_worker()
+        return None
+
+
+def _revive_from_summary(store: Store) -> None:
+    """扩展定时 `summary --if-stale` 后按需恢复 worker（DESIGN §45.30）：只试一次，任何错误都吞掉。
+
+    这是辅助动作：不能改变摘要输出与退出码，出错也不像其他命令那样兜底再拉一次。
+    worker 由 gnome-shell 环境拉起时，worker_environment 会给 PATH 补上 ~/.local/bin，保证找得到 codex。
+    """
+    try:
+        _revive_worker(store, time.time())
+    except Exception:  # needs_worker 读账本也可能抛 sqlite3.Error 等 _revive_worker 不接的异常
+        pass
+
+
+def cmd_summary(args: argparse.Namespace) -> int:
+    # 只有 --if-stale（扩展的定时与打开菜单补查）在发布后按需拉起 worker：普通 summary 与只带 --refresh 的手动重建不拉起。
+    # 早先因 gnome-shell 的 PATH 找不到 codex 而完全不拉起（§45.28.3 实现修订），现由 worker 环境补 PATH 解决（§45.30）
+    root = state_dir()
+    ledger = (root / DB_NAME).is_file()
+    published: summary.PublishResult | None = None
+    if args.refresh or args.if_stale:
+        if not ledger:
+            raise CliError("ledger_absent", EXIT_UNAVAILABLE)
+        with _open_store() as store:
+            try:
+                published = summary.publish(store, root, force=not args.if_stale)
+            except summary.SummaryError as error:
+                raise CliError(error.code, EXIT_STORE) from error
+            finally:
+                # 摘要重写、未变化或写入失败都照样补查：新 worker 启动时会强制重建摘要
+                if args.if_stale:
+                    _revive_from_summary(store)
+    if ledger:
+        with _open_store() as store:
+            state = summary.status(root, store)
+    else:
+        state = summary.status(root, None)
+    if published is not None:
+        state["published"] = published.status
+    if args.json:
+        _print_json(state)
+        return EXIT_OK
+    print(f"协作摘要：{summary.STATE_LABELS.get(state['state'], state['state'])}")
+    if "revision" in state:
+        print(f"摘要修订号：{state['revision']}（账本 {state.get('ledgerRevision', '-')}）")
+    if published is not None:
+        print("已重建" if published.status == "written" else "摘要已是最新，未重写")
+    return EXIT_OK
+
+
+def _report_error(args: argparse.Namespace, code: str) -> None:
+    print(f"{command_name()}: {reason_text(code)} [{code}]", file=sys.stderr)
+    if getattr(args, "json_errors", False) and getattr(args, "json", False):
+        _print_json({"ok": False, "code": code, "reasonText": reason_text(code)})
+
+
+def build_parser() -> argparse.ArgumentParser:
+    prog = command_name()
+    parser = argparse.ArgumentParser(prog=prog, description="AgentStatus 协作桥：在本机 agent 会话之间交接任务")
+    parser.add_argument("--version", action="version", version=f"{prog} {__version__}")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    peers = commands.add_parser("peers", help="列出可交接的会话")
+    peers.add_argument("--json", action="store_true")
+    peers.set_defaults(handler=cmd_peers)
+
+    send = commands.add_parser("send", help="把任务交给另一个会话")
+    send.add_argument("--to", required=True, help="目标：codex@会话名、pane（%%3）或会话 ID")
+    send.add_argument("-m", "--message", help="任务内容；- 表示从标准输入读取")
+    send.add_argument("--file", help="从文件读取任务内容")
+    send.add_argument("--title", help="任务标题（默认取内容第一行）")
+    send.add_argument("--ref", action="append", default=[], help="附带引用文件（记录 sha256）")
+    send.add_argument("--review-by", help="完成后自动交给该会话复核")
+    send.add_argument("--allow-shared", action="store_true", help="允许投递到被多个进程加载的 thread")
+    send.add_argument("--no-wait", action="store_true", help="不等待首次投递结果")
+    send.add_argument("--no-notify", action="store_true", help="对方交结果后不回推通知发起会话")
+    send.add_argument("--json", action="store_true")
+    send.set_defaults(handler=cmd_send)
+
+    tasks = commands.add_parser("tasks", help="列出协作任务")
+    tasks.add_argument("--all", action="store_true", help="包含已结束的任务")
+    tasks.add_argument("--json", action="store_true")
+    tasks.set_defaults(handler=cmd_tasks)
+
+    status = commands.add_parser("status", help="查看任务详情")
+    status.add_argument("task")
+    status.add_argument("--body", action="store_true", help="显示任务正文")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(handler=cmd_status)
+
+    report = commands.add_parser("report", help="汇报自己承接的任务")
+    report.add_argument("task")
+    report.add_argument("--attempt", type=int)
+    kinds = report.add_mutually_exclusive_group(required=True)
+    kinds.add_argument("--ack", action="store_true", help="开始处理")
+    kinds.add_argument("--progress", action="store_true", help="进展")
+    kinds.add_argument("--result", action="store_true", help="完成并提交结果")
+    kinds.add_argument("--blocked", action="store_true", help="受阻，需要发起方或用户处理")
+    kinds.add_argument("--failed", action="store_true", help="无法完成")
+    kinds.add_argument("--approve", action="store_true", help="复核通过")
+    kinds.add_argument("--changes", action="store_true", help="复核要求修改")
+    report.add_argument("--note", help="一句话说明")
+    report.add_argument("--file", action="append", default=[], help="结果文件（记录 sha256）")
+    report.add_argument("--commit", help="结果提交")
+    report.add_argument("--manual", action="store_true", help="用户在终端里代为补记")
+    report.add_argument("--json", action="store_true")
+    report.set_defaults(handler=cmd_report)
+
+    wait = commands.add_parser("wait", help="等待任务到达某个阶段")
+    wait.add_argument("task")
+    wait.add_argument("--until", choices=("sent", "ack", "result"), default="result")
+    wait.add_argument("--timeout", type=float, default=3600.0)
+    wait.add_argument("--json", action="store_true")
+    wait.set_defaults(handler=cmd_wait)
+
+    for name, handler, text in (
+        ("pause", cmd_pause, "暂停发送桥内排队的消息"),
+        ("resume", cmd_resume, "继续发送"),
+        ("cancel", cmd_cancel, "取消尚未发送的消息"),
+    ):
+        command = commands.add_parser(name, help=text)
+        command.add_argument("task")
+        command.set_defaults(handler=handler)
+
+    accept = commands.add_parser("accept", help="验收结果")
+    accept.add_argument("task")
+    accept.add_argument("--force", action="store_true", help="没有待验收结果时也标记验收")
+    accept.add_argument("--json", action="store_true", help="成功与失败都输出结构化结果（供界面调用）")
+    accept.set_defaults(handler=cmd_accept, json_errors=True)
+
+    close = commands.add_parser("close", help="停止追踪任务")
+    close.add_argument("task")
+    close.add_argument("--reason")
+    close.set_defaults(handler=cmd_close)
+
+    retry = commands.add_parser("retry", help="重发未送达的消息，或把意见交回返工")
+    retry.add_argument("task")
+    retry.add_argument("--to", help="改派到其他会话")
+    retry.add_argument("-m", "--message", help="补充说明")
+    retry.add_argument("--force", action="store_true", help="上一条可能已送达时仍重发")
+    retry.add_argument("--allow-shared", action="store_true")
+    retry.set_defaults(handler=cmd_retry)
+
+    worker = commands.add_parser("worker", help=f"运行后台 worker（通常由 {prog} 自动拉起）")
+    worker.add_argument("--once", action="store_true")
+    worker.set_defaults(handler=cmd_worker)
+
+    summary_parser = commands.add_parser("summary", help="查看或重建给 AgentStatus 界面用的协作摘要")
+    summary_parser.add_argument("--refresh", action="store_true", help="重建摘要")
+    summary_parser.add_argument("--if-stale", action="store_true", help="仅在摘要缺失、损坏或落后于账本时重建")
+    summary_parser.add_argument("--json", action="store_true")
+    summary_parser.set_defaults(handler=cmd_summary)
+
+    doctor = commands.add_parser("doctor", help="检查协作桥运行环境")
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(handler=cmd_doctor)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """命令入口；错误以固定原因码和可读说明输出到 stderr。"""
+    global _worker_ensured
+    _worker_ensured = False
+    args = build_parser().parse_args(argv)
+    # 任一调用前后补查摘要：提交后未发布（进程被杀、锁超时）的窗口由下一次调用收敛；worker 与 summary 自行处理
+    refresh = args.command not in {"worker", "summary"}
+    if refresh:
+        _refresh_summary()
+    try:
+        return int(args.handler(args))
+    except CliError as error:
+        _report_error(args, error.code)
+        return error.exit_code
+    except ReportError as error:
+        _report_error(args, error.code)
+        return EXIT_REJECTED
+    except StoreError as error:
+        _report_error(args, error.code)
+        return _exit_for_store_error(error.code)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if refresh:
+            _refresh_summary(revive=True)

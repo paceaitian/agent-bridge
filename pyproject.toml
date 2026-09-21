@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-bridge"
+version = "0.1.0.dev0"
+description = "Hand tasks between local AI coding agents on one Linux machine"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+# 只声明 `agent-bridge`。`ab` 是**可选**别名，由用户自己建符号链接——不在这里声明是有原因的：
+# 同一台机器上如果还装着 AgentStatus 集成版，它的安装器会在 `~/.local/bin/ab` 放一条符号链接，
+# 而 pip 装同名脚本会用普通文件把它顶掉（实测：无警告直接覆盖），于是现役入口被换成一个
+# 落在别的账本根上的开发态脚本。详见 README「与 AgentStatus 集成版共存」。
+[project.scripts]
+agent-bridge = "agentstatus_bridge.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

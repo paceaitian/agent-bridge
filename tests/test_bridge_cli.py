@@ -1,0 +1,909 @@
+"""`ab` 命令行：退出码合同、验收/重发/返工规则与不需要图形界面的完整流程。"""
+
+from __future__ import annotations
+
+from contextlib import redirect_stderr, redirect_stdout
+import fcntl
+import threading
+import time
+from io import StringIO
+import json
+import os
+import sqlite3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import patch
+
+from agentstatus_bridge import cli, naming, paths
+from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
+from agentstatus_bridge.endpoints import Caller
+from agentstatus_bridge.hints import PaneState
+from agentstatus_bridge.model import Consumption, Delivery, Endpoint, Provider, Role, Runtime, Verdict, Work
+from agentstatus_bridge.procfs import ProcessInfo
+from agentstatus_bridge.store import Store
+from bridge_support import endpoint, ref
+
+IMPL = endpoint(ref(Provider.CODEX, "impl-thread", pid=1000, pane="%1", label="impl"))
+REVIEW = endpoint(ref(Provider.CLAUDE, "review-session", pid=2000, pane="%2", label="review"))
+LEAD = endpoint(ref(Provider.CODEX, "lead-thread", pid=3000, pane="%3", label="lead"))
+# 只读 provider：发现阶段就带 no_inbox，所有投递入口都要拒（DESIGN §45.34）
+GROK = endpoint(ref(Provider.GROK, "019a0000-cccc-7ccc-8ccc-cccccccccccc", pid=4000, pane="%9", label="grok"))
+
+
+def as_agent(item: Endpoint) -> Caller:
+    return Caller(item, ProcessInfo(item.ref.pid, 1, item.ref.provider.value, item.ref.start_ticks))
+
+
+USER = Caller(None, None)
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.state = Path(self._tmp.name) / "bridge"
+        self.endpoints: list[Endpoint] = [IMPL, REVIEW, LEAD]
+        self.caller = USER
+        self.worker_up = True
+        self.panes: dict[str, PaneState] = {}
+        patches = [
+            patch.object(cli, "agentstatus_panes", side_effect=lambda: dict(self.panes)),
+            # doctor 会 `shutil.which("codex")` 并**真的执行**它（strace 实证：还会在真实 ~/.codex 下
+            # 建目录与锁），也会探测真实 `~/.claude/sessions`。测试不该碰 PATH 上任意同名程序与真实
+            # agent 目录，两处都在这里注入（独立 Fable 审计 P3-4）
+            patch.dict(
+                os.environ,
+                {
+                    "AB_STATE_DIR": str(self.state),
+                    "AB_CLAUDE_SESSIONS_DIR": str(Path(self._tmp.name) / "claude-sessions"),
+                },
+            ),
+            patch.object(cli, "cli_version", return_value=None),
+            patch.object(cli, "discover", side_effect=lambda: list(self.endpoints)),
+            patch.object(cli, "identify_caller", side_effect=lambda _endpoints: self.caller),
+            patch.object(cli, "ensure_worker", return_value=False),
+            patch.object(cli, "worker_running", side_effect=lambda _root: self.worker_up),
+            patch.object(cli, "_receiver_class", return_value="bypass"),
+        ]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def run_cli(self, *argv: str) -> tuple[int, str, str]:
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def send(self, *extra: str) -> str:
+        code, out, err = self.run_cli("send", "--to", "codex@impl", "-m", "实现 X\n细节", "--no-wait", "--json", *extra)
+        self.assertEqual(code, cli.EXIT_OK, err)
+        return json.loads(out)["id"]
+
+    def store(self) -> Store:
+        return Store.open(self.state)
+
+    def mark_sent(self, task_id: str, delivery: Delivery = Delivery.QUEUED) -> None:
+        with self.store() as store:
+            attempt = store.attempts(task_id)[-1]
+            store.begin_send(attempt.id, now=1.0, pid=1, start_ticks="1")
+            store.finish_send(attempt.id, delivery=delivery, reason="test", provider_ref=None, detail={}, now=2.0)
+
+    def test_peers_and_doctor_show_the_local_device(self) -> None:
+        """设备名要有人看得见：peers 每行一列、doctor 一行（DESIGN §45.35）。"""
+        with patch.object(cli, "device_name", return_value="test-box"):
+            code, out, err = self.run_cli("peers", "--json")
+            self.assertEqual(code, cli.EXIT_OK, err)
+            rows = json.loads(out)["peers"]
+            # 今天发现到的端点全在本机，所以每行都是同一个值；这一列是给以后跨设备留的显示位
+            self.assertEqual({row["device"] for row in rows}, {"test-box"})
+            code, out, err = self.run_cli("doctor", "--json")
+            self.assertEqual(code, cli.EXIT_OK, err)
+            self.assertEqual(json.loads(out)["device"], "test-box")
+        code, out, _err = self.run_cli("doctor")
+        self.assertIn("本机设备名", out)
+
+    def test_read_only_target_is_refused_at_every_entry(self) -> None:
+        self.endpoints = [IMPL, REVIEW, LEAD, endpoint(GROK.ref, issues=("no_inbox",))]
+        task_id = self.send()
+        self.mark_sent(task_id, Delivery.FAILED)
+        cases = [
+            ("send", "--to", GROK.ref.native_id, "-m", "x", "--no-wait"),
+            ("send", "--to", "grok@grok", "-m", "x", "--no-wait"),
+            ("send", "--to", "codex@impl", "--review-by", "grok@grok", "-m", "x", "--no-wait"),
+            ("retry", task_id[:8], "--to", "grok@grok", "-m", "x"),
+        ]
+        for argv in cases:
+            with self.subTest(command=argv[0] + ("+review" if "--review-by" in argv else "")):
+                code, _out, err = self.run_cli(*argv)
+                self.assertEqual(code, cli.EXIT_REJECTED, err)
+                self.assertIn("target_no_inbox", err)
+                self.assertIn("没有收件通道", err)
+        # 只读端点照常出现在 peers 里，并标明原因
+        code, out, _err = self.run_cli("peers")
+        self.assertEqual(code, cli.EXIT_OK)
+        self.assertIn("只读", out)
+
+    def test_ambiguous_read_only_candidates_report_the_real_reason(self) -> None:
+        # 同一进程 resume 出两个会话：pane 与 provider@会话名都命中两行，但换哪个候选都投不进去
+        second = endpoint(
+            ref(Provider.GROK, "019a0000-dddd-7ddd-8ddd-dddddddddddd", pid=4000, pane="%9", label="grok"),
+            issues=("no_inbox", "shared_process"),
+        )
+        self.endpoints = [IMPL, REVIEW, LEAD, endpoint(GROK.ref, issues=("no_inbox", "shared_process")), second]
+        for selector in ("grok@grok", "%9"):
+            with self.subTest(selector=selector):
+                code, _out, err = self.run_cli("send", "--to", selector, "-m", "x", "--no-wait")
+                self.assertEqual(code, cli.EXIT_REJECTED, err)
+                self.assertIn("target_no_inbox", err)
+                self.assertNotIn("可选目标", err)
+        # 候选里混有能收件的会话时（同一 pane 里既有 Grok 又有 Codex），仍然是「目标不唯一」，让用户去选
+        self.endpoints = [
+            IMPL,
+            endpoint(GROK.ref, issues=("no_inbox",)),
+            endpoint(ref(Provider.CODEX, "other-thread", pid=1001, pane="%9", label="other")),
+        ]
+        code, _out, err = self.run_cli("send", "--to", "%9", "-m", "x", "--no-wait")
+        self.assertEqual(code, cli.EXIT_TARGET, err)
+        self.assertIn("target_ambiguous", err)
+
+    def test_send_from_terminal_creates_queued_task(self) -> None:
+        task_id = self.send()
+        code, out, _ = self.run_cli("status", task_id[:8], "--json")
+        self.assertEqual(code, 0)
+        document = json.loads(out)
+        self.assertEqual((document["phase"], document["title"], document["origin"]), ("queued", "实现 X", None))
+        self.assertEqual(document["attempts"][0]["senderClass"], "bypass")
+        self.assertNotIn("body", document["attempts"][0])
+        code, out, _ = self.run_cli("status", task_id[:8], "--body", "--json")
+        self.assertEqual(json.loads(out)["attempts"][0]["body"], "实现 X\n细节")
+
+    def test_no_wait_send_to_idle_target_explains_background_sending(self) -> None:
+        code, out, _ = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--no-wait")
+        self.assertEqual(code, cli.EXIT_OK)
+        self.assertIn("后台 worker 正在发送", out)
+
+    def test_send_exit_codes(self) -> None:
+        code, _, err = self.run_cli("send", "--to", "nope", "-m", "x", "--no-wait")
+        self.assertEqual((code, "target_not_found" in err), (cli.EXIT_TARGET, True))
+        self.caller = as_agent(IMPL)
+        code, _, err = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+        self.assertEqual((code, "target_is_self" in err), (cli.EXIT_REJECTED, True))
+        self.caller = USER
+        self.endpoints = [endpoint(IMPL.ref, issues=("no_thread_yet",))]
+        code, _, err = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+        self.assertEqual((code, "target_no_thread_yet" in err), (cli.EXIT_REJECTED, True))
+        self.endpoints = [endpoint(IMPL.ref, runtime=Runtime.BUSY)]
+        self.worker_up = False
+        code, out, _ = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertIn("对方忙", out)
+
+    def test_agent_origin_is_recorded(self) -> None:
+        self.caller = as_agent(LEAD)
+        task_id = self.send("--review-by", "claude@review")
+        with self.store() as store:
+            task = store.get_task(task_id)
+        assert task is not None
+        self.assertTrue(task.origin is not None and task.origin.same_session(LEAD.ref))
+        self.assertTrue(task.reviewer is not None and task.reviewer.same_session(REVIEW.ref))
+
+    def test_retry_needs_force_when_delivery_is_unknown(self) -> None:
+        task_id = self.send()
+        code, _, err = self.run_cli("retry", task_id)
+        self.assertEqual((code, "still_pending" in err), (cli.EXIT_REJECTED, True))
+        self.mark_sent(task_id, Delivery.UNKNOWN)
+        code, _, err = self.run_cli("retry", task_id)
+        self.assertEqual((code, "retry_requires_force" in err), (cli.EXIT_REJECTED, True))
+        code, out, _ = self.run_cli("retry", task_id, "--force")
+        self.assertEqual(code, 0)
+        self.assertIn("可能重复执行", out)
+        with self.store() as store:
+            attempts = store.attempts(task_id)
+        self.assertEqual([(item.seq, item.delivery) for item in attempts], [(1, Delivery.UNKNOWN), (2, Delivery.PENDING)])
+
+    def test_failed_delivery_can_be_redirected_without_force(self) -> None:
+        task_id = self.send()
+        self.mark_sent(task_id, Delivery.FAILED)
+        code, _, err = self.run_cli("retry", task_id, "--to", "codex@lead")
+        self.assertEqual(code, 0, err)
+        with self.store() as store:
+            latest = store.attempts(task_id)[-1]
+        self.assertTrue(latest.target.same_session(LEAD.ref))
+        self.assertEqual(latest.body, "实现 X\n细节")
+
+    def test_acceptance_rules(self) -> None:
+        self.caller = as_agent(LEAD)
+        task_id = self.send()
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        code, _, err = self.run_cli("accept", task_id, "--force")
+        self.assertEqual((code, "accept_not_allowed" in err), (cli.EXIT_REJECTED, True))
+        self.caller = USER
+        code, _, err = self.run_cli("accept", task_id)
+        self.assertEqual((code, "no_result_to_accept" in err), (cli.EXIT_REJECTED, True))
+        self.caller = as_agent(IMPL)
+        code, out, err = self.run_cli("report", task_id, "--result", "--note", "完成")
+        self.assertEqual(code, 0, err)
+        self.assertIn("已排队通知发起方", out)
+        self.caller = as_agent(LEAD)
+        code, _, err = self.run_cli("accept", task_id)
+        self.assertEqual(code, 0, err)
+        code, out, _ = self.run_cli("status", task_id, "--json")
+        self.assertEqual(json.loads(out)["phase"], "done")
+
+    def test_review_changes_go_back_to_implementer(self) -> None:
+        task_id = self.send("--review-by", "claude@review")
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        self.assertEqual(self.run_cli("report", task_id, "--result", "--note", "v1")[0], 0)
+        self.mark_sent(task_id, Delivery.DELIVERED)
+        self.caller = as_agent(REVIEW)
+        self.assertEqual(self.run_cli("report", task_id, "--changes", "--note", "缺测试")[0], 0)
+        code, _, _ = self.run_cli("wait", task_id, "--timeout", "0")
+        self.assertEqual(code, cli.EXIT_FAILURE_REPORTED)
+        self.caller = USER
+        code, _, err = self.run_cli("retry", task_id)
+        self.assertEqual(code, 0, err)
+        with self.store() as store:
+            task = store.get_task(task_id)
+            latest = store.attempts(task_id)[-1]
+        assert task is not None
+        self.assertIsNone(task.verdict)
+        self.assertEqual((latest.role, latest.work), (Role.HANDOFF, Work.AWAITING_ACK))
+        self.assertTrue(latest.target.same_session(IMPL.ref))
+        self.assertIn("缺测试", latest.body)
+        self.assertIn("实现 X", latest.body)
+        self.assertNotEqual(task.verdict, Verdict.CHANGES)
+
+    def test_cancel_wait_and_close(self) -> None:
+        task_id = self.send()
+        code, _, _ = self.run_cli("wait", task_id, "--timeout", "0")
+        self.assertEqual(code, cli.EXIT_TIMEOUT)
+        self.assertEqual(self.run_cli("cancel", task_id)[0], 0)
+        code, _, err = self.run_cli("cancel", task_id)
+        self.assertEqual((code, "nothing_to_cancel" in err), (cli.EXIT_REJECTED, True))
+        second = self.send()
+        self.mark_sent(second)
+        code, out, _ = self.run_cli("close", second)
+        self.assertEqual(code, 0)
+        self.assertIn("无法撤回", out)
+        with self.store() as store:
+            self.assertEqual(store.archived_risk_count(), 1)
+        code, out, _ = self.run_cli("tasks", "--json")
+        self.assertEqual([item["id"] for item in json.loads(out)["tasks"]], [task_id])
+
+    def test_wait_returns_unknown_delivery_immediately(self) -> None:
+        task_id = self.send()
+        self.mark_sent(task_id, Delivery.UNKNOWN)
+        started = time.monotonic()
+        code, out, _ = self.run_cli("wait", task_id, "--timeout", "30")
+        self.assertEqual(code, cli.EXIT_UNKNOWN)
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertIn("retry", out)
+
+    def test_wait_until_ack_stops_on_blocked_report(self) -> None:
+        task_id = self.send()
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        self.assertEqual(self.run_cli("report", task_id, "--blocked", "--note", "缺权限")[0], 0)
+        code, _, _ = self.run_cli("wait", task_id, "--until", "ack", "--timeout", "0")
+        self.assertEqual(code, cli.EXIT_FAILURE_REPORTED)
+
+    def test_forced_acceptance_cancels_queued_messages(self) -> None:
+        task_id = self.send()
+        code, _, err = self.run_cli("accept", task_id, "--force")
+        self.assertEqual(code, 0, err)
+        with self.store() as store:
+            self.assertEqual([item.delivery for item in store.attempts(task_id)], [Delivery.CANCELLED])
+
+    def test_shared_thread_opt_in_is_required_and_kept_for_retry(self) -> None:
+        self.endpoints = [endpoint(IMPL.ref, issues=("shared_thread",)), REVIEW, LEAD]
+        code, _, err = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+        self.assertEqual((code, "target_shared_thread" in err), (cli.EXIT_REJECTED, True))
+        task_id = self.send("--allow-shared")
+        self.mark_sent(task_id, Delivery.FAILED)
+        code, _, err = self.run_cli("retry", task_id)
+        self.assertEqual(code, 0, err)
+        with self.store() as store:
+            self.assertTrue(store.attempts(task_id)[-1].allow_shared)
+
+    def test_no_notify_skips_origin_notice(self) -> None:
+        self.caller = as_agent(LEAD)
+        task_id = self.send("--no-notify")
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        code, out, err = self.run_cli("report", task_id, "--result", "--note", "完成")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("通知发起方", out)
+        with self.store() as store:
+            self.assertEqual(len(store.attempts(task_id)), 1)
+
+    def test_status_revives_missing_worker_for_queued_messages(self) -> None:
+        task_id = self.send()
+        self.worker_up = False
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        self.assertEqual(self.run_cli("status", task_id)[0], 0)
+        cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+
+    def test_commands_and_if_stale_summary_revive_worker_for_a_pending_origin_reminder(self) -> None:
+        self.caller = as_agent(LEAD)
+        task_id = self.send()
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        self.assertEqual(self.run_cli("report", task_id, "--result", "--note", "完成")[0], 0)
+        self.mark_sent(task_id)  # 回执已交到发起方：此时只剩「等提醒到期」这一件待办
+        self.caller = USER
+        self.worker_up = False
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        # 扩展定时 summary --if-stale 也能恢复：worker 环境会补上 ~/.local/bin（DESIGN §45.30，取代 §45.28.3 的「summary 不拉起」）
+        self.assertEqual(self.run_cli("summary", "--if-stale")[0], 0)
+        cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        self.assertEqual(self.run_cli("tasks")[0], 0)
+        cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+        self.assertEqual(self.run_cli("accept", task_id)[0], 0)
+        # 验收给执行方排了结束回执（DESIGN §45.31），它发出之前仍需要 worker
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        self.assertEqual(self.run_cli("summary", "--if-stale")[0], 0)
+        cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+        self.mark_sent(task_id)
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        self.assertEqual(self.run_cli("tasks")[0], 0)
+        self.assertEqual(self.run_cli("summary", "--if-stale")[0], 0)
+        cli.ensure_worker.assert_not_called()  # type: ignore[attr-defined]
+
+    def summary_json(self, *extra: str) -> tuple[int, dict[str, object], str]:
+        code, out, err = self.run_cli("summary", *extra, "--json")
+        return code, json.loads(out) if out else {}, err
+
+    def test_only_if_stale_summary_revives_and_only_when_needed(self) -> None:
+        # 还没有账本：if-stale 仍报 ledger_absent（退出码 6、未落账），不拉起、不建账本
+        code, _out, err = self.run_cli("summary", "--if-stale")
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertIn("ledger_absent", err)
+        self.assertFalse((self.state / "bridge.sqlite3").exists())
+        cli.ensure_worker.assert_not_called()  # type: ignore[attr-defined]
+        self.send()  # 用户发起、排队待发：需要 worker
+        self.worker_up = False
+        # 普通 summary 与只带 --refresh 的手动重建不新增拉起
+        for extra in ((), ("--refresh",)):
+            with self.subTest(extra=extra):
+                cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+                code, document, err = self.summary_json(*extra)
+                self.assertEqual((code, err), (cli.EXIT_OK, ""))
+                self.assertEqual(document["state"], "ok")
+                cli.ensure_worker.assert_not_called()  # type: ignore[attr-defined]
+        # if-stale 的「未变化」分支：按需拉起一次，JSON 与退出码不变
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        code, document, err = self.summary_json("--if-stale")
+        self.assertEqual((code, document["published"], err), (cli.EXIT_OK, "fresh", ""))
+        cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+        # 「重写」分支：账本有变化而摘要未发布
+        (self.state / "summary.json").unlink()
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        code, document, err = self.summary_json("--if-stale")
+        self.assertEqual((code, document["published"], err), (cli.EXIT_OK, "written", ""))
+        cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+        # worker 已在运行：不新增进程
+        self.worker_up = True
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        self.assertEqual(self.summary_json("--if-stale")[0], cli.EXIT_OK)
+        cli.ensure_worker.assert_not_called()  # type: ignore[attr-defined]
+        self.worker_up = False
+        # 没有后台需求：不拉起
+        with patch.object(cli, "needs_worker", return_value=False):
+            cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+            self.assertEqual(self.summary_json("--if-stale")[0], cli.EXIT_OK)
+            cli.ensure_worker.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_if_stale_revive_errors_never_change_summary_output_or_exit_code(self) -> None:
+        self.send()
+        self.worker_up = False
+        expected = self.summary_json("--if-stale")[1]
+        # 需求检查读账本出错：吞掉，不兜底再拉
+        with patch.object(cli, "needs_worker", side_effect=sqlite3.OperationalError("disk I/O error")):
+            cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+            self.assertEqual(self.summary_json("--if-stale"), (cli.EXIT_OK, expected, ""))
+            cli.ensure_worker.assert_not_called()  # type: ignore[attr-defined]
+        # 锁文件异常按未运行处理；拉起本身抛错：只试一次，输出不变
+        for failure in (OSError("spawn"), RuntimeError("unexpected")):
+            with self.subTest(failure=type(failure).__name__):
+                cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+                cli.ensure_worker.side_effect = failure  # type: ignore[attr-defined]
+                try:
+                    self.assertEqual(self.summary_json("--if-stale"), (cli.EXIT_OK, expected, ""))
+                finally:
+                    cli.ensure_worker.side_effect = None  # type: ignore[attr-defined]
+                cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+        with patch.object(cli, "worker_running", side_effect=IsADirectoryError("worker.lock")):
+            cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+            self.assertEqual(self.summary_json("--if-stale"), (cli.EXIT_OK, expected, ""))
+            cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+        # 摘要写入失败：既有退出码 8 不变，补查照样只试一次（新 worker 启动时会重建摘要）
+        with patch.object(cli.summary, "publish", side_effect=cli.summary.SummaryError("summary_write_failed")):
+            cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+            code, out, err = self.run_cli("summary", "--if-stale", "--json")
+            self.assertEqual((code, out), (cli.EXIT_STORE, ""))
+            self.assertIn("summary_write_failed", err)
+            self.assertNotIn("Traceback", err)
+            cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+
+    def test_if_stale_summary_follows_every_background_need(self) -> None:
+        # summary 用的是同一个 needs_worker：排队、发送中、观察窗口与待办提醒（见上）都拉起，窗口外的旧投递不拉起
+        now = time.time()
+        cases: list[tuple[str, Delivery | None, float, bool]] = [
+            ("pending", None, now, True),
+            ("sending", Delivery.SENDING, now, True),
+            ("written_recent", Delivery.WRITTEN, now, True),
+            ("held_recent", Delivery.HELD, now, True),
+            ("queued_unconsumed", Delivery.QUEUED, now, True),
+            ("written_old", Delivery.WRITTEN, now - 2 * 3600, False),
+            ("queued_old", Delivery.QUEUED, now - 2 * 3600, False),
+        ]
+        for name, delivery, at, needed in cases:
+            with self.subTest(case=name), TemporaryDirectory() as other:
+                state = Path(other) / "bridge"
+                with patch.dict(os.environ, {"AB_STATE_DIR": str(state)}):
+                    self.worker_up = True
+                    task_id = self.send()
+                    self.worker_up = False
+                    if delivery is not None:
+                        with Store.open(state) as store:
+                            attempt = store.attempts(task_id)[-1]
+                            store.begin_send(attempt.id, now=at, pid=1, start_ticks="1")
+                            if delivery is not Delivery.SENDING:
+                                store.finish_send(
+                                    attempt.id, delivery=delivery, reason="test", provider_ref=None, detail={}, now=at
+                                )
+                    cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+                    self.assertEqual(self.run_cli("summary", "--if-stale")[0], cli.EXIT_OK)
+                    self.assertEqual(cli.ensure_worker.call_count, 1 if needed else 0)  # type: ignore[attr-defined]
+
+    def test_command_that_already_started_worker_is_not_revived_again(self) -> None:
+        # report/retry/resume 自己拉起过 worker：main 结束时不再补拉，新 worker 还没持锁时会多起一个进程（Opus 审计 F2）
+        self.caller = as_agent(LEAD)
+        task_id = self.send()
+        self.mark_sent(task_id)
+        self.worker_up = False
+        self.caller = as_agent(IMPL)
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        cli.ensure_worker.return_value = True  # type: ignore[attr-defined]  # 真的新拉起了进程（它还没拿到锁）
+        self.assertEqual(self.run_cli("report", task_id, "--blocked", "--note", "缺权限")[0], 0)
+        cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+        self.mark_sent(task_id)
+        self.caller = as_agent(LEAD)
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        self.assertEqual(self.run_cli("retry", task_id)[0], 0)
+        cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+        # 结束补查失败的兜底分支也不能再拉一次（Codex 复审 S03）
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        real_publish = cli.summary.publish
+        calls = {"n": 0}
+
+        def failing_after_first(*args: object, **kwargs: object):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise cli.summary.SummaryError("summary_write_failed")
+            return real_publish(*args, **kwargs)  # type: ignore[arg-type]
+
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        with patch.object(cli.summary, "publish", side_effect=failing_after_first):
+            self.assertEqual(self.run_cli("report", task_id, "--blocked", "--note", "还是缺")[0], 0)
+        cli.ensure_worker.assert_called_once()  # type: ignore[attr-defined]
+
+    def test_worker_start_failure_after_commit_explains_instead_of_crashing(self) -> None:
+        # report/retry/resume 已写入账本后拉起 worker 失败：说明已记录并返回 6，不以异常堆栈退出（DESIGN §45.29）
+        self.caller = as_agent(LEAD)
+        task_id = self.send()
+        self.mark_sent(task_id)
+        self.worker_up = False
+        cli.ensure_worker.side_effect = OSError("spawn")  # type: ignore[attr-defined]
+        try:
+            self.caller = as_agent(IMPL)
+            code, out, err = self.run_cli("report", task_id, "--blocked", "--note", "缺权限")
+            self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+            self.assertIn("已记录", out)
+            self.assertIn("无法启动后台 worker", err)
+            self.assertIn("已记入账本", err)
+            with self.store() as store:
+                self.assertEqual(store.attempts(task_id)[0].work, Work.BLOCKED)
+                self.assertEqual(store.attempts(task_id)[-1].role, Role.NOTICE)
+            self.caller = as_agent(LEAD)
+            code, out, err = self.run_cli("retry", task_id)
+            self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+            self.assertIn("已排队第", out)
+            self.assertIn("无法启动后台 worker", err)
+            self.assertIn("请勿重复执行", err)
+            self.assertIn("summary 除外", err)
+            self.assertEqual(self.run_cli("pause", task_id)[0], 0)
+            code, out, err = self.run_cli("resume", task_id)
+            self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+            self.assertIn("继续发送", out)
+            self.assertIn("无法启动后台 worker", err)
+            # --json 同样返回 6，stdout 仍是合法 JSON，说明只写 stderr（Codex F02 / Opus P3-3）
+            self.mark_sent(task_id)
+            self.caller = as_agent(IMPL)
+            code, out, err = self.run_cli("report", task_id, "--result", "--note", "好了", "--json")
+            self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+            self.assertEqual(json.loads(out)["phase"], "awaiting_acceptance")
+            self.assertIn("已记入账本", err)
+            # 没有排队消息、但结果待验收还等着提醒：仍需要 worker，照样报 6（Codex 复审 R01）
+            self.caller = as_agent(LEAD)
+            with self.store() as store:
+                for attempt in store.attempts(task_id):
+                    store.transition_delivery(
+                        attempt.id, expected=(Delivery.PENDING,), new=Delivery.CANCELLED, reason="test", now=3.0
+                    )
+            self.assertEqual(self.run_cli("pause", task_id)[0], 0)
+            code, _out, err = self.run_cli("resume", task_id)
+            self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+            self.assertIn("可检查 worker 状态", err)
+            # 读账本判断需求时出错：按需要处理、返回 6，不打堆栈（Opus 第二轮复审）
+            self.assertEqual(self.run_cli("pause", task_id)[0], 0)
+            with patch.object(cli, "needs_worker", side_effect=sqlite3.OperationalError("disk I/O error")):
+                code, _out, err = self.run_cli("resume", task_id)
+            self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+            self.assertNotIn("Traceback", err)
+            # 没有任何后台工作的任务恢复：不需要 worker，不报（Opus 审计 P3-5）
+            with self.store() as store:
+                store.update_task(task_id, now=4.0, event="accepted", accepted_at=4.0)
+            self.caller = USER
+            code, out, _err = self.run_cli("send", "--to", "codex@impl", "-m", "只读", "--no-wait", "--json")
+            self.assertEqual(code, cli.EXIT_UNAVAILABLE, "新任务排队、拉起失败：send 报 6")
+            idle = json.loads(out)["id"]
+            self.mark_sent(idle)
+            self.caller = as_agent(IMPL)
+            # 没有后续消息的汇报不需要 worker：拉起失败也不报（Opus 复审 P3-c）
+            code, _out, err = self.run_cli("report", idle, "--progress", "--note", "进行中")
+            self.assertEqual((code, err), (cli.EXIT_OK, ""))
+            code, _out, err = self.run_cli("report", idle, "--result", "--note", "好了")
+            self.assertEqual((code, err), (cli.EXIT_OK, ""), "用户发起的任务没有回执与提醒")
+            self.caller = USER
+            self.assertEqual(self.run_cli("pause", idle)[0], 0)
+            code, _out, err = self.run_cli("resume", idle)
+            self.assertEqual((code, err), (cli.EXIT_OK, ""))
+            # 另一个仍在暂停的任务上有发送中断待恢复的记录（SENDING）：恢复空闲任务时也需要 worker。
+            # SENDING 所在任务保持暂停，才测得到「暂停中的发送也要恢复」这条专属判断（Opus 末轮复审）
+            with self.store() as store:
+                store.update_task(task_id, now=5.0, event="reopen", accepted_at=None)
+                retried = store.add_attempt(
+                    task_id, role=Role.HANDOFF, target=IMPL.ref, body="再来", refs=[], now=5.0, sender=None, sender_class=None
+                )
+                store.begin_send(retried.id, now=5.0, pid=1, start_ticks="1")
+                store.update_task(task_id, now=5.0, event="paused", control="paused")
+            self.assertEqual(self.run_cli("pause", idle)[0], 0)
+            code, _out, _err = self.run_cli("resume", idle)
+            self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        finally:
+            cli.ensure_worker.side_effect = None  # type: ignore[attr-defined]
+        # 能拉起时照常返回 0
+        self.assertEqual(self.run_cli("pause", idle)[0], 0)
+        self.assertEqual(self.run_cli("resume", idle)[0], 0)
+
+    def test_broken_worker_lock_does_not_crash_send_or_doctor(self) -> None:
+        # 锁文件异常（例如被替换成目录）：已写入账本的 send 与用来排查的 doctor 都不能打堆栈（Opus 审计 P3-6）
+        with patch.object(cli, "worker_running", side_effect=IsADirectoryError("worker.lock")):
+            code, out, err = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--no-wait")
+            self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+            self.assertIn("已交给", out)
+            self.assertNotIn("Traceback", err)
+            code, out, _err = self.run_cli("doctor", "--json")
+            self.assertEqual(code, cli.EXIT_OK)
+            self.assertFalse(json.loads(out)["workerRunning"])
+            self.assertIn("IsADirectoryError", json.loads(out)["workerLockError"], "doctor 要能看到原因（Opus 复审 P3-b）")
+
+    def test_failed_or_noop_start_keeps_the_final_revive(self) -> None:
+        # 启动失败、或当时旧 worker 还在（随后退出），都不能消费命令结束时的补拉（Codex 复审 S02 / Opus 复审 P3-1）
+        self.caller = as_agent(LEAD)  # 有发起方：结果回执排队，需要 worker
+        task_id = self.send()
+        self.worker_up = False
+        real_publish = cli.summary.publish
+        calls = {"n": 0}
+
+        def failing_first(*args: object, **kwargs: object):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise cli.summary.SummaryError("summary_lock_timeout")
+            return real_publish(*args, **kwargs)  # type: ignore[arg-type]
+
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        cli.ensure_worker.side_effect = [OSError("spawn"), True]  # type: ignore[attr-defined]
+        try:
+            with patch.object(cli.summary, "publish", side_effect=failing_first):
+                self.assertEqual(self.run_cli("tasks")[0], 0)
+        finally:
+            cli.ensure_worker.side_effect = None  # type: ignore[attr-defined]
+        self.assertEqual(cli.ensure_worker.call_count, 2)  # type: ignore[attr-defined]
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
+        cli.ensure_worker.return_value = False  # type: ignore[attr-defined]  # report 时旧 worker 仍持锁，结束前退出
+        self.assertEqual(self.run_cli("report", task_id, "--blocked", "--note", "缺权限")[0], 0)
+        self.assertEqual(cli.ensure_worker.call_count, 2)  # type: ignore[attr-defined]
+
+    def test_status_flags_target_that_stopped_without_reporting(self) -> None:
+        task_id = self.send()
+        self.mark_sent(task_id)
+        # worker 已观察到 Codex 队列项离开队列；未观察到时不应提示（DESIGN §45.12）
+        with self.store() as store:
+            store.set_consumption(store.attempts(task_id)[0].id, Consumption.LEFT_QUEUE, now=3.0)
+        self.panes = {"%1": PaneState(Runtime.IDLE, time.time() - 120, True)}
+        code, out, _ = self.run_cli("status", task_id)
+        self.assertEqual(code, 0)
+        self.assertIn("还没有汇报", out)
+        self.assertIn(f"{CMD} retry {task_id[:8]} --force", out)
+        self.assertNotIn(f"{CMD} retry {task_id[:8]} /", out)
+        document = json.loads(self.run_cli("status", task_id, "--json")[1])
+        self.assertTrue(document["targetStoppedWithoutReport"])
+        listed = json.loads(self.run_cli("tasks", "--json")[1])["tasks"][0]
+        self.assertTrue(listed["targetStoppedWithoutReport"])
+        self.assertIn("对方已停下未汇报", self.run_cli("tasks")[1])
+        # 只是查询时的提示：不改变任务状态
+        self.assertEqual(document["phase"], "running")
+        self.caller = as_agent(IMPL)
+        self.assertEqual(self.run_cli("report", task_id, "--result", "--note", "完成")[0], 0)
+        self.caller = USER
+        self.assertFalse(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+
+    def test_status_flags_target_session_that_is_not_found(self) -> None:
+        task_id = self.send()
+        self.mark_sent(task_id)
+        # 发现里还有别的会话，却没有 impl 的任何一代：可能已退出，也可能暂时无法识别（DESIGN §45.32）
+        self.endpoints = [REVIEW, LEAD]
+        code, out, _ = self.run_cli("status", task_id)
+        self.assertEqual(code, 0)
+        self.assertIn("当前未发现 codex@impl 的会话（可能已退出", out)
+        self.assertNotIn("已不在", out)
+        self.assertIn(f"{CMD} retry {task_id[:8]} --force", out)
+        document = json.loads(self.run_cli("status", task_id, "--json")[1])
+        self.assertTrue(document["targetSessionMissing"])
+        self.assertFalse(document["targetStoppedWithoutReport"])
+        self.assertEqual(document["phase"], "running")
+        self.assertTrue(json.loads(self.run_cli("tasks", "--json")[1])["tasks"][0]["targetSessionMissing"])
+        self.assertIn("未发现对方会话", self.run_cli("tasks")[1])
+        # 未确证离开 Codex 队列的各种观察都只说“若仍在”，重发与改派都提示可能重复；确证离队后不再提
+        with self.store() as store:
+            attempt_id = store.attempts(task_id)[0].id
+        for consumption in (Consumption.NOT_OBSERVED, Consumption.UNKNOWN, Consumption.STILL_QUEUED, Consumption.LEFT_QUEUE):
+            with self.subTest(consumption=consumption):
+                with self.store() as store:
+                    store.set_consumption(attempt_id, consumption, now=3.0)
+                out = self.run_cli("status", task_id)[1]
+                self.assertIn("当前未发现", out)
+                maybe_queued = consumption is not Consumption.LEFT_QUEUE
+                self.assertEqual("尚未确认离开 Codex 队列" in out, maybe_queued)
+                self.assertEqual("都可能重复执行" in out, maybe_queued)
+        # 发现结果为空视为发现失败，不提示；对方恢复后提示消失
+        self.endpoints = []
+        self.assertFalse(json.loads(self.run_cli("status", task_id, "--json")[1])["targetSessionMissing"])
+        self.endpoints = [IMPL, REVIEW, LEAD]
+        self.assertFalse(json.loads(self.run_cli("status", task_id, "--json")[1])["targetSessionMissing"])
+        self.assertNotIn("未发现对方会话", self.run_cli("tasks")[1])
+
+    def test_left_queue_wording_does_not_claim_execution(self) -> None:
+        self.assertNotIn("已开始", cli.CONSUMPTION_LABELS[Consumption.LEFT_QUEUE])
+
+    def test_pause_resume(self) -> None:
+        task_id = self.send()
+        self.assertEqual(self.run_cli("pause", task_id)[0], 0)
+        code, out, _ = self.run_cli("status", task_id)
+        self.assertIn(f"{CMD} resume", out)
+        self.assertEqual(self.run_cli("resume", task_id)[0], 0)
+        code, _, err = self.run_cli("resume", task_id)
+        self.assertEqual((code, "not_paused" in err), (cli.EXIT_REJECTED, True))
+
+
+class DeviceNameTests(unittest.TestCase):
+    """本机设备名：固定值、形状受控，且 peers/doctor 都把它显示出来（DESIGN §45.35）。"""
+
+    def resolve(self, hostname: str, override: str | None = None) -> str:
+        environment = {"AB_DEVICE": override} if override is not None else {}
+        with (
+            patch.object(paths.socket, "gethostname", return_value=hostname),
+            patch.dict(os.environ, environment, clear=False),
+        ):
+            if override is None:
+                os.environ.pop("AB_DEVICE", None)
+            return paths.device_name()
+
+    def test_value_is_bounded_and_safe_for_a_header_field(self) -> None:
+        cases = {
+            # 只取主机名第一段：没有理由把内网域名一起发进跨会话消息
+            ("devbox.lan", None): "devbox",
+            # 空白与 `=` 都会毁掉「消息头只有一行、按 k=v 切分」这条
+            ("my box=1", None): "my-box-1",
+            ("...", None): "local",
+            ("", None): "local",
+            # 覆盖优先：跨设备时主机名可能重名，要能显式命名
+            ("devbox", "arm-hub"): "arm-hub",
+            ("devbox", "  "): "devbox",
+            ("x" * 80, None): "x" * paths.DEVICE_CHARS,
+        }
+        for (hostname, override), expected in cases.items():
+            with self.subTest(hostname=hostname, override=override):
+                value = self.resolve(hostname, override)
+                self.assertEqual(value, expected)
+                self.assertRegex(value, r"^[A-Za-z0-9._-]{1,32}$")
+
+
+class CommandNameTests(unittest.TestCase):
+    """对外命令名：env > argv0（限认得的入口名）> 独立版默认名（DESIGN §45.36）。"""
+
+    def resolve(self, argv0: str, override: str | None = None) -> str:
+        environment = {naming.COMMAND_ENV: override} if override is not None else {}
+        with patch.object(naming.sys, "argv", [argv0]), patch.dict(os.environ, environment, clear=False):
+            if override is None:
+                os.environ.pop(naming.COMMAND_ENV, None)
+            return naming.command_name()
+
+    def test_resolution_order(self) -> None:
+        cases = {
+            # 装出来的命令与 opt-in 别名：用户敲哪个，生成给对方的命令就写哪个
+            ("/home/x/.local/bin/ab", None): "ab",
+            ("agent-bridge", None): "agent-bridge",
+            ("/opt/venv/bin/agent-bridge", None): "agent-bridge",
+            # 不是命令行入口（worker 是 `python -m` 起的）：猜不出来就用默认名，由拉起方显式传
+            ("/usr/bin/python3", None): naming.DEFAULT_COMMAND,
+            ("/x/agentstatus_bridge/__main__.py", None): naming.DEFAULT_COMMAND,
+            ("", None): naming.DEFAULT_COMMAND,
+            # env 显式覆盖一切：集成版的入口脚本就是这么绑的
+            ("/usr/bin/python3", "ab"): "ab",
+            ("agent-bridge", "ab"): "ab",
+            ("ab", "  "): "ab",
+        }
+        for (argv0, override), expected in cases.items():
+            with self.subTest(argv0=argv0, override=override):
+                self.assertEqual(self.resolve(argv0, override), expected)
+
+    def test_argv_may_be_empty(self) -> None:
+        with patch.object(naming.sys, "argv", []), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(naming.COMMAND_ENV, None)
+            self.assertEqual(naming.command_name(), naming.DEFAULT_COMMAND)
+
+    def test_help_and_version_follow_the_entry_name(self) -> None:
+        with patch.dict(os.environ, {naming.COMMAND_ENV: "ab"}, clear=False):
+            parser = cli.build_parser()
+        self.assertEqual(parser.prog, "ab")
+        self.assertIn("ab 自动拉起", parser.format_help())
+
+
+class StateRootTests(unittest.TestCase):
+    """状态根：默认是独立版的目录，集成版由入口脚本绑回现役根，来源要能看出来（DESIGN §45.36）。"""
+
+    def resolve(self, environment: dict[str, str]) -> tuple[str, str]:
+        keys = ("AB_STATE_DIR", "AB_BINDING", "XDG_STATE_HOME")
+        with patch.dict(os.environ, environment, clear=False):
+            for key in keys:
+                if key not in environment:
+                    os.environ.pop(key, None)
+            return str(paths.state_dir()), paths.state_dir_source()
+
+    def test_default_is_the_standalone_directory(self) -> None:
+        root, source = self.resolve({})
+        self.assertEqual(root, str(Path.home() / ".local/state" / paths.STATE_DIR_NAME))
+        self.assertEqual(source, "default")
+        # 拆仓前的现役根不再是默认值：集成版必须显式绑，不能靠默认值碰巧相同
+        self.assertNotEqual(root, str(Path.home() / ".local/state/agentstatus/bridge"))
+
+    def test_xdg_state_home_is_respected(self) -> None:
+        root, source = self.resolve({"XDG_STATE_HOME": "/tmp/xdg"})
+        self.assertEqual(root, f"/tmp/xdg/{paths.STATE_DIR_NAME}")
+        self.assertEqual(source, "default")
+
+    def test_source_separates_an_explicit_value_from_the_integration_binding(self) -> None:
+        self.assertEqual(self.resolve({"AB_STATE_DIR": "/tmp/mine"}), ("/tmp/mine", "env"))
+        self.assertEqual(
+            self.resolve({"AB_STATE_DIR": "/tmp/bound", "AB_BINDING": "agentstatus:/tmp/bound"}),
+            ("/tmp/bound", "integration"),
+        )
+
+    def test_stale_or_rootless_binding_never_claims_integration(self) -> None:
+        # 旧的裸标记没有绑定根证据；继承标记后改根也不能沿用 integration。
+        for marker in ("agentstatus", "agentstatus:", "agentstatus:/tmp/old"):
+            with self.subTest(marker=marker):
+                self.assertEqual(
+                    self.resolve({"AB_STATE_DIR": "/tmp/new", "AB_BINDING": marker}),
+                    ("/tmp/new", "env"),
+                )
+        self.assertEqual(self.resolve({"AB_BINDING": "agentstatus:/tmp/old"})[1], "default")
+
+    def test_prefix_collision_is_not_a_match(self) -> None:
+        # 比对必须是**相等**而不是前缀：`/tmp/bound` 的标记不能认下 `/tmp/bound-2`。
+        # 没有这条时，把 `==` 换成 `startswith` 的弱化会全绿通过（复核实测）。
+        self.assertEqual(
+            self.resolve({"AB_STATE_DIR": "/tmp/bound-2", "AB_BINDING": "agentstatus:/tmp/bound"}),
+            ("/tmp/bound-2", "env"),
+        )
+
+    def test_binding_root_may_itself_contain_a_colon(self) -> None:
+        root = "/tmp/fixture:bridge"
+        self.assertEqual(
+            self.resolve({"AB_STATE_DIR": root, "AB_BINDING": f"agentstatus:{root}"}),
+            (root, "integration"),
+        )
+
+
+class PeerSelectorTests(unittest.TestCase):
+    """ab peers 给出的目标必须能解析回这一行（DESIGN §45.33.6）。"""
+
+    def test_short_id_is_used_only_when_it_resolves_back(self) -> None:
+        plain = endpoint(ref(Provider.CODEX, "019a0000-1111-7111-8111-111111111111", pid=5001, pane=None, label=None))
+        named = endpoint(ref(Provider.CODEX, "019a9999-3333-7333-8333-333333333333", pid=5003, pane="%3", label="tmuxed"))
+        # 唯一时用展示名
+        selectors = cli._selectors([plain, named])
+        self.assertEqual(selectors[id(plain)], "codex@019a0000")
+        self.assertEqual(selectors[id(named)], "codex@tmuxed")
+        # 同前缀的第二条无 pane 会话出现后，两条都退回完整原生 ID
+        twin = endpoint(ref(Provider.CODEX, "019a0000-2222-7222-8222-222222222222", pid=5002, pane=None, label=None))
+        selectors = cli._selectors([plain, twin])
+        self.assertEqual(selectors[id(plain)], plain.ref.native_id)
+        self.assertEqual(selectors[id(twin)], twin.ref.native_id)
+        # 前缀撞上别人的 tmux 会话名时也退回完整原生 ID
+        clash = endpoint(ref(Provider.CODEX, "019a8888-4444-7444-8444-444444444444", pid=5004, pane="%4", label="019a0000"))
+        selectors = cli._selectors([plain, clash])
+        self.assertEqual(selectors[id(plain)], plain.ref.native_id)
+        self.assertEqual(selectors[id(clash)], "codex@019a0000")
+
+
+class WorkerStartupTests(unittest.TestCase):
+    """不替换 worker_running：新拉起的 worker 稍后才持锁时，--no-wait 不能误报不可用。"""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.state = Path(self._tmp.name) / "bridge"
+        self._lock_fd: int | None = None
+        self._thread: threading.Thread | None = None
+        for item in (
+            patch.dict(os.environ, {"AB_STATE_DIR": str(self.state)}),
+            patch.object(cli, "discover", return_value=[IMPL]),
+            patch.object(cli, "identify_caller", return_value=USER),
+            patch.object(cli, "_receiver_class", return_value=None),
+            patch.object(cli, "WORKER_START_SECONDS", 1.0),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+        self.addCleanup(self._release)
+
+    def _late_worker(self, root: Path) -> bool:
+        def hold() -> None:
+            time.sleep(0.3)
+            fd = os.open(root / "worker.lock", os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self._lock_fd = fd
+
+        self._thread = threading.Thread(target=hold, daemon=True)
+        self._thread.start()
+        return True
+
+    def _release(self) -> None:
+        if self._thread is not None:
+            self._thread.join(2.0)
+        if self._lock_fd is not None:
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            os.close(self._lock_fd)
+
+    def _send(self) -> tuple[int, str, str]:
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(["send", "--to", "%1", "-m", "x", "--no-wait"])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_starting_worker_is_not_reported_missing(self) -> None:
+        with patch.object(cli, "ensure_worker", side_effect=self._late_worker):
+            code, out, err = self._send()
+        self.assertEqual(code, cli.EXIT_OK, err)
+        self.assertNotIn("未运行", out)
+
+    def test_worker_that_never_takes_the_lock_is_reported(self) -> None:
+        with patch.object(cli, "ensure_worker", return_value=True):
+            code, out, _ = self._send()
+        self.assertEqual(code, cli.EXIT_UNAVAILABLE)
+        self.assertIn("未运行", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
