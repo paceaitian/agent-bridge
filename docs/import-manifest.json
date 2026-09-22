@@ -4,13 +4,13 @@
     "src/agentstatus_bridge/__main__.py": "83da1011be1d566881bd959ac43e7f8385c0c0889618706cece275c120acd6e4",
     "src/agentstatus_bridge/cli.py": "2eee11ec44648381a60df765355b37896ceb2bbac44491cfa7f1f53623ac01e5",
     "src/agentstatus_bridge/closure.py": "dc7b8727255abb3d029a8fcfd530fd7f43bcd8880654061d274ea0f8b4b1ebc3",
-    "src/agentstatus_bridge/dispatch.py": "3d1410b2f7aca95466f6223a340a71d3e8d24170f954acc662bf8d2d56700707",
-    "src/agentstatus_bridge/endpoints.py": "c763b6274946bc0c1354b63626aae669e1aca951238ed1752deb06c217cc9af6",
+    "src/agentstatus_bridge/dispatch.py": "f3fcdde2e61010c44f597d7dd939b4a5cb7ccb2086496c15c4253241d7861805",
+    "src/agentstatus_bridge/endpoints.py": "eb1c2969a00d0d037a4eef02b952716226640840a2da1369f911f19e2b57f23f",
     "src/agentstatus_bridge/envelope.py": "0dfaadc86d9c0a2c4506afee370fb0db3a2235cfab6cf81bf3e0babbe0800300",
     "src/agentstatus_bridge/hints.py": "af49486312dc65d3b1fe10b268c3747926d523f71489beae9b5815e7c4d3220e",
     "src/agentstatus_bridge/ids.py": "2bd663be53b52b458ceec4460ff16efad321462a13faa0ac85633dbffb667491",
-    "src/agentstatus_bridge/labels.py": "c96852a81ac150dd51218f25502ddcd31e3c03c7b93da2bab415f1cd39ad54fb",
-    "src/agentstatus_bridge/model.py": "eef2ff8163c61a54e5a7c3a58e5307964ba648aae963f203f3a5c7326bfe711c",
+    "src/agentstatus_bridge/labels.py": "fb4db77b38eabfc8611deea5596556b67b59685d5a546a17ef49d90aea9db89b",
+    "src/agentstatus_bridge/model.py": "deaf0e58fcff78eb1f1f6956c1ea6446731270cd685c7499985a556e3fa97b3c",
     "src/agentstatus_bridge/naming.py": "e753431470fb832c4d413d4b21600fdeee8045d15d1ece36e65c5013a1322cc1",
     "src/agentstatus_bridge/paths.py": "078b8e50ed87398333175288db09f1659f026e87e6fc58301640d77ead9caf41",
     "src/agentstatus_bridge/procfs.py": "7e0f9ed95aaea728f7ab6b6c884af3ee36b45cbef15e0cc2b9f610f3f3c3bcdd",
@@ -26,10 +26,10 @@
     "tests/fixtures/summary-v1.json": "87ffafb4c36dd22dc991ed78b92ad68bf896b4b17241463490d9d70d1fdf1b59",
     "tests/test_bridge_cli.py": "84c207b59483bc0e4432c6b38f59e7f3b25b9c5645ca76ffd0c63afc1b673c8a",
     "tests/test_bridge_closure.py": "c89ad174d67c962a5b2666921ae00dcc7adcdfacb280028b2c9cb90b92342cc0",
-    "tests/test_bridge_dispatch.py": "82b15f56ecc5350cf2955ad0ba47d70a0ceccf3733c52ea8bbc1dda5d0436097",
-    "tests/test_bridge_endpoints.py": "b16f548b0d6e23d86349615d1c2a3ecd07f3cb779a9422683dee0f41fcc0abc2",
-    "tests/test_bridge_hints.py": "41574f5f3296c7e94d77d5c8f96f071fc6cf46c908e00afb9cf340edae449143",
-    "tests/test_bridge_labels.py": "affafc5e273cf2086094133e16d316867e8a3fdd6079a5f06ca46e36393f8e94",
+    "tests/test_bridge_dispatch.py": "46e81e829a219f560ea21d7eb0b3bd065d0edeec910612e3a33fac90267de790",
+    "tests/test_bridge_endpoints.py": "c04a47af6046bbb2abe3220bfff5eb5d2b455f7137f018ef5a8121b754ff90e4",
+    "tests/test_bridge_hints.py": "29b6cef21d3c9d82822c015eca4dbc778a2a23049525a93457b5c8a8f17d2dd4",
+    "tests/test_bridge_labels.py": "6dd01e6a880ccdd32e0ef1ff23066321cef54d06264db786d36b8f2c110072d9",
     "tests/test_bridge_reminders.py": "b1836d4a49c679ea55468b59dbeee94d32d82e3923c0569ebf8145506487f318",
     "tests/test_bridge_reports.py": "88731cd04229dbeef6c4667fb0fe794bdafc3f07b25b72fa976cc84c2d725364",
     "tests/test_bridge_store.py": "4a78a370d3a06b9767c59ae680b6522fca7541082f63a5f19e63dcaededbb38f",
@@ -38,7 +38,7 @@
     "tests/test_bridge_worker.py": "bff778415e0d6be74a1d25773209c795c384d00a5a542010ac3d5c4b70db689b"
   },
   "source": {
-    "commit": "27d29eb9993119b423b5b691350f53d03450291b",
+    "commit": "434802be2510278e73adf7e0270a3107e325a303",
     "repository": "agentstatus"
   }
 }

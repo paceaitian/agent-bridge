@@ -9,6 +9,7 @@
 - Grok：读 `~/.grok/active_sessions.json`，再用 `comm` 与进程持有的 events 文件核实；只读，
   没有收件通道，只能作为发起方。
 - 运行状态：Claude 用注册表 busy/idle；Codex 与 Grok 用 AgentStatus D-Bus（不自动启动）按 pane 读取。
+  注册表分不清「前台这一轮在跑」与「只剩后台工作」，observer 能分，所以后者会覆盖前者（DESIGN §45.37）。
 """
 
 from __future__ import annotations
@@ -27,10 +28,13 @@ from typing import Any
 
 from . import procfs
 from .hints import PaneState
+from .ids import opaque_id
 from .model import Endpoint, EndpointRef, Provider, Runtime
 from .paths import claude_sessions_dir, codex_home, grok_home
 
 MAX_REGISTRY_FILES = 256
+# 允许 observer 证据比注册表状态时刻早多少：实测正常后台窗口里早约 0.09 秒，漏 hook 时差一整轮（§45.37）
+EVIDENCE_SKEW_SECONDS = 5.0
 MAX_REGISTRY_BYTES = 64 * 1024
 _REGISTRY_NAME = re.compile(r"[0-9]+\.json")
 _ROLLOUT = re.compile(
@@ -113,6 +117,9 @@ AGENTSTATUS_BUS_NAME = "org.paceaitian.AgentStatus1"
 AGENTSTATUS_OBJECT_PATH = "/org/paceaitian/AgentStatus1"
 AGENTSTATUS_INTERFACE_NAME = AGENTSTATUS_BUS_NAME
 _SELECTOR_NORMALIZE = re.compile(r"[\s_]+")
+# 会话键只需要满足一件事：不可能和 pane id 相撞（pane 形如 `%12`）。这里只要求含 `:` 且有界——
+# 比 observer 自己的键格式更严没有收益，反而会在上游改键形状时静默丢行、让放行永远不发生（审计 P3-4）
+_OBSERVER_KEY = re.compile(r"[^%\s][^\s]{0,126}:[^\s]{1,64}")
 # Claude 2.1.x 注册表 status：waiting 为对话框打开，shell 为正在执行 shell 命令
 _CLAUDE_STATUS = {
     "idle": Runtime.IDLE,
@@ -163,6 +170,56 @@ def tmux_panes() -> dict[int, PaneInfo]:
     return panes
 
 
+def _positive_count(value: Any) -> bool:
+    """observer 的计数字段：正整数才算数。缺字段、非整数、布尔、0 与负数都当作没有，不比写方更严（DESIGN §45.35）。"""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _has_background_work(item: Mapping[str, Any]) -> bool:
+    """本轮之外仍在跑的工作：后台任务与可显示的子代理各自独立计数，任一为正即算。
+
+    定时任务（`scheduledWorkCount`）不算——它是「将来会跑」而不是「现在在跑」，不影响对方能否收件。
+    """
+    return _positive_count(item.get("backgroundWorkCount")) or _positive_count(item.get("activeChildren"))
+
+
+def _evidence_covers(evidence_at: float | None, status_at_ms: Any) -> bool:
+    """observer 的证据要和注册表这次状态变化对得上：同一时刻附近或更新，才准用来放开忙判。
+
+    注册表的 `statusUpdatedAt` 只在状态**翻转**时更新。实测正常的「本轮结束、只剩后台」窗口里，
+    observer 的 Stop 事件比注册表改写早约 0.09 秒，所以不能要求严格不旧；而漏掉开轮 hook 时，
+    注册表会因新一轮翻转拿到新时刻、observer 却停在上一轮的旧证据上，两者相差一整轮
+    （实测同一会话里这个差可达上百秒）。几秒的偏斜既覆盖两条链路的调度抖动，也挡得住后者（审计 F01）。
+
+    注册表没给这个字段时不作判断，维持既有行为——宁可少一道校验，也不因上游少个字段就整体退化。
+    """
+    if not isinstance(status_at_ms, (int, float)) or isinstance(status_at_ms, bool):
+        return True
+    return evidence_at is not None and evidence_at >= status_at_ms / 1000.0 - EVIDENCE_SKEW_SECONDS
+
+
+def _claude_background_row(
+    view: ObserverView, session_id: str, pane: PaneInfo | None, pid: int, start: str
+) -> ObserverRow | None:
+    """能为这个目标放行的 observer 行：优先运行代际，其次同 pane 的会话行；都没有就返回 None。
+
+    与 `summary._observer_binding` 同一套键与优先级（DESIGN §45.27.1）。一条 native session 可以
+    同时存在多个运行代际（resume 到另一个进程/pane），只查 base 行会两头出错：新代际被旧代际的
+    工作状态一直扣住，旧代际的后台状态又能放开新代际正在跑的前台轮次（Codex 审计 R02）。
+    """
+    base = opaque_id("claude", session_id)
+    if pane is not None:
+        generation = view.row(opaque_id("claude-gen", base, pane.pane_id, pid, start))
+        if generation is not None:
+            # 有更精确的代际行就以它为准，不再回退到 base 行
+            return generation if generation.runtime is Runtime.BACKGROUND else None
+    row = view.row(base)
+    if row is None or row.runtime is not Runtime.BACKGROUND:
+        return None
+    # 回退用的会话行必须属于同一个 pane（两边都没有 pane 也算同一个），否则它说的是别的代际
+    return row if row.pane == (pane.pane_id if pane is not None else None) else None
+
+
 def _map_agentstatus_runtime(item: Mapping[str, Any]) -> Runtime:
     # 与 observer 公开文档一致：stale/unavailable 的快照不代表当前状态
     if item.get("freshness") in {"stale", "unavailable"}:
@@ -171,7 +228,8 @@ def _map_agentstatus_runtime(item: Mapping[str, Any]) -> Runtime:
         return Runtime.WAITING
     state = item.get("runtimeState")
     if state == "ready":
-        return Runtime.IDLE
+        # 本轮已结束：还有后台工作在跑时面板仍显示运行中，但对方能收件（DESIGN §45.37）
+        return Runtime.BACKGROUND if _has_background_work(item) else Runtime.IDLE
     if state in {"thinking", "working", "starting"}:
         return Runtime.BUSY
     return Runtime.UNKNOWN
@@ -186,13 +244,91 @@ def _pane_state(item: Mapping[str, Any]) -> PaneState:
     )
 
 
+@dataclass(frozen=True)
+class ObserverRow:
+    """observer 对一个对象的观察：运行状态、该状态被确认的时刻、它属于哪个 pane。
+
+    `runtime_at` 取自 observer 的 `runtimeUpdatedAt`——最后一次**真正设置过这条会话 runtime**
+    的事件时刻。子代理结束、存活心跳这类不改父会话 runtime 的事件不会刷新它，所以它才有资格
+    充当「这条会话的前台轮次已经结束」的证据；`lastEventAt` 只说明「最近有任何动静」（审计 R01）。
+    """
+
+    runtime: Runtime
+    runtime_at: float | None
+    pane: str | None
+    fresh: bool = True
+
+
+@dataclass(frozen=True)
+class ObserverView:
+    """一次 ListSessions 快照，按两套互不相交的键索引。
+
+    - `%pane`：pane 级观察，供**收紧**判定使用（等待用户、Codex/Grok 的忙闲）；
+    - `provider:hex`：observer 的会话键（含运行代际键 `claude-gen:…`），是**放开**原生忙判的唯一
+      凭据——pane 会被换会话或别的 provider 复用，会话身份不会（DESIGN §45.37，审计 F02）。
+
+    两套键不可能相撞：pane 形如 `%12`，会话键必含 `:`。`get()` 与原来的 `Mapping[str, Runtime]`
+    同形，只收紧不放开的调用方照旧。
+    """
+
+    rows: Mapping[str, ObserverRow] = field(default_factory=dict)
+
+    def get(self, key: str) -> Runtime | None:
+        row = self.rows.get(key)
+        return row.runtime if row is not None else None
+
+    def row(self, key: str) -> ObserverRow | None:
+        return self.rows.get(key)
+
+    @property
+    def states(self) -> dict[str, Runtime]:
+        return {key: row.runtime for key, row in self.rows.items()}
+
+
+def agentstatus_view() -> ObserverView:
+    """经 AgentStatus D-Bus 读取一次快照；daemon 不在或出错时返回空视图，不启动它。"""
+    rows: dict[str, ObserverRow] = {}
+    for item in _observer_rows():
+        seen = item.get("runtimeUpdatedAt")
+        pane = item.get("paneId")
+        row = ObserverRow(
+            runtime=_map_agentstatus_runtime(item),
+            runtime_at=float(seen) if isinstance(seen, (int, float)) and not isinstance(seen, bool) else None,
+            pane=pane if isinstance(pane, str) else None,
+            fresh=item.get("freshness") not in {"stale", "unavailable"},
+        )
+        key = item.get("key")
+        for index in (row.pane, key if isinstance(key, str) and _OBSERVER_KEY.fullmatch(key) else None):
+            if index is None:
+                continue
+            previous = rows.get(index)
+            if previous is not None:
+                # 同一个 pane 可能有多行（换会话、残留代际）。新鲜的那行说了算，否则一条 stale 行
+                # 会按行序把当前状态盖成未知（审计 P3-2）
+                if previous.fresh and not row.fresh:
+                    continue
+                # 两行都新鲜时偏向更保守的一边：pane 索引只用于收紧，等待用户不该被行序覆盖（审计 P3-B）
+                if previous.fresh and row.fresh and previous.runtime is Runtime.WAITING:
+                    continue
+            # 整行替换，不把状态和证据时刻拼在一起
+            rows[index] = row
+    return ObserverView(rows)
+
+
 def agentstatus_runtime() -> dict[str, Runtime]:
-    """经 AgentStatus D-Bus 读取各 pane 的运行状态；daemon 不在或出错时返回空，不启动它。"""
-    return {pane: state.runtime for pane, state in agentstatus_panes().items()}
+    """按键索引的运行状态；`doctor` 用它判断 AgentStatus 可读，不需要证据时刻。"""
+    return agentstatus_view().states
 
 
 def agentstatus_panes() -> dict[str, PaneState]:
     """经 AgentStatus D-Bus 读取各 pane 的运行状态与最近一轮结束时刻；不可用时返回空，不启动 daemon。"""
+    return {
+        str(item["paneId"]): _pane_state(item) for item in _observer_rows() if isinstance(item.get("paneId"), str)
+    }
+
+
+def _observer_rows() -> list[Mapping[str, Any]]:
+    """读一次 ListSessions 并返回其中的对象行；不可用、超限或格式不对时返回空。"""
     try:
         import gi
 
@@ -212,17 +348,13 @@ def agentstatus_panes() -> dict[str, PaneState]:
         reply = proxy.call_sync("ListSessions", None, flags, 2000, None)
         raw = reply.unpack()[0]
         if not isinstance(raw, str) or len(raw) > 4 * 1024 * 1024:
-            return {}
+            return []
         sessions = json.loads(raw)
     except Exception:  # 可选数据源：任何失败都只意味着“状态未知”
-        return {}
-    result: dict[str, PaneState] = {}
+        return []
     if not isinstance(sessions, list):
-        return result
-    for item in sessions:
-        if isinstance(item, dict) and isinstance(item.get("paneId"), str):
-            result[item["paneId"]] = _pane_state(item)
-    return result
+        return []
+    return [item for item in sessions if isinstance(item, dict)]
 
 
 @dataclass
@@ -234,7 +366,7 @@ class DiscoverySources:
     codex_home: Path = field(default_factory=codex_home)
     grok_home: Path = field(default_factory=grok_home)
     panes: Callable[[], Mapping[int, PaneInfo]] = tmux_panes
-    runtime: Callable[[], Mapping[str, Runtime]] = agentstatus_runtime
+    runtime: Callable[[], ObserverView] = agentstatus_view
     uid: int = field(default_factory=os.getuid)
 
 
@@ -284,7 +416,7 @@ def _is_owned_socket(path: str, uid: int) -> bool:
 
 
 def _discover_claude(
-    sources: DiscoverySources, panes: Mapping[int, PaneInfo], runtime: Mapping[str, Runtime]
+    sources: DiscoverySources, panes: Mapping[int, PaneInfo], runtime: ObserverView
 ) -> list[Endpoint]:
     try:
         files = sorted(
@@ -329,8 +461,20 @@ def _discover_claude(
         pane = _pane_for(pid, panes, sources.proc_root)
         status = data.get("status")
         state = _CLAUDE_STATUS.get(status, Runtime.UNKNOWN) if isinstance(status, str) else Runtime.UNKNOWN
+        source = "claude_registry"
+        released = _claude_background_row(runtime, session_id, pane, pid, proc_start)
         if pane is not None and runtime.get(pane.pane_id) is Runtime.WAITING:
             state = Runtime.WAITING  # 原生审批/提问对话框打开时不投递
+        elif (
+            state is not Runtime.WAITING
+            and released is not None
+            and _evidence_covers(released.runtime_at, data.get("statusUpdatedAt"))
+        ):
+            # 注册表只有一个 status：后台工作在跑时它报 busy/shell，看不出本轮其实已经结束。observer 分得清，
+            # 但放开忙判**只认会话身份**：pane 会被换会话或另一个 provider 复用，那不是本会话的证据；
+            # 收紧忙判（等待用户）仍按 pane 取，宁可多扣一条也不误放（DESIGN §45.37，Codex 审计 F02）
+            state = Runtime.BACKGROUND
+            source = "agentstatus"
         name = data.get("name")
         endpoints.append(
             Endpoint(
@@ -344,7 +488,7 @@ def _discover_claude(
                     server_pid=pane.server_pid if pane else None,
                 ),
                 runtime=state,
-                runtime_source="claude_registry",
+                runtime_source=source,
                 socket_path=socket_path,
                 name=name[:80] if isinstance(name, str) and name else None,
                 issues=tuple(issues),
@@ -354,7 +498,7 @@ def _discover_claude(
 
 
 def _discover_codex(
-    sources: DiscoverySources, panes: Mapping[int, PaneInfo], runtime: Mapping[str, Runtime]
+    sources: DiscoverySources, panes: Mapping[int, PaneInfo], runtime: ObserverView
 ) -> list[Endpoint]:
     sessions_root = str(sources.codex_home / "sessions") + "/"
     processes: dict[int, tuple[procfs.ProcessInfo, set[str]]] = {}
@@ -423,7 +567,7 @@ def _discover_codex(
 
 
 def _discover_grok(
-    sources: DiscoverySources, panes: Mapping[int, PaneInfo], runtime: Mapping[str, Runtime]
+    sources: DiscoverySources, panes: Mapping[int, PaneInfo], runtime: ObserverView
 ) -> list[Endpoint]:
     """Grok 会话：注册表条目、`comm == "grok"`、进程确实持有该会话的 events 文件，三样都要（DESIGN §45.34）。
 
@@ -546,7 +690,7 @@ class ProviderAdapter:
 
     provider: Provider
     comm: str
-    discover: Callable[[DiscoverySources, Mapping[int, PaneInfo], Mapping[str, Runtime]], list[Endpoint]]
+    discover: Callable[[DiscoverySources, Mapping[int, PaneInfo], ObserverView], list[Endpoint]]
     caller_env: Callable[[Mapping[str, str], list[Endpoint]], list[Endpoint]]
     env_markers: tuple[str, ...]
     inbox: bool = True
@@ -588,7 +732,7 @@ def discover(sources: DiscoverySources | None = None) -> list[Endpoint]:
     """发现当前可交接的端点，按 provider 与 tmux 会话名排序。"""
     config = sources or DiscoverySources()
     panes = dict(config.panes())
-    runtime = dict(config.runtime())
+    runtime = config.runtime()
     endpoints: list[Endpoint] = []
     for adapter in ADAPTERS.values():
         found = adapter.discover(config, panes, runtime)

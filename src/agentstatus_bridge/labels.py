@@ -46,6 +46,7 @@ ROLE_LABELS: dict[Role, str] = {Role.HANDOFF: "交接", Role.REVIEW: "复核", R
 CLOSURE_LABEL = "结束回执"
 RUNTIME_LABELS: dict[Runtime, str] = {
     Runtime.IDLE: "空闲",
+    Runtime.BACKGROUND: "后台",
     Runtime.BUSY: "忙",
     Runtime.WAITING: "等待用户",
     Runtime.UNKNOWN: "状态未知",

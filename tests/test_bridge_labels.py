@@ -17,6 +17,7 @@ from agentstatus_bridge.model import (
     Flow,
     Phase,
     Role,
+    Runtime,
     Task,
     Verdict,
     Work,
@@ -132,6 +133,10 @@ class NextStepTests(unittest.TestCase):
         for item, attempts, expected in cases:
             with self.subTest(expected=expected):
                 self.assertEqual(cli._next_step(item, attempts), expected)
+
+    def test_every_runtime_has_a_label(self) -> None:
+        # 打印路径是直接下标（cli.peers / cli.send），漏一个成员就是 KeyError 而不是难看的文案
+        self.assertEqual(set(labels.RUNTIME_LABELS), set(Runtime))
 
     def test_cli_keeps_label_exports(self) -> None:
         # 既有测试与审计脚本经 cli 引用这些名称

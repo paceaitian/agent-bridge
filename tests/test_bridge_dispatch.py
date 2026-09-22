@@ -136,6 +136,15 @@ class DispatchTests(unittest.TestCase):
         self._run()
         self.assertEqual(self._attempt(attempt.id).delivery, Delivery.QUEUED)
 
+    def test_background_target_is_not_held(self) -> None:
+        """本轮已结束、只剩后台工作在跑：消息真的外调发出，而不只是 runtime 取值变了（DESIGN §45.37）。"""
+        target = ref()
+        _task, attempt = self._task(target)
+        self.endpoints = [endpoint(target, runtime=Runtime.BACKGROUND)]
+        self._run()
+        self.assertEqual(self._attempt(attempt.id).delivery, Delivery.QUEUED)
+        self.assertEqual(len(self.codex.calls), 1)
+
     def test_paused_task_is_not_sent(self) -> None:
         target = ref()
         self.endpoints = [endpoint(target)]

@@ -58,6 +58,14 @@ class StoppedWithoutReportTests(unittest.TestCase):
             "turn_ended_before_last_report": (attempt(), live, PaneState(Runtime.IDLE, 140.0, True), now),
             "target_busy_again": (attempt(), endpoint(ref(Provider.CLAUDE, "claude-session"), runtime=Runtime.BUSY), idle, now),
             "pane_asking_user": (attempt(), live, PaneState(Runtime.WAITING, 200.0, True), now),
+            # 本轮结束后后台工作还在跑：对方能收件，但不能说它「已停下」（DESIGN §45.37）
+            "target_in_background": (
+                attempt(),
+                endpoint(ref(Provider.CLAUDE, "claude-session"), runtime=Runtime.BACKGROUND),
+                idle,
+                now,
+            ),
+            "pane_in_background": (attempt(), live, PaneState(Runtime.BACKGROUND, 200.0, True), now),
             "stale_snapshot": (attempt(), live, PaneState(Runtime.IDLE, 200.0, False), now),
             "no_turn_end_seen": (attempt(), live, PaneState(Runtime.IDLE, None, True), now),
             "no_pane": (attempt(), live, None, now),

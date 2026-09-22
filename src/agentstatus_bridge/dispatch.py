@@ -2,7 +2,7 @@
 
 规则（DESIGN §45.3）：
 - 先持久化 sending 再外调；外调结果不明记 unknown，从不自动重发。
-- 对方忙或原生对话框打开时留在桥内排队（可暂停、取消）；空闲或状态未知时发送。
+- 对方忙或原生对话框打开时留在桥内排队（可暂停、取消）；空闲、只剩后台工作或状态未知时发送（§45.37）。
 - 投递到用户选定的进程代际；它已退出时才接续唯一存活的同会话进程，多个时不猜。
 - 目标会话持续不在：可证明未发送，标 failed 并给出原因，交用户重发或改派。
 """
@@ -424,6 +424,7 @@ class Dispatcher:
             # 发送前已看到多个消费者，而用户没有放行共享 thread
             return self._fail(attempt, "target_shared_thread", now)
         if live.runtime in (Runtime.BUSY, Runtime.WAITING):
+            # 只有前台轮次在跑或对方在等用户时才扣住；BACKGROUND（本轮已结束、只剩后台工作）照常发（§45.37）
             return "waiting"
         provider = live.ref.provider
         if provider is Provider.CLAUDE and self.reply_address is None:

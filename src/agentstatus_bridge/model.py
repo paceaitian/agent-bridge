@@ -24,6 +24,8 @@ class Runtime(StrEnum):
     """投递前参考的对方运行状态；只影响何时发送，不是任务证据。"""
 
     IDLE = "idle"
+    # 本轮已结束、但还有后台工作（后台任务或子代理）在跑：可以投递，但不是「停下未汇报」（DESIGN §45.37）
+    BACKGROUND = "background"
     BUSY = "busy"
     WAITING = "waiting"
     UNKNOWN = "unknown"

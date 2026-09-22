@@ -8,11 +8,17 @@ import shutil
 import socket
 from tempfile import TemporaryDirectory
 import unittest
+import unittest.mock
 
+from agentstatus_bridge import endpoints as endpoints_module
 from agentstatus_bridge.endpoints import (
     ADAPTERS,
     DiscoverySources,
     MAX_REGISTRY_FILES,
+    _map_agentstatus_runtime,  # pyright: ignore[reportPrivateUsage]
+    ObserverRow,
+    ObserverView,
+    agentstatus_view,
     _pane_state,  # pyright: ignore[reportPrivateUsage]
     PaneInfo,
     ResolveError,
@@ -22,6 +28,7 @@ from agentstatus_bridge.endpoints import (
     resolve_target,
 )
 from agentstatus_bridge.hints import PaneState
+from agentstatus_bridge.ids import opaque_id
 from agentstatus_bridge.model import Provider, Runtime
 from agentstatus_bridge import procfs
 from bridge_support import FakeProc, endpoint, ref
@@ -42,6 +49,8 @@ class DiscoveryTests(unittest.TestCase):
         self.grok_home = self.root / "grok"
         self.panes: dict[int, PaneInfo] = {}
         self.runtime: dict[str, Runtime] = {}
+        self.evidence: dict[str, float] = {}
+        self.observer_pane: dict[str, str | None] = {}
         self._sockets: list[socket.socket] = []
 
     def tearDown(self) -> None:
@@ -56,7 +65,20 @@ class DiscoveryTests(unittest.TestCase):
             codex_home=self.codex_home,
             grok_home=self.grok_home,
             panes=lambda: self.panes,
-            runtime=lambda: self.runtime,
+            runtime=lambda: self._view(),
+        )
+
+    def _view(self) -> ObserverView:
+        """把测试里写的「键 → 状态」摊成 observer 行；pane 键默认属于自己，会话键默认没有 pane。"""
+        return ObserverView(
+            {
+                key: ObserverRow(
+                    state,
+                    self.evidence.get(key),
+                    self.observer_pane.get(key, key if key.startswith("%") else None),
+                )
+                for key, state in self.runtime.items()
+            }
         )
 
     def _socket(self, name: str) -> str:
@@ -207,6 +229,134 @@ class DiscoveryTests(unittest.TestCase):
         [found] = discover(self._sources())
         self.assertEqual(found.runtime, Runtime.WAITING)
 
+    def test_observer_corrects_the_registry_when_only_background_work_is_left(self) -> None:
+        """注册表的 busy/shell 分不清前台轮次与后台工作，observer 能分，以 observer 为准（DESIGN §45.37）。"""
+        self._claude(500, status="shell")  # 后台 shell 在跑时注册表报 shell
+        self._claude(700, status="busy")  # 子代理在跑时注册表报 busy
+        for pid in (500, 700):
+            key = opaque_id("claude", f"session-{pid}")
+            self.runtime[key] = Runtime.BACKGROUND
+            self.observer_pane[key] = f"%{pid}"
+        found = {item.ref.pid: (item.runtime, item.runtime_source) for item in discover(self._sources())}
+        self.assertEqual(
+            found,
+            {500: (Runtime.BACKGROUND, "agentstatus"), 700: (Runtime.BACKGROUND, "agentstatus")},
+        )
+
+    def test_only_this_session_identity_can_release_the_native_busy(self) -> None:
+        """放开忙判只认会话身份：pane 会被换会话或别的 provider 复用，那不是本会话的证据（Codex 审计 F02）。"""
+        self._claude(500, status="busy")
+        cases = {
+            # pane 级观察：同一 pane 上换了会话、或行本来就属于另一个 provider，都可能是这个值
+            "pane_row": "%500",
+            "other_claude_session": opaque_id("claude", "session-999"),
+            "other_provider": opaque_id("codex", "777", "%500", 400, "77"),
+        }
+        for name, key in cases.items():
+            with self.subTest(name):
+                self.runtime.clear()
+                self.runtime[key] = Runtime.BACKGROUND
+                [found] = discover(self._sources())
+                self.assertEqual((found.runtime, found.runtime_source), (Runtime.BUSY, "claude_registry"))
+
+    def test_release_needs_observer_evidence_from_this_state_change(self) -> None:
+        """observer 的证据要和注册表这次状态变化对得上：停在上一轮的旧证据不能放开当前的忙（审计 F01）。
+
+        实测正常窗口里 observer 的 Stop 事件比注册表改写早约 0.09 秒，所以判据是「不早于 5 秒」，
+        不是「不早于」；漏开轮 hook 时两者相差一整轮，这条就挡得住。
+        """
+        key = opaque_id("claude", "session-500")
+        self.runtime[key] = Runtime.BACKGROUND
+        self.observer_pane[key] = "%500"
+        cases = {
+            # 注册表在 1000.0 翻转；observer 的证据分别是：同一次变化前 0.09 秒 / 恰好在容差边缘 / 上一轮
+            "same_transition": (1000.0, 999.91, Runtime.BACKGROUND),
+            "within_skew": (1000.0, 995.0, Runtime.BACKGROUND),
+            "just_outside_skew": (1000.0, 994.99, Runtime.BUSY),
+            "previous_turn": (1000.0, 40.0, Runtime.BUSY),
+            "no_evidence_at_all": (1000.0, None, Runtime.BUSY),
+        }
+        self._claude(500, status="busy")
+        registry = self.sessions / "500.json"
+        for name, (status_at, evidence_at, expected) in cases.items():
+            with self.subTest(name):
+                self.evidence.clear()
+                if evidence_at is not None:
+                    self.evidence[key] = evidence_at
+                document = json.loads(registry.read_text(encoding="utf-8"))
+                document["statusUpdatedAt"] = int(status_at * 1000)
+                registry.write_text(json.dumps(document), encoding="utf-8")
+                [found] = discover(self._sources())
+                self.assertIs(found.runtime, expected)
+
+    def test_registry_without_a_status_timestamp_keeps_the_old_behaviour(self) -> None:
+        """上游少给 statusUpdatedAt 时不作时效判断：少一道校验，而不是整体退回保守（审计 F01）。"""
+        self._claude(500, status="busy")
+        self.assertNotIn("statusUpdatedAt", json.loads((self.sessions / "500.json").read_text(encoding="utf-8")))
+        key = opaque_id("claude", "session-500")
+        self.runtime[key] = Runtime.BACKGROUND
+        self.observer_pane[key] = "%500"
+        [found] = discover(self._sources())
+        self.assertIs(found.runtime, Runtime.BACKGROUND)
+
+    def test_generation_row_decides_when_a_session_has_more_than_one(self) -> None:
+        """同一 native session resume 到别的进程/pane 时会有多个代际行：只认自己那一代（审计 R02）。"""
+        self._claude(500, status="busy")
+        base = opaque_id("claude", "session-500")
+        mine = opaque_id("claude-gen", base, "%500", 500, "77")
+        other = opaque_id("claude-gen", base, "%900", 900, "77")
+        # 1. 自己那一代说「本轮已结束、只剩后台」→ 放行
+        self.runtime[mine] = Runtime.BACKGROUND
+        self.observer_pane[mine] = "%500"
+        self.assertIs(discover(self._sources())[0].runtime, Runtime.BACKGROUND)
+        # 2. 自己那一代说在跑前台 → 不放行，哪怕 base 行说后台（旧代际留下的）
+        self.runtime[mine] = Runtime.BUSY
+        self.runtime[base] = Runtime.BACKGROUND
+        self.observer_pane[base] = "%500"
+        self.assertIs(discover(self._sources())[0].runtime, Runtime.BUSY)
+        # 3. 只有别的代际说后台 → 不放行
+        self.runtime.pop(mine)
+        self.runtime.pop(base)
+        self.runtime[other] = Runtime.BACKGROUND
+        self.observer_pane[other] = "%900"
+        self.assertIs(discover(self._sources())[0].runtime, Runtime.BUSY)
+        # 4. 没有代际行时才回退到会话行，且它必须属于同一个 pane
+        self.runtime.pop(other)
+        self.runtime[base] = Runtime.BACKGROUND
+        self.observer_pane[base] = "%900"
+        self.assertIs(discover(self._sources())[0].runtime, Runtime.BUSY)
+        self.observer_pane[base] = "%500"
+        self.assertIs(discover(self._sources())[0].runtime, Runtime.BACKGROUND)
+
+    def test_generation_key_matches_the_summary_binding(self) -> None:
+        """桥自己算的代际键必须与摘要给面板的那套逐字节相同，否则永远查不到自己的行。"""
+        from agentstatus_bridge.summary import endpoint_binding
+
+        self._claude(500)
+        [found] = discover(self._sources())
+        keys = [entry["key"] for entry in endpoint_binding(found.ref)["observerKeys"]]
+        base = opaque_id("claude", "session-500")
+        self.assertEqual(keys, [opaque_id("claude-gen", base, "%500", 500, "77"), base])
+
+    def test_waiting_for_the_user_outranks_background_work(self) -> None:
+        """两个来源里只要有一个说在等用户就不投递：注册表说等待、或 observer 看到原生对话框。"""
+        self._claude(500, status="waiting")
+        self._claude(700, status="busy")
+        self.runtime["%700"] = Runtime.WAITING
+        for pid in (500, 700):
+            key = opaque_id("claude", f"session-{pid}")
+            self.runtime[key] = Runtime.BACKGROUND
+            self.observer_pane[key] = f"%{pid}"
+        found = {item.ref.pid: item.runtime for item in discover(self._sources())}
+        self.assertEqual(found, {500: Runtime.WAITING, 700: Runtime.WAITING})
+
+    def test_without_an_observer_reading_the_registry_still_decides(self) -> None:
+        """observer 不在线（runtime 映射为空）时维持现行行为：注册表说忙就是忙，桥不因此失效。"""
+        self._claude(500, status="busy")
+        self.assertEqual(self.runtime, {})
+        [found] = discover(self._sources())
+        self.assertEqual(found.runtime, Runtime.BUSY)
+
     def test_codex_thread_from_open_rollout_and_shared_consumer(self) -> None:
         self.proc.add(401, comm="zsh")
         self.proc.add(600, comm="codex", ppid=401, argv=["codex"], fds=[self._rollout(UUID_A), str(self.codex_home / "queue_1.sqlite")])
@@ -353,6 +503,107 @@ class AgentStatusMappingTests(unittest.TestCase):
         self.assertEqual(stale, PaneState(Runtime.UNKNOWN, None, False))
         asking = _pane_state({"runtimeState": "working", "attentionState": "action_required", "freshness": "aging"})
         self.assertEqual(asking, PaneState(Runtime.WAITING, None, True))
+        background = _pane_state(
+            {"runtimeState": "ready", "freshness": "fresh", "activeChildren": 1, "lastTurnEndedAt": 1700000000.5}
+        )
+        self.assertEqual(background, PaneState(Runtime.BACKGROUND, 1700000000.5, True))
+
+    def test_runtime_view_indexes_panes_and_session_identities(self) -> None:
+        """一次快照建两套键：pane 供收紧判定，会话键供放开判定；键不合法的行只进 pane（Codex 审计 F02）。"""
+        rows: list[dict[str, object]] = [
+            {"paneId": "%1", "key": f"claude:{'a' * 24}", "runtimeState": "ready", "freshness": "fresh", "activeChildren": 1, "runtimeUpdatedAt": 1000.5},
+            {"paneId": "%2", "key": f"codex:{'b' * 24}", "runtimeState": "working", "freshness": "fresh", "runtimeUpdatedAt": True},
+            # 没有 pane 的会话（不在 tmux 里）仍然要有身份条目，否则它永远拿不到放行
+            {"key": f"claude:{'c' * 24}", "runtimeState": "ready", "freshness": "fresh", "backgroundWorkCount": 2, "runtimeUpdatedAt": 7},
+            {"paneId": "%3", "key": "not-an-opaque-id", "runtimeState": "ready", "freshness": "fresh"},
+            # 运行代际键也要收：放开判定优先查它（审计 R02）
+            {"paneId": "%4", "key": f"claude-gen:{'d' * 24}", "runtimeState": "ready", "freshness": "fresh", "activeChildren": 1},
+        ]
+        with unittest.mock.patch.object(endpoints_module, "_observer_rows", return_value=rows):
+            snapshot = agentstatus_view()
+        # 证据时刻取自 runtimeUpdatedAt（不是 lastEventAt）；不是数（True 也不是）或缺字段的行没有证据
+        self.assertEqual(
+            {key: row.runtime_at for key, row in snapshot.rows.items() if row.runtime_at is not None},
+            {"%1": 1000.5, f"claude:{'a' * 24}": 1000.5, f"claude:{'c' * 24}": 7.0},
+        )
+        # 每行都记住自己属于哪个 pane：会话行回退时要用它核对代际
+        self.assertEqual(snapshot.rows[f"claude:{'a' * 24}"].pane, "%1")
+        self.assertIsNone(snapshot.rows[f"claude:{'c' * 24}"].pane)
+        self.assertEqual(
+            snapshot.states,
+            {
+                "%1": Runtime.BACKGROUND,
+                f"claude:{'a' * 24}": Runtime.BACKGROUND,
+                "%2": Runtime.BUSY,
+                f"codex:{'b' * 24}": Runtime.BUSY,
+                f"claude:{'c' * 24}": Runtime.BACKGROUND,
+                "%3": Runtime.IDLE,
+                "%4": Runtime.BACKGROUND,
+                f"claude-gen:{'d' * 24}": Runtime.BACKGROUND,
+            },
+        )
+
+    def test_fresh_row_wins_over_a_stale_one_on_the_same_pane(self) -> None:
+        """同一个 pane 上有多行时新鲜的说了算：否则一条残留的 stale 行会按行序把当前状态盖成未知（审计 P3-2）。"""
+        fresh = {"paneId": "%1", "runtimeState": "working", "freshness": "fresh"}
+        stale = {"paneId": "%1", "runtimeState": "ready", "freshness": "stale"}
+        for order in ([fresh, stale], [stale, fresh]):
+            with self.subTest(order=[row["freshness"] for row in order]):
+                with unittest.mock.patch.object(endpoints_module, "_observer_rows", return_value=order):
+                    self.assertEqual(agentstatus_view().states, {"%1": Runtime.BUSY})
+        # 两行都不新鲜时保持「最后一行胜出」，不引入新的偏好
+        older = {"paneId": "%1", "runtimeState": "working", "freshness": "unavailable"}
+        with unittest.mock.patch.object(endpoints_module, "_observer_rows", return_value=[older, stale]):
+            self.assertEqual(agentstatus_view().states, {"%1": Runtime.UNKNOWN})
+        # 两行都新鲜时偏保守：等待用户不被行序覆盖（审计 P3-B）
+        asking = {"paneId": "%1", "runtimeState": "working", "attentionState": "action_required", "freshness": "fresh"}
+        for order in ([asking, fresh], [fresh, asking]):
+            with self.subTest(order=[row.get("attentionState") for row in order]):
+                with unittest.mock.patch.object(endpoints_module, "_observer_rows", return_value=order):
+                    self.assertEqual(agentstatus_view().states, {"%1": Runtime.WAITING})
+
+    def test_session_keys_are_taken_as_the_observer_writes_them(self) -> None:
+        """键只需不与 pane 相撞：比 observer 更严会在上游改键形状时静默丢行、让放行永不发生（审计 P3-4）。"""
+        rows: list[dict[str, object]] = [
+            {"key": "claude:" + "a" * 24, "runtimeState": "ready", "freshness": "fresh", "activeChildren": 1},
+            {"key": "claude-gen:" + "b" * 40, "runtimeState": "ready", "freshness": "fresh", "activeChildren": 1},
+            {"key": "future.provider:XYZ-99", "runtimeState": "ready", "freshness": "fresh", "activeChildren": 1},
+            {"key": "%12", "runtimeState": "ready", "freshness": "fresh"},  # 长得像 pane：不收
+            {"key": "no-colon", "runtimeState": "ready", "freshness": "fresh"},
+            {"key": "has space:" + "c" * 24, "runtimeState": "ready", "freshness": "fresh"},
+        ]
+        with unittest.mock.patch.object(endpoints_module, "_observer_rows", return_value=rows):
+            keys = set(agentstatus_view().rows)
+        self.assertEqual(keys, {"claude:" + "a" * 24, "claude-gen:" + "b" * 40, "future.provider:XYZ-99"})
+
+    def test_turn_ended_with_background_work_is_not_idle(self) -> None:
+        """本轮已结束、后台工作仍在跑：可投递但不是空闲；判据是两个计数，任一为正即算（DESIGN §45.37）。"""
+        ended = {"runtimeState": "ready", "freshness": "fresh"}
+        for name, counts in {
+            "background_task": {"backgroundWorkCount": 1},
+            "subagent": {"activeChildren": 1},
+            "both": {"backgroundWorkCount": 2, "activeChildren": 3},
+        }.items():
+            with self.subTest(name):
+                self.assertIs(_map_agentstatus_runtime(ended | counts), Runtime.BACKGROUND)
+        for name, counts in {
+            "absent": {},
+            "zero": {"backgroundWorkCount": 0, "activeChildren": 0},
+            "negative": {"backgroundWorkCount": -1},
+            "true_is_not_a_count": {"activeChildren": True},
+            "string": {"activeChildren": "1"},
+            "float": {"backgroundWorkCount": 1.5},
+            # 定时任务是「将来会跑」，不影响对方现在能否收件
+            "scheduled_only": {"scheduledWorkCount": 4},
+        }.items():
+            with self.subTest(name):
+                self.assertIs(_map_agentstatus_runtime(ended | counts), Runtime.IDLE)
+        # 计数不改变另外三种判定：前台轮次在跑、快照不新鲜、正在要求用户注意
+        running = {"runtimeState": "working", "freshness": "fresh", "activeChildren": 1}
+        self.assertIs(_map_agentstatus_runtime(running), Runtime.BUSY)
+        self.assertIs(_map_agentstatus_runtime(ended | {"freshness": "stale", "activeChildren": 1}), Runtime.UNKNOWN)
+        asking = ended | {"attentionState": "action_required", "activeChildren": 1}
+        self.assertIs(_map_agentstatus_runtime(asking), Runtime.WAITING)
 
 
 class ResolveTests(unittest.TestCase):
