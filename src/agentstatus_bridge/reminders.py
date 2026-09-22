@@ -94,7 +94,7 @@ def pending_reminder(task: Task, attempts: list[Attempt]) -> PendingReminder | N
         if attempt.created_at < attention:
             continue  # 之前几次关注的回执与提醒
         if attempt.delivery in _MAY_HAVE_ARRIVED and attempt.delivery_at is not None:
-            # 从这次关注的回执实际交到发起方算起：发起方忙了很久才收到回执时，不紧跟着再提醒（Codex 设计复审 F03）
+            # 从这次关注的回执实际交到发起方算起：回执晚到（worker 停摆、发现失败）时，不紧跟着再提醒（Codex 设计复审 F03）
             since = max(since, attempt.delivery_at)
     return PendingReminder(token=token, due_at=since + REMIND_AFTER_SECONDS, view=view)
 

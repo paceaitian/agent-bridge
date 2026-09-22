@@ -16,6 +16,7 @@ from agentstatus_bridge.model import (
     Delivery,
     Flow,
     Phase,
+    ReportKind,
     Role,
     Runtime,
     Task,
@@ -108,7 +109,7 @@ class NextStepTests(unittest.TestCase):
         tid = short("a" * 32)
         cases = [
             (task(control="paused"), [attempt(delivery=Delivery.PENDING)], f"{CMD} resume {tid} 继续发送"),
-            (task(), [attempt(delivery=Delivery.PENDING)], f"对方空闲后自动发送；不需要了可 {CMD} cancel {tid}"),
+            (task(), [attempt(delivery=Delivery.PENDING)], f"等后台 worker 发送；不需要了可 {CMD} cancel {tid}"),
             (task(), [attempt(delivery=Delivery.HELD)], f"去对方会话里批准这条消息；过期后可 {CMD} retry"),
             (task(), [attempt(delivery=Delivery.UNKNOWN)], f"不会自动重发。确认对方没收到后可 {CMD} retry {tid} --force"),
             (task(), [attempt(delivery=Delivery.REFUSED)], f"未送达：{CMD} retry {tid}（可加 --to 改派）或 {CMD} close {tid}"),
@@ -137,6 +138,11 @@ class NextStepTests(unittest.TestCase):
     def test_every_runtime_has_a_label(self) -> None:
         # 打印路径是直接下标（cli.peers / cli.send），漏一个成员就是 KeyError 而不是难看的文案
         self.assertEqual(set(labels.RUNTIME_LABELS), set(Runtime))
+
+    def test_every_report_kind_has_an_event_label(self) -> None:
+        # cmd_report 的打印路径也是直接下标：ReportKind 是闭合枚举，漏一个成员就该是 KeyError
+        # （EVENT_LABELS 还含账本里的其他事件名，所以是包含关系而不是相等）
+        self.assertLessEqual({kind.value for kind in ReportKind}, set(labels.EVENT_LABELS))
 
     def test_cli_keeps_label_exports(self) -> None:
         # 既有测试与审计脚本经 cli 引用这些名称

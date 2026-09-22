@@ -33,6 +33,7 @@ MAX_INBOX_CLIENTS = 32
 MAX_INBOX_BUFFER = 2 * 1024 * 1024
 TAG = "cross-session-message"
 PRIORITY_ENV = "AB_CLAUDE_PRIORITY"
+_PRIORITIES = frozenset({"next", "later", "now"})
 _ADDRESS_UNSAFE = re.compile(r"[^A-Za-z0-9:_/.\-]")
 _PEERCRED = struct.Struct("3i")
 
@@ -156,15 +157,27 @@ class ClaudePeerTransport:
 
     def __init__(self, *, proc_root: Path = procfs.DEFAULT_PROC, priority: str | None = None) -> None:
         self._proc_root = proc_root
-        configured = priority or os.environ.get(PRIORITY_ENV) or "next"
-        self._priority = configured if configured in {"next", "later", "now"} else "next"
+        # 显式构造参数与环境变量是**运维覆盖**：设了就对所有消息生效，压过按消息种类的选择。
+        # 没设时由每条消息的 `DeliveryContext.priority` 决定，再兜底 next（DESIGN §45.42）。
+        configured = priority or os.environ.get(PRIORITY_ENV)
+        self._override = configured if configured in _PRIORITIES else None
+
+    def _priority_for(self, context: DeliveryContext) -> str:
+        if self._override is not None:
+            return self._override
+        chosen = context.priority
+        if chosen is not None and chosen in _PRIORITIES:
+            return chosen
+        # 兜底可达：其他 transport 复用 DeliveryContext 时可以不填 priority（Codex 侧就不填）
+        return "next"
 
     def deliver(self, endpoint: Endpoint, text: str, context: DeliveryContext) -> DeliveryOutcome:
         path = endpoint.socket_path
         if not path:
             return DeliveryOutcome(Delivery.FAILED, "claude_socket_unavailable")
+        priority = self._priority_for(context)
         try:
-            frame = build_frame(text, context, priority=self._priority).encode("utf-8")
+            frame = build_frame(text, context, priority=priority).encode("utf-8")
         except ValueError:
             return DeliveryOutcome(Delivery.FAILED, "provider_payload_too_large")
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -190,7 +203,7 @@ class ClaudePeerTransport:
             except OSError:
                 return DeliveryOutcome(Delivery.UNKNOWN, "claude_socket_write_failed")
             detail: dict[str, Any] = {
-                "priority": self._priority,
+                "priority": priority,
                 "senderClass": context.sender_class or "unknown",
             }
             # 接收端可能在同一连接上立即回执；读不到就等收件箱的异步回执

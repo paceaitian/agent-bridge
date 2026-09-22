@@ -205,7 +205,7 @@ def _claude_background_row(
 
     与 `summary._observer_binding` 同一套键与优先级（DESIGN §45.27.1）。一条 native session 可以
     同时存在多个运行代际（resume 到另一个进程/pane），只查 base 行会两头出错：新代际被旧代际的
-    工作状态一直扣住，旧代际的后台状态又能放开新代际正在跑的前台轮次（Codex 审计 R02）。
+    工作状态盖住，旧代际的后台状态又会把新代际正在跑的前台轮次显示成已结束（Codex 审计 R02）。
     """
     base = opaque_id("claude", session_id)
     if pane is not None:
@@ -464,7 +464,7 @@ def _discover_claude(
         source = "claude_registry"
         released = _claude_background_row(runtime, session_id, pane, pid, proc_start)
         if pane is not None and runtime.get(pane.pane_id) is Runtime.WAITING:
-            state = Runtime.WAITING  # 原生审批/提问对话框打开时不投递
+            state = Runtime.WAITING  # 原生审批/提问对话框打开；只用于显示与提示，§45.42 起不再影响投递
         elif (
             state is not Runtime.WAITING
             and released is not None

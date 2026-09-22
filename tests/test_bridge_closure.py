@@ -118,7 +118,8 @@ class ClosureCliTests(unittest.TestCase):
         task_id = self.review_flow()
         code, out, err = self.run_cli("accept", task_id)
         self.assertEqual(code, cli.EXIT_OK, err)
-        self.assertIn("已排队结束回执 → codex@impl、claude@review", out)
+        # 括号里的说明也钉住：§45.42 取消忙时扣留后不能再写「对方空闲后发送」（Codex 复审 F02）
+        self.assertIn("已排队结束回执 → codex@impl、claude@review（进对方原生队列，不需要汇报）", out)
         closures = self.closures(task_id)
         self.assertEqual(len(closures), 2)
         self.assertTrue(closures[0].target.same_session(IMPL.ref) and closures[1].target.same_session(REVIEW.ref))
@@ -549,16 +550,17 @@ class ClosureDispatchTests(unittest.TestCase):
         # 只剩普通排队消息（任务暂停或已结束）时 worker 不为它驻留
         self.assertFalse(needs_worker(self.store, self.now + DAY))
 
-    def test_busy_or_waiting_target_is_never_interrupted(self) -> None:
-        target = ref()
-        _task, closure = self.finish(target)
+    def test_busy_or_waiting_target_receives_the_closure(self) -> None:
+        """结束回执同样不再按忙闲扣留（DESIGN §45.42）。"""
         for runtime in (Runtime.BUSY, Runtime.WAITING):
-            self.endpoints = [endpoint(target, runtime=runtime)]
-            self.run_once()
-            self.assertEqual((self.get(closure).delivery, self.codex.calls), (Delivery.PENDING, []))
-        self.endpoints = [endpoint(target)]
-        self.run_once()
-        self.assertEqual(self.get(closure).delivery, Delivery.QUEUED)
+            with self.subTest(runtime=runtime):
+                target = ref()
+                _task, closure = self.finish(target)
+                self.endpoints = [endpoint(target, runtime=runtime)]
+                before = len(self.codex.calls)
+                self.run_once()
+                self.assertEqual(self.get(closure).delivery, Delivery.QUEUED)
+                self.assertEqual(len(self.codex.calls), before + 1)
 
     def test_unsent_closure_survives_a_worker_restart(self) -> None:
         target = ref()

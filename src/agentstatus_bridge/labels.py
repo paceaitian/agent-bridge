@@ -62,7 +62,7 @@ ISSUE_LABELS: dict[str, str] = {
 }
 REASON_TEXTS: dict[str, str] = {
     **READABLE_REASONS,
-    "waiting_for_target": "对方忙或等待用户，空闲后自动发送",
+    "waiting_for_target": "已排队，还没发出",
     "paused": "已暂停发送",
     "sending": "正在发送",
     "awaiting_ack": "等待对方确认开始处理",
@@ -152,6 +152,7 @@ REASON_TEXTS: dict[str, str] = {
     "claude_socket_write_failed": "写入对方会话中断，是否送达不明",
     "claude_socket_unavailable": "对方会话没有可用的消息 socket",
     "reminder_outdated": "提醒排队期间任务已有变化或回执被拒，这条提醒不再发送",
+    "notice_outdated": "发起方已返工，这条还没发出的通知不再发送",
 }
 EVENT_LABELS: dict[str, str] = {
     "created": "创建任务",
@@ -225,7 +226,7 @@ def next_step(task: Task, attempts: list[Attempt], *, ref: str, command: str | N
     if reason == "paused":
         return NextStep("resume", f"{cmd} resume {ref} 继续发送", f"{cmd} resume {ref}")
     if reason == "waiting_for_target":
-        return NextStep("wait", f"对方空闲后自动发送；不需要了可 {cmd} cancel {ref}")
+        return NextStep("wait", f"等后台 worker 发送；不需要了可 {cmd} cancel {ref}")
     if reason == "delivery_held":
         # 等接收方批准时重发没有帮助，只提示去对方会话处理
         return NextStep("approve_at_target", f"去对方会话里批准这条消息；过期后可 {cmd} retry")

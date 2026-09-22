@@ -266,17 +266,23 @@ class ReminderTests(unittest.TestCase):
         self._run()
         self.assertEqual(len(self._reminders(task_id)), 2)
 
-    def test_busy_origin_is_timed_from_when_the_result_notice_arrives(self) -> None:
+    def test_reminder_is_timed_from_when_the_result_notice_arrives(self) -> None:
+        """提醒从**送达**时刻起算，不是从对方汇报时刻起算（DESIGN §45.28.3）。
+
+        取消忙时扣留后（§45.42），回执晚到的原因不再是「对方忙」而是这段时间 worker 没跑；
+        要守的性质不变，所以换掉制造延迟的手段、留下同一条断言。
+        """
         task_id = self._task()
         self._run()
-        self.lead_busy = True
         self._report(task_id)
         reported = self.now
         self.now += 40 * 60
+        # 断言不能靠「这一轮压根没跑」成立：让发现整体为空，提醒这一轮照跑，回执只是发不出去（Fable 复审 S4）
+        self.endpoints_empty = True
         self._run()
-        self.assertEqual(self._reminders(task_id), [], "回执还在排队时不叠加提醒")
-        self.lead_busy = False
-        self._run()  # 发起方空闲，回执送达
+        self.assertEqual(self._reminders(task_id), [], "回执还没送达时不叠加提醒")
+        self.endpoints_empty = False
+        self._run()  # 端点恢复，回执送达
         arrived = self.now
         self._run()
         self.assertEqual(self._reminders(task_id), [], "回执刚送达不紧跟着再提醒")
@@ -293,9 +299,9 @@ class ReminderTests(unittest.TestCase):
         self._run()
         self._report(task_id)
         self._run()
-        self.lead_busy = True
         self.now += REMIND_AFTER_SECONDS
-        self._run()
+        # 取消忙时扣留后，「只排队不外调」是让提醒停在 PENDING 的手段（DESIGN §45.42）
+        self.dispatcher.queue_reminders()
         [reminder] = self._reminders(task_id)
         self.assertEqual(self.store.get_attempt(reminder.id).delivery, Delivery.PENDING)  # type: ignore[union-attr]
         sent = len(self.claude.calls)
@@ -307,7 +313,6 @@ class ReminderTests(unittest.TestCase):
         cancelled = self.store.get_attempt(reminder.id)
         assert cancelled is not None
         self.assertEqual((cancelled.delivery, cancelled.delivery_reason), (Delivery.CANCELLED, "reminder_outdated"))
-        self.lead_busy = False
         self._run()
         self.assertEqual(len(self.claude.calls), sent, "取消的提醒不外调")
         # 新结果照常计时提醒，被取消的旧提醒不挡路
@@ -321,9 +326,9 @@ class ReminderTests(unittest.TestCase):
     def test_held_result_notice_is_timed_from_the_prompt_and_expiry_reminds(self) -> None:
         task_id = self._task()
         self._run()
-        self.lead_busy = True
         self._report(task_id)
         reported = self.now
+        # 不跑 dispatch，直接摆出「已写入、对方要批准」的结果：本用例验的是 HELD 之后的提醒计时
         notice = self.store.attempts(task_id)[-1]
         self.now += 10 * 60
         self.store.begin_send(notice.id, now=self.now, pid=1, start_ticks="1")
@@ -413,15 +418,14 @@ class ReminderTests(unittest.TestCase):
                 self._report(task_id)
                 self._run()
                 notice = [item for item in self.store.attempts(task_id) if item.role is Role.NOTICE][0]
-                self.lead_busy = True
                 self.now += REMIND_AFTER_SECONDS
-                self._run()
+                # 取消忙时扣留后，「只排队不外调」是让提醒停在 PENDING 的手段（DESIGN §45.42）
+                self.dispatcher.queue_reminders()
                 [reminder] = self._reminders(task_id)
                 # 提醒还在桥内排队时，原回执迟到的拒绝回执到了（Codex 复审 S01）
                 self.store.transition_delivery(
                     notice.id, expected=(Delivery.WRITTEN,), new=declined, reason="claude_denied", now=self.now
                 )
-                self.lead_busy = False
                 sent = len(self.claude.calls)
                 self._run()
                 cancelled = self.store.get_attempt(reminder.id)
@@ -434,11 +438,10 @@ class ReminderTests(unittest.TestCase):
         self._run()
         self._report(task_id)
         self._run()
-        self.lead_busy = True
         self.now += REMIND_AFTER_SECONDS
-        self._run()
+        # 取消忙时扣留后，「只排队不外调」是让提醒停在 PENDING 的手段（DESIGN §45.42）
+        self.dispatcher.queue_reminders()
         [reminder] = self._reminders(task_id)
-        self.lead_busy = False
         other = Store.open(Path(self._tmp.name) / "bridge")
         self.addCleanup(other.close)
         other._conn.execute("PRAGMA busy_timeout=100")  # pyright: ignore[reportPrivateUsage]
@@ -469,11 +472,10 @@ class ReminderTests(unittest.TestCase):
         self._run()
         self._report(task_id)
         self._run()
-        self.lead_busy = True
         self.now += REMIND_AFTER_SECONDS
-        self._run()
+        # 取消忙时扣留后，「只排队不外调」是让提醒停在 PENDING 的手段（DESIGN §45.42）
+        self.dispatcher.queue_reminders()
         [reminder] = self._reminders(task_id)
-        self.lead_busy = False
         sent = len(self.claude.calls)
         real = procfs.read_process
         raced = False
@@ -500,13 +502,13 @@ class ReminderTests(unittest.TestCase):
     def test_codex_origin_queued_notice_restarts_the_clock(self) -> None:
         task_id = self._task(origin=CODEX_LEAD)
         self._run()
-        self.codex_lead_busy = True
         self._report(task_id)
         self.now += 40 * 60
+        self.endpoints_empty = True  # 同上：提醒这一轮真的跑过，只是回执还没入队（Fable 复审 S4）
         self._run()
         self.assertEqual(self._reminders(task_id), [])
-        self.codex_lead_busy = False
-        self._run()  # 回执进入发起方 Codex 队列
+        self.endpoints_empty = False
+        self._run()  # 端点恢复，回执进入发起方 Codex 队列
         notice = [item for item in self.store.attempts(task_id) if item.role is Role.NOTICE][0]
         self.assertEqual(notice.delivery, Delivery.QUEUED)
         arrived = self.now

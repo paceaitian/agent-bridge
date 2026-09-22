@@ -21,6 +21,7 @@ from agentstatus_bridge.model import Attempt, Consumption, Delivery, EndpointRef
 from agentstatus_bridge.transports import DeliveryContext
 from agentstatus_bridge.transports import claude_peer
 from agentstatus_bridge.transports.claude_peer import (
+    PRIORITY_ENV,
     ClaudeInbox,
     ClaudePeerTransport,
     build_frame,
@@ -237,6 +238,39 @@ class ClaudeFrameTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_frame("x" * 1_000_001, context)
 
+    def test_priority_comes_from_the_message_and_falls_back_to_next(self) -> None:
+        """每条消息自带原生调度提示；通道不认识的取值回落 next，不让上层写错把消息打成中断（§45.42）。
+
+        先清掉环境里的运维覆盖：它一旦被设过，这条用例测的就是覆盖而不是按消息取值（Codex 复查建议）。
+        """
+        with patch.dict(os.environ):
+            os.environ.pop(PRIORITY_ENV, None)
+            transport = ClaudePeerTransport()
+            for given, expected in (("later", "later"), ("next", "next"), ("now", "now"),
+                                    (None, "next"), ("", "next"), ("urgent", "next"), ("NEXT", "next")):
+                with self.subTest(given=given):
+                    context = DeliveryContext(message_uuid="m", sender_name="x", priority=given)
+                    self.assertEqual(transport._priority_for(context), expected)  # pyright: ignore[reportPrivateUsage]
+
+    def test_operator_override_wins_over_the_per_message_priority(self) -> None:
+        """构造参数与环境变量是运维覆盖：设了就对所有消息生效。"""
+        context = DeliveryContext(message_uuid="m", sender_name="x", priority="later")
+        self.assertEqual(
+            ClaudePeerTransport(priority="now")._priority_for(context),  # pyright: ignore[reportPrivateUsage]
+            "now",
+        )
+        with patch.dict(os.environ, {PRIORITY_ENV: "next"}):
+            self.assertEqual(
+                ClaudePeerTransport()._priority_for(context),  # pyright: ignore[reportPrivateUsage]
+                "next",
+            )
+        with patch.dict(os.environ, {PRIORITY_ENV: "bogus"}):
+            self.assertEqual(
+                ClaudePeerTransport()._priority_for(context),  # pyright: ignore[reportPrivateUsage]
+                "later",
+                "覆盖值非法时退回按消息种类选，而不是退回 next",
+            )
+
     def test_sender_name_matches_receiver_normalization(self) -> None:
         self.assertEqual(normalize_sender_name(" a\u200bb\x07c "), "abc")
         self.assertEqual(len(normalize_sender_name("名" * 80)), 64)
@@ -253,6 +287,10 @@ class ClaudeFrameTests(unittest.TestCase):
         )
         assert refused is not None
         self.assertEqual(refused.delivery, Delivery.REFUSED)
+        # dropped=对方会话没收下（队列满、限流等）：必须是终态失败，不能当成「可能已送达」而不再重发（Fable 复审 S6）
+        dropped = parse_receipt({"type": "control", "action": "peer_message_status", "status": "dropped", "orig_msg_id": "y"})
+        assert dropped is not None
+        self.assertEqual((dropped.delivery, dropped.reason), (Delivery.FAILED, "claude_dropped"))
         self.assertIsNone(parse_receipt({"type": "control", "action": "peer_message_status", "status": "odd", "orig_msg_id": "x"}))
         self.assertIsNone(parse_receipt({"type": "user"}))
         self.assertEqual(encode_address("/run/user/1000/cc-socks/12.sock"), "uds:/run/user/1000/cc-socks/12.sock")

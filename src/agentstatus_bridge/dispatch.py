@@ -2,7 +2,8 @@
 
 规则（DESIGN §45.3）：
 - 先持久化 sending 再外调；外调结果不明记 unknown，从不自动重发。
-- 对方忙或原生对话框打开时留在桥内排队（可暂停、取消）；空闲、只剩后台工作或状态未知时发送（§45.37）。
+- 不按忙闲扣留：消息一律外调，对方读它的时机交给原生优先级（回执 next、交接 later，§45.42）；
+  显式 `ab pause` 与仍在 PENDING 的 `ab cancel` 照旧可用。
 - 投递到用户选定的进程代际；它已退出时才接续唯一存活的同会话进程，多个时不猜。
 - 目标会话持续不在：可证明未发送，标 failed 并给出原因，交用户重发或改派。
 """
@@ -30,7 +31,6 @@ from .model import (
     EndpointRef,
     Provider,
     Role,
-    Runtime,
     Task,
 )
 from .reminders import (
@@ -48,7 +48,31 @@ from .transports import DeliveryContext, DeliveryOutcome, Transport
 from .transports.claude_peer import Receipt, encode_address, parse_receipt, parse_reply
 from .transports.codex_queue import queue_item_state
 
-# 发现结果缓存，避免对方忙时每秒都扫描 /proc 与调用 tmux
+# 原生调度提示按消息种类选（DESIGN §45.42）。取消忙时扣留之后，「对方什么时候读它」不再由
+# 桥自己排队决定，而是交给上游为此设计的优先级：
+# - 回执类（结果通知、结束回执、提醒）讲的是**已经做完**的事，被对方当前轮吸收反而更早知道结果；
+# - 交接类（新任务、复核）要对方**开始做**新事，`later` 会被原生 max-next 过滤掉，等主轮可 drain。
+_ROLE_PRIORITY: dict[Role, str] = {
+    Role.NOTICE: "next",
+    Role.HANDOFF: "later",
+    Role.REVIEW: "later",
+}
+
+
+def native_priority(attempt: Attempt) -> str:
+    """这条消息希望对方什么时候读它。
+
+    结束回执与提醒都是 `Role.NOTICE`（`is_closure` 按定义就要求 role 是 NOTICE），
+    所以不需要单独分支——单独写一条只会是永远改变不了结果的死代码。
+
+    直接下标而不是 `.get(默认值)`：`Role` 是闭合枚举，漏配就该是 KeyError，
+    由 `test_every_role_has_a_native_priority` 在测试期变红，而不是被静默打成某个默认值
+    （与 `labels.py` 的 RUNTIME_LABELS 同一口径）。
+    """
+    return _ROLE_PRIORITY[attempt.role]
+
+
+# 发现结果缓存，避免 worker 每一轮都扫描 /proc 与调用 tmux
 DISCOVERY_MIN_INTERVAL_SECONDS = 2.0
 # 目标连续缺席这么久才判定不在，容忍短暂的发现失败
 TARGET_GONE_GRACE_SECONDS = 15.0
@@ -394,14 +418,14 @@ class Dispatcher:
     def dispatch(self, attempt: Attempt, endpoints: list[Endpoint]) -> str:
         """尝试发送一条排队消息，返回 sent / waiting / failed / skipped。"""
         task = self.store.get_task(attempt.task_id)
-        # 只有结束回执不受任务结束/暂停限制；其余发送条件（忙时等待、目标消失、权限）完全照旧（DESIGN §45.31.5）
+        # 只有结束回执不受任务结束/暂停限制；其余发送条件（目标消失、权限）完全照旧（DESIGN §45.31.5）
         if task is None or ((task.finished or task.paused) and not attempt.is_closure):
             return "skipped"
         now = self.clock()
         if self._reminder_outdated(task, attempt, now):
             return "skipped"
-        adapter = ADAPTERS.get(attempt.target.provider)
-        if adapter is not None and not adapter.inbox:
+        # ADAPTERS 覆盖全部 Provider（守卫见 test_bridge_endpoints），漏成员就该是 KeyError 而不是静默放行
+        if not ADAPTERS[attempt.target.provider].inbox:
             # 有没有收件通道是注册表里的静态能力：发现不到、发现整体为空、对方离线都不会让它变得能收，
             # 所以不能等 liveness 与 15 秒宽限走完才判——否则这条通知永远 PENDING、worker 一直驻留（Codex 审计 F02）
             return self._fail(attempt, "target_no_inbox", now)
@@ -423,9 +447,9 @@ class Dispatcher:
         if "shared_thread" in live.issues and not attempt.allow_shared:
             # 发送前已看到多个消费者，而用户没有放行共享 thread
             return self._fail(attempt, "target_shared_thread", now)
-        if live.runtime in (Runtime.BUSY, Runtime.WAITING):
-            # 只有前台轮次在跑或对方在等用户时才扣住；BACKGROUND（本轮已结束、只剩后台工作）照常发（§45.37）
-            return "waiting"
+        # 不再按忙闲扣留（DESIGN §45.42）：扣留换来的撤回窗口 7 天 0 次使用，而代价是回执中位延迟
+        # 6 分钟、最大 58 分钟。上游接收路径本就没有「对方忙就不入队」的条件；忙时消息进原生队列，
+        # 对方读它的时机由上面的优先级分档表达。忙闲仍用于显示与查询提示，不再充当输入调度器。
         provider = live.ref.provider
         if provider is Provider.CLAUDE and self.reply_address is None:
             return "waiting"  # Claude 回执只能由持有收件箱的 worker 接收
@@ -459,6 +483,7 @@ class Dispatcher:
                 sender_session=sender.native_id if sender and sender.provider is Provider.CLAUDE else None,
                 sender_class=attempt.sender_class,
                 reply_to=self.reply_address if provider is Provider.CLAUDE else None,
+                priority=native_priority(attempt),
             )
         except Exception as error:
             # 尚未外调：可证明未发送，不能让记录停在发送中

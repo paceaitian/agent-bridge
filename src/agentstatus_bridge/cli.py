@@ -623,9 +623,8 @@ def cmd_send(args: argparse.Namespace) -> int:
         else:
             print(f"任务 {short(task.id)} 已交给 {target.ref.display()}：{DELIVERY_LABELS[current.delivery]}")
             if current.delivery is Delivery.PENDING:
-                if target.runtime in (Runtime.BUSY, Runtime.WAITING):
-                    print(f"对方{RUNTIME_LABELS[target.runtime]}，桥会在对方空闲后发送")
-                elif worker_up:
+                # 不再按忙闲扣留（§45.42）：还是 PENDING 只说明 worker 还没轮到它
+                if worker_up:
                     print(f"后台 worker 正在发送；稍后用 {command_name()} status 查看投递结果")
                 if not worker_up:
                     code = "worker_start_failed" if started is None else "worker_not_running"
@@ -739,7 +738,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         if args.json:
             _print_json(_task_document(store, outcome.task))
             return exit_code
-        print(f"已记录：{EVENT_LABELS.get(kind.value, kind.value)}（任务 {short(outcome.task.id)} #{outcome.attempt.seq}）")
+        print(f"已记录：{EVENT_LABELS[kind.value]}（任务 {short(outcome.task.id)} #{outcome.attempt.seq}）")
         for followup in outcome.followups:
             label = "已排队发给复核方" if followup.role is Role.REVIEW else "已排队通知发起方"
             print(f"{label} {followup.target.display()}")
@@ -868,7 +867,7 @@ def _closure_document(outcome: ClosureOutcome) -> dict[str, object]:
 def _print_closure(outcome: ClosureOutcome) -> None:
     if outcome.queued:
         names = "、".join(item.target.display() for item in outcome.queued)
-        print(f"已排队结束回执 → {names}（对方空闲后发送，不需要汇报）")
+        print(f"已排队结束回执 → {names}（进对方原生队列，不需要汇报）")
     for recipient, _capacity in outcome.skipped:
         print(f"排队容量已满，未给 {recipient.target.display()} 排结束回执")
 
@@ -997,71 +996,97 @@ def cmd_retry(args: argparse.Namespace) -> int:
     caller = identify_caller(endpoints)
     now = time.time()
     with _open_store() as store:
-        task = _task(store, args.task)
-        if task.finished:
-            raise CliError("task_finished")
-        if not _may_decide(caller, task):
-            raise CliError("accept_not_allowed")
-        attempts = work_attempts(store.attempts(task.id))
-        if not attempts:
-            raise CliError("attempt_not_found")
-        first = attempts[0]
-        current = attempts[-1]
-        if current.delivery is Delivery.PENDING:
-            raise CliError("still_pending")
-        undelivered = current.delivery in PROVEN_UNDELIVERED
-        rework = current.work in (Work.BLOCKED, Work.FAILED) or (
-            current.role is Role.REVIEW and task.verdict is Verdict.CHANGES
-        ) or (current.work is Work.RESULT and current.role is Role.HANDOFF)
-        if not (undelivered or rework or args.force):
-            raise CliError("retry_requires_force")
-        role = current.role
-        target_ref = current.target
-        if undelivered and not rework:
-            body = current.body
-            if args.message:
-                body = f"{body}\n\n补充：{args.message}"
-        else:
-            if current.role is Role.REVIEW and task.verdict is Verdict.CHANGES:
-                role = Role.HANDOFF
-                implementer = next((item for item in reversed(attempts) if item.role is Role.HANDOFF), first)
-                target_ref = implementer.target
-            body = _rework_body(first, current, task, args.message)
-        allow_shared = bool(args.allow_shared or current.allow_shared)
-        if args.to:
-            target = _resolve(args.to, endpoints)
-            _check_target(target, allow_shared=allow_shared)
-            target_ref = target.ref
-        else:
-            live, problem = select_generation(target_ref, endpoints)
-            if problem is not None:
-                raise CliError(f"target_{problem}")
-            if live is not None:
-                _check_target(live, allow_shared=allow_shared)
-                target_ref = live.ref
+        # 校验、作废过时回执、追加返工尝试必须在同一个事务里（Codex 复审 F01）。分成多次提交时，
+        # 提交间隙里另一连接可能已经汇报出新一轮结果、或并发 close 排了结束回执，随后的全量扫描
+        # 会把它们一起作废；追加成功而作废失败还会留下「返工已落账却返回错误」的半完成命令。
+        # 端点发现在事务外做，事务内重做全部校验——世界变了就照常抛原来那些错误。
         try:
-            attempt = store.add_attempt(
-                task.id,
-                role=role,
-                target=target_ref,
-                body=body,
-                refs=first.refs if role is Role.HANDOFF else current.refs,
-                now=now,
-                sender=first.sender,
-                sender_class=first.sender_class,
-                options={"allowShared": allow_shared},
-            )
+            with store.transaction():
+                attempt, undelivered, rework = _retry_in_transaction(store, args, endpoints, caller, now)
         except StoreError as error:
             raise CliError(error.code, _exit_for_store_error(error.code)) from error
-        fields: dict[str, object] = {"control": "active"}
-        if task.verdict is not None:
-            fields["verdict"] = None
-        store.update_task(task.id, now=now, event="retry", **fields)
         started = _start_worker()
-        print(f"已排队第 {attempt.seq} 次{ROLE_LABELS[attempt.role]} → {attempt.target.display()}（任务 {short(task.id)}）")
+        print(f"已排队第 {attempt.seq} 次{ROLE_LABELS[attempt.role]} → {attempt.target.display()}（任务 {short(attempt.task_id)}）")
         if args.force and not undelivered and not rework:
             print("注意：上一条消息可能已送达，对方可能重复执行")
     return EXIT_UNAVAILABLE if _queued_without_worker(started) else EXIT_OK
+
+
+def _retry_in_transaction(
+    store: Store, args: argparse.Namespace, endpoints: list[Endpoint], caller: Caller, now: float
+) -> tuple[Attempt, bool, bool]:
+    """在调用方开启的事务内完成返工：重新校验 → 作废过时回执 → 追加新尝试 → 更新任务。"""
+    task = _task(store, args.task)
+    if task.finished:
+        raise CliError("task_finished")
+    if not _may_decide(caller, task):
+        raise CliError("accept_not_allowed")
+    attempts = work_attempts(store.attempts(task.id))
+    if not attempts:
+        raise CliError("attempt_not_found")
+    first = attempts[0]
+    current = attempts[-1]
+    if current.delivery is Delivery.PENDING:
+        raise CliError("still_pending")
+    undelivered = current.delivery in PROVEN_UNDELIVERED
+    rework = current.work in (Work.BLOCKED, Work.FAILED) or (
+        current.role is Role.REVIEW and task.verdict is Verdict.CHANGES
+    ) or (current.work is Work.RESULT and current.role is Role.HANDOFF)
+    if not (undelivered or rework or args.force):
+        raise CliError("retry_requires_force")
+    role = current.role
+    target_ref = current.target
+    if undelivered and not rework:
+        body = current.body
+        if args.message:
+            body = f"{body}\n\n补充：{args.message}"
+    else:
+        if current.role is Role.REVIEW and task.verdict is Verdict.CHANGES:
+            role = Role.HANDOFF
+            implementer = next((item for item in reversed(attempts) if item.role is Role.HANDOFF), first)
+            target_ref = implementer.target
+        body = _rework_body(first, current, task, args.message)
+    allow_shared = bool(args.allow_shared or current.allow_shared)
+    if args.to:
+        target = _resolve(args.to, endpoints)
+        _check_target(target, allow_shared=allow_shared)
+        target_ref = target.ref
+    else:
+        live, problem = select_generation(target_ref, endpoints)
+        if problem is not None:
+            raise CliError(f"target_{problem}")
+        if live is not None:
+            _check_target(live, allow_shared=allow_shared)
+            target_ref = live.ref
+    # 先作废再追加：全局尝试槽有上限，别让即将作废的回执占着位置（Codex 复审 F01）。
+    # 返工意味着「这个结果不作数」，还没发出的通知随之作废；已经发出去的不追，那是对方已经看到的事实。
+    # **不再额外排除结束回执**：结束回执只在 accept/close 的事务里与 accepted_at/closed_at 同写，
+    # 而本函数开头的 `task.finished` 检查就在同一个事务内重做过——有结束回执就意味着任务已结束，
+    # 那一步已经抛 `task_finished` 了。再加一条 `not is_closure` 只会是永远走不到的死代码
+    # （Fable 复审的变异佐证：加上它 96 条用例全绿）。Codex 复审 F01 的并发反例正是由「分多次提交」
+    # 造成的，事务边界一合并就不成立。
+    for stale in store.attempts(task.id):
+        if stale.role is Role.NOTICE and stale.delivery is Delivery.PENDING:
+            store.transition_delivery(
+                stale.id, expected=(Delivery.PENDING,), new=Delivery.CANCELLED,
+                reason="notice_outdated", now=now,
+            )
+    attempt = store.add_attempt(
+        task.id,
+        role=role,
+        target=target_ref,
+        body=body,
+        refs=first.refs if role is Role.HANDOFF else current.refs,
+        now=now,
+        sender=first.sender,
+        sender_class=first.sender_class,
+        options={"allowShared": allow_shared},
+    )
+    fields: dict[str, object] = {"control": "active"}
+    if task.verdict is not None:
+        fields["verdict"] = None
+    store.update_task(task.id, now=now, event="retry", **fields)
+    return attempt, undelivered, rework
 
 
 def cmd_worker(args: argparse.Namespace) -> int:

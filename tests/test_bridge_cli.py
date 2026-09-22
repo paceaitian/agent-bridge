@@ -21,7 +21,7 @@ from agentstatus_bridge.endpoints import Caller
 from agentstatus_bridge.hints import PaneState
 from agentstatus_bridge.model import Consumption, Delivery, Endpoint, Provider, Role, Runtime, Verdict, Work
 from agentstatus_bridge.procfs import ProcessInfo
-from agentstatus_bridge.store import Store
+from agentstatus_bridge.store import Store, StoreError
 from bridge_support import endpoint, ref
 
 IMPL = endpoint(ref(Provider.CODEX, "impl-thread", pid=1000, pane="%1", label="impl"))
@@ -174,11 +174,13 @@ class CliTests(unittest.TestCase):
         self.endpoints = [endpoint(IMPL.ref, issues=("no_thread_yet",))]
         code, _, err = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
         self.assertEqual((code, "target_no_thread_yet" in err), (cli.EXIT_REJECTED, True))
+        # 对方忙不再影响投递（§45.42）：排队与否只取决于 worker 在不在
         self.endpoints = [endpoint(IMPL.ref, runtime=Runtime.BUSY)]
         self.worker_up = False
         code, out, _ = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
         self.assertEqual(code, cli.EXIT_UNAVAILABLE)
-        self.assertIn("对方忙", out)
+        self.assertIn("后台 worker 未运行", out)
+        self.assertNotIn("对方忙", out)
 
     def test_agent_origin_is_recorded(self) -> None:
         self.caller = as_agent(LEAD)
@@ -202,6 +204,55 @@ class CliTests(unittest.TestCase):
         with self.store() as store:
             attempts = store.attempts(task_id)
         self.assertEqual([(item.seq, item.delivery) for item in attempts], [(1, Delivery.UNKNOWN), (2, Delivery.PENDING)])
+
+    def test_retry_cancels_a_result_notice_that_has_not_been_sent(self) -> None:
+        """返工意味着这个结果不作数：还没发出的结果回执随之作废（DESIGN §45.42）。
+
+        不作废的话它会在新一轮派出之后才送达发起方——实测发生过 2 例。
+        """
+        self.caller = as_agent(LEAD)  # 有发起方才会产生结果回执
+        task_id = self.send()
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        self.assertEqual(self.run_cli("report", task_id, "--result", "--note", "完成")[0], 0)
+        self.caller = as_agent(LEAD)
+        with self.store() as store:
+            notice = [item for item in store.attempts(task_id) if item.role is Role.NOTICE][-1]
+        self.assertEqual(notice.delivery, Delivery.PENDING)
+        code, _out, err = self.run_cli("retry", task_id, "--message", "还差测试")
+        self.assertEqual(code, 0, err)
+        with self.store() as store:
+            stale = store.get_attempt(notice.id)
+            latest = store.attempts(task_id)[-1]
+        assert stale is not None
+        self.assertEqual((stale.delivery, stale.delivery_reason), (Delivery.CANCELLED, "notice_outdated"))
+        # 新一轮照常排队；已送达的回执不会被追回（这里只有未发出的那条被作废）
+        self.assertEqual((latest.role, latest.delivery), (Role.HANDOFF, Delivery.PENDING))
+
+    def test_retry_is_atomic_when_the_new_attempt_cannot_be_written(self) -> None:
+        """作废旧通知与追加返工必须同进同退（Codex 复审 F01）。
+
+        分多次提交时，提交间隙里另一连接可能汇报出新一轮结果或排了结束回执，随后的全量扫描
+        会把它们一起作废；追加失败而作废已提交，还会留下「旧通知没了、返工没落账」的半完成命令。
+        """
+        self.caller = as_agent(LEAD)
+        task_id = self.send()
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        self.assertEqual(self.run_cli("report", task_id, "--result", "--note", "完成")[0], 0)
+        self.caller = as_agent(LEAD)
+        with self.store() as store:
+            notice = [item for item in store.attempts(task_id) if item.role is Role.NOTICE][-1]
+            before = len(store.attempts(task_id))
+        with patch.object(Store, "add_attempt", side_effect=StoreError("store_busy")):
+            code, _out, _err = self.run_cli("retry", task_id, "--message", "还差测试")
+        self.assertEqual(code, cli.EXIT_STORE)
+        with self.store() as store:
+            rolled_back = store.get_attempt(notice.id)
+            after = store.attempts(task_id)
+        assert rolled_back is not None
+        self.assertEqual(rolled_back.delivery, Delivery.PENDING, "追加失败时旧通知不能已经被作废")
+        self.assertEqual(len(after), before, "失败的返工不得留下半条记录")
 
     def test_failed_delivery_can_be_redirected_without_force(self) -> None:
         task_id = self.send()

@@ -1,7 +1,8 @@
-"""协作桥分发：忙时排队、目标消失、结果不明不重发、回执与消费证据。"""
+"""协作桥分发：按消息种类选原生优先级、目标消失、结果不明不重发、回执与消费证据。"""
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,15 +16,18 @@ from agentstatus_bridge.dispatch import (
     WRITTEN_WATCH_SECONDS,
     Dispatcher,
     message_uuid,
+    native_priority,
 )
 from agentstatus_bridge import dispatch, store as store_module
 from agentstatus_bridge.envelope import parse_header
 from agentstatus_bridge.model import (
+    CLOSURE_KIND,
     Consumption,
     Delivery,
     Endpoint,
     EndpointRef,
     Flow,
+    NOTICE_KIND_OPTION,
     Phase,
     Provider,
     Role,
@@ -124,17 +128,21 @@ class DispatchTests(unittest.TestCase):
         self.assertNotIn("agent-bridge", text)
         self.assertNotIn("ab report", text)
 
-    def test_busy_or_waiting_target_stays_in_bridge_queue(self) -> None:
-        target = ref()
-        _task, attempt = self._task(target)
-        for runtime in (Runtime.BUSY, Runtime.WAITING):
-            self.endpoints = [endpoint(target, runtime=runtime)]
-            self._run()
-            self.assertEqual(self._attempt(attempt.id).delivery, Delivery.PENDING)
-        self.assertEqual(self.codex.calls, [])
-        self.endpoints = [endpoint(target, runtime=Runtime.UNKNOWN)]
-        self._run()
-        self.assertEqual(self._attempt(attempt.id).delivery, Delivery.QUEUED)
+    def test_busy_or_waiting_target_is_delivered_not_held(self) -> None:
+        """忙闲不再决定投不投（DESIGN §45.42）。
+
+        上游接收路径没有「对方忙就不入队」的条件；扣留换来的撤回窗口 7 天 0 次使用，
+        代价却是回执中位延迟 6 分钟、最大 58 分钟。忙闲仍用于显示与查询提示。
+        """
+        for runtime in (Runtime.BUSY, Runtime.WAITING, Runtime.BACKGROUND, Runtime.IDLE, Runtime.UNKNOWN):
+            with self.subTest(runtime=runtime):
+                target = ref()
+                _task, attempt = self._task(target)
+                self.endpoints = [endpoint(target, runtime=runtime)]
+                before = len(self.codex.calls)
+                self._run()
+                self.assertEqual(self._attempt(attempt.id).delivery, Delivery.QUEUED)
+                self.assertEqual(len(self.codex.calls), before + 1)
 
     def test_background_target_is_not_held(self) -> None:
         """本轮已结束、只剩后台工作在跑：消息真的外调发出，而不只是 runtime 取值变了（DESIGN §45.37）。"""
@@ -212,6 +220,41 @@ class DispatchTests(unittest.TestCase):
         self._run()
         self.assertEqual(self.claude.calls, [])
         self.assertEqual(self._attempt(attempt.id).delivery, Delivery.PENDING)
+
+    def test_every_role_has_a_native_priority(self) -> None:
+        """闭合枚举是合同：新增 role 时漏配在这里变红，而不是被静默打成某个默认值。"""
+        self.assertEqual(set(dispatch._ROLE_PRIORITY), set(Role))  # pyright: ignore[reportPrivateUsage]
+
+    def test_native_priority_is_chosen_by_message_kind(self) -> None:
+        """取消扣留后，「对方什么时候读它」改由原生优先级表达（DESIGN §45.42）。
+
+        回执类讲的是已经做完的事，被对方当前轮吸收反而更早知道结果；交接类要对方开始做新事，
+        `later` 会被原生 max-next 过滤掉、等主轮可 drain。
+        """
+        target = ref(Provider.CLAUDE, "claude-session")
+        self.endpoints = [endpoint(target, socket_path="/run/test/peer.sock")]
+        task, handoff = self._task(target)
+        cases = [(handoff, "later")]
+        for role, expected in ((Role.REVIEW, "later"), (Role.NOTICE, "next")):
+            cases.append((
+                self.store.add_attempt(
+                    task.id, role=role, target=target, body="x", refs=[], now=self.now,
+                    sender=None, sender_class=None,
+                ),
+                expected,
+            ))
+        for attempt, expected in cases:
+            with self.subTest(role=attempt.role):
+                self.assertEqual(native_priority(attempt), expected)
+        # 结束回执按定义就是 NOTICE，因此天然归回执类；这条断言钉住这个推理，不另设分支
+        closure = replace(cases[-1][0], options={NOTICE_KIND_OPTION: CLOSURE_KIND})
+        self.assertTrue(closure.is_closure)
+        self.assertIs(closure.role, Role.NOTICE)
+        self.assertEqual(native_priority(closure), "next")
+        # 端到端：真的写进了投递上下文，而不只是函数返回值对
+        self._run()
+        _endpoint, _text, context = self.claude.calls[0]
+        self.assertEqual(context.priority, "later")
 
     def test_claude_context_declares_origin_class_honestly(self) -> None:
         target = ref(Provider.CLAUDE, "claude-session")
