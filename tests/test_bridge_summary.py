@@ -636,7 +636,7 @@ class SummaryCliTests(unittest.TestCase):
     def test_doctor_shows_summary_state(self) -> None:
         self.send()
         with (
-            patch.object(cli, "cli_version", return_value="codex-cli 0.154.0"),
+            patch.object(cli, "cli_version", return_value="0.154.0"),
             patch("agentstatus_bridge.endpoints.agentstatus_runtime", return_value={}),
         ):
             code, out, err = self.run_cli("doctor", "--json")

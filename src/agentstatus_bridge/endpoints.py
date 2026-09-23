@@ -45,8 +45,10 @@ _ROLLOUT = re.compile(
 _GROK_EVENTS = re.compile(
     r"/(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/events\.jsonl$"
 )
-# 这些 Codex 子命令不是交互 TUI，不能作为任务目标；按支持版本维护，另含已消失的历史名称（DESIGN §45.33.2）
-# `agents` 不在其中：0.154 里它走 run_interactive_tui，是交互的 agents 概览
+# 这些 Codex 子命令不是交互 TUI，不能作为任务目标（DESIGN §45.33.2、§45.44 二.7）。名单依据：0.156.0 `--help`
+# 可见的非交互子命令 + 固定源码（`fe74a774`）中 `hide=true` 的隐藏子命令 `tcp-tunnel`（`--help` 不列隐藏子命令）；
+# 另含 `--help` 未列出（已删或隐藏）的历史名。`agents`/`resume`/`fork` 是交互，故意不在内；
+# `app` 只在 macOS/Windows 编译，本桥 Linux 范围不收
 _CODEX_NON_TUI = frozenset(
     {
         "app-server",
@@ -78,6 +80,7 @@ _CODEX_NON_TUI = frozenset(
         "review",
         "sandbox",
         "stdio-to-uds",
+        "tcp-tunnel",
         "unarchive",
         "update",
     }
@@ -373,7 +376,7 @@ class DiscoverySources:
 def _codex_non_interactive(tokens: Sequence[str]) -> bool:
     """按有界 argv 判断 Codex 是否以明确的非交互子命令启动（DESIGN §45.33.2、§45.33.6）。
 
-    跟随上游 0.154 的解析：跳过已知全局选项及其取值（多值选项的空格写法吞掉后续非选项 token，内联写法只带一个），
+    跟随上游 0.154 的解析（0.156.0 已按源码逐项核对取值型全局选项，2026-09-22）：跳过已知全局选项及其取值（多值选项的空格写法吞掉后续非选项 token，内联写法只带一个），
     `--` 之后是字面参数；**位置参数之后仍可能出现子命令**（`codex hello exec` 实际进入 exec），所以未知 token 不终止扫描，
     继续找第一个落在子命令表里的 token；一个都没有就是交互（裸 `codex`、`codex "初始要求"`）。
     """

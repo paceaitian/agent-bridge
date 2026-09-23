@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from agentstatus_bridge import procfs
+from agentstatus_bridge.cli import project_delivery_detail
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
 from agentstatus_bridge.envelope import parse_header, render
 from agentstatus_bridge.model import Attempt, Consumption, Delivery, EndpointRef, Flow, Provider, Role, Task
@@ -31,10 +32,17 @@ from agentstatus_bridge.transports.claude_peer import (
 )
 from agentstatus_bridge.transports.codex_queue import (
     MAX_ARGV_MESSAGE_BYTES,
+    OUTPUT_KEY,
+    UNKNOWN_VERSION,
+    VERSION_KEY,
+    VERSION_TIMEOUT_SECONDS,
     CodexQueueTransport,
     RunResult,
     classify_failure,
+    cli_version,
+    parse_version,
     queue_item_state,
+    summarize_queue_evidence,
 )
 from bridge_support import endpoint, ref
 
@@ -123,6 +131,28 @@ class CodexQueueTests(unittest.TestCase):
             )
         self.assertEqual((outcome.delivery, outcome.reason), (Delivery.FAILED, "codex_cli_missing"))
 
+    def test_outcome_detail_never_carries_command_output(self) -> None:
+        """stdout/stderr 只用来分类、不进 detail（DESIGN §45.43 2.3 的负例）。
+
+        标量守卫只约束形状，挡不住一个短字符串形式的正文；所以要直接证明输出文本本身不会被记下。
+        """
+        marker = "SYNTHETIC_PRIVATE_MARKER"
+        results = [
+            RunResult(0, f"Queued message {ITEM} for thread {THREAD}.\n{marker}", ""),
+            RunResult(0, marker, ""),
+            RunResult(1, marker, f"Error: thread/queue/add failed: thread not found: {THREAD} {marker}"),
+            RunResult(1, "", f"Error: queued submission operation failed: queue storage failed: {marker}"),
+            RunResult(1, "", f"Error: {marker}"),
+            RunResult(2, "", f"error: unexpected argument '{marker}' found"),
+            RunResult(101, "", f"thread 'main' panicked at {marker}"),
+        ]
+        for result in results:
+            with self.subTest(code=result.returncode, stdout=result.stdout[:16]):
+                transport, _ = self._transport(result)
+                outcome = self._deliver(transport)
+                self.assertNotIn(marker, json.dumps(outcome.detail))
+                self.assertFalse(project_delivery_detail(outcome.detail)[1])
+
     def test_queue_item_state_reads_ids_only(self) -> None:
         with TemporaryDirectory() as tmp:
             database = Path(tmp) / "queue_1.sqlite"
@@ -138,6 +168,220 @@ class CodexQueueTests(unittest.TestCase):
                 connection.execute("INSERT INTO queued_items VALUES ('a', 't', '{}', 1, 0, 0)")
             self.assertEqual(queue_item_state("a", database=database), Consumption.STILL_QUEUED)
             self.assertEqual(queue_item_state("b", database=database), Consumption.LEFT_QUEUE)
+
+
+class CodexQueueEvidenceTests(unittest.TestCase):
+    """每次真正外调 `codex queue` 都留下「哪个版本执行的」与「输出是否落在已知分支」（DESIGN §45.44）。
+
+    夹具仿照 standalone 安装：入口链接 → `current` 链接 → 某个 release。假 runner 可以在 queue 调用期间
+    原子切换 `current`，复现自动升级与投递重叠的竞态。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.releases: dict[str, Path] = {}
+        for version in ("0.155.1", "0.156.0"):
+            binary = base / "releases" / version / "bin" / "codex"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\n")
+            self.releases[version] = binary
+        self.current = base / "current"
+        self.current.symlink_to(base / "releases" / "0.155.1")
+        self.entry = base / "codex"
+        self.entry.symlink_to(self.current / "bin" / "codex")
+        self.calls: list[tuple[list[str], float]] = []
+        self.switch_during_queue: str | None = None
+        self.queue_result: RunResult | Exception = RunResult(0, f"Queued message {ITEM} for thread {THREAD}.\n", "")
+        self.version_results: dict[str, RunResult | Exception] = {}
+
+    def switch(self, version: str) -> None:
+        # 与安装器同一种原子切换：先建新链接再 rename 覆盖
+        staged = self.current.with_name("current.new")
+        staged.symlink_to(self.releases[version].parent.parent)
+        os.replace(staged, self.current)
+
+    def runner(self, argv: Sequence[str], timeout: float) -> RunResult:
+        self.calls.append((list(argv), timeout))
+        if argv[1] == "queue":
+            if self.switch_during_queue is not None:
+                self.switch(self.switch_during_queue)
+            if isinstance(self.queue_result, Exception):
+                raise self.queue_result
+            return self.queue_result
+        if argv[1] == "--version":
+            version = Path(argv[0]).parent.parent.name
+            result = self.version_results.get(version, RunResult(0, f"codex-cli {version}\n", ""))
+            if isinstance(result, Exception):
+                raise result
+            return result
+        raise AssertionError(argv)
+
+    def transport(self) -> CodexQueueTransport:
+        return CodexQueueTransport(executable=str(self.entry), runner=self.runner)
+
+    def deliver(self, transport: CodexQueueTransport | None = None, text: str = "hello"):
+        context = DeliveryContext(message_uuid="u", sender_name="user")
+        return (transport or self.transport()).deliver(endpoint(ref(native=THREAD)), text, context)
+
+    def version_calls(self) -> list[list[str]]:
+        return [argv for argv, _ in self.calls if argv[1] == "--version"]
+
+    def test_output_evidence_for_every_branch(self) -> None:
+        other = "019a0000-0000-7000-8000-000000000000"
+        cases: dict[str, tuple[RunResult, Delivery, str | None]] = {
+            "成功": (RunResult(0, f"Queued message {ITEM} for thread {THREAD}.", ""), Delivery.QUEUED, "recognized"),
+            # 格式认得、语义不符：原因码不拆，只在 queueOutput 上区分
+            "thread 不符": (RunResult(0, f"Queued message {ITEM} for thread {other}.", ""), Delivery.UNKNOWN, "recognized"),
+            "stdout 不认得": (RunResult(0, "something new", ""), Delivery.UNKNOWN, "unrecognized"),
+            # 固定 argv 被 clap 拒绝只可能是上游改了接口：这是本节最想抓的信号
+            "exit 2": (RunResult(2, "", "error: unexpected argument '--thread' found"), Delivery.FAILED, "unrecognized"),
+            "已知拒收": (RunResult(1, "", "Error: thread/queue/add failed: thread not found: x"), Delivery.FAILED, "recognized"),
+            "已知不确定": (RunResult(1, "", "Error: thread/queue/add transport error: broken pipe"), Delivery.UNKNOWN, "recognized"),
+            "未识别错误": (RunResult(1, "", "Error: something new"), Delivery.UNKNOWN, "unrecognized"),
+            "panic": (RunResult(101, "", "thread 'main' panicked"), Delivery.UNKNOWN, "unrecognized"),
+            # 被信号终止：进程没有正常结束，无结果可评
+            "被信号终止": (RunResult(-9, "", ""), Delivery.UNKNOWN, None),
+        }
+        for name, (result, delivery, output) in cases.items():
+            with self.subTest(case=name):
+                self.queue_result = result
+                outcome = self.deliver()
+                self.assertEqual(outcome.delivery, delivery)
+                self.assertEqual(outcome.detail.get(OUTPUT_KEY), output)
+                self.assertEqual(outcome.detail[VERSION_KEY], "0.155.1")
+                self.assertFalse(project_delivery_detail(outcome.detail)[1])
+
+    def test_timeout_records_the_version_but_not_the_output(self) -> None:
+        self.queue_result = subprocess.TimeoutExpired(["codex"], 60)
+        outcome = self.deliver()
+        self.assertEqual(outcome.reason, "codex_queue_timeout")
+        self.assertEqual(outcome.detail, {VERSION_KEY: "0.155.1"})
+
+    def test_no_external_call_leaves_no_evidence(self) -> None:
+        self.assertEqual(self.deliver(text="x" * (MAX_ARGV_MESSAGE_BYTES + 1)).detail, {})
+        self.queue_result = FileNotFoundError("codex")
+        self.assertEqual(self.deliver().detail, {})
+        with patch("agentstatus_bridge.transports.codex_queue.shutil.which", return_value=None):
+            outcome = CodexQueueTransport(runner=self.runner).deliver(
+                endpoint(ref(native=THREAD)), "x", DeliveryContext(message_uuid="u", sender_name="user")
+            )
+        self.assertEqual((outcome.reason, outcome.detail), ("codex_cli_missing", {}))
+        self.assertEqual(self.version_calls(), [])
+
+    def test_version_comes_from_the_release_resolved_before_the_call(self) -> None:
+        outcome = self.deliver()
+        self.assertEqual(outcome.detail[VERSION_KEY], "0.155.1")
+        # 查版本用的是不可变的 release 路径，而 queue 本身仍经原入口调用（不改 argv[0]）
+        self.assertEqual(self.calls[0][0][0], str(self.entry))
+        self.assertEqual(self.calls[1], ([os.path.realpath(self.releases["0.155.1"]), "--version"], VERSION_TIMEOUT_SECONDS))
+
+    def test_entry_switched_during_the_call_is_unknown(self) -> None:
+        """Codex V01：投后再解析入口会把旧程序的结果记到新版本头上。"""
+        self.switch_during_queue = "0.156.0"
+        outcome = self.deliver()
+        self.assertEqual((outcome.delivery, outcome.detail[VERSION_KEY]), (Delivery.QUEUED, UNKNOWN_VERSION))
+        self.assertEqual(self.version_calls(), [])
+
+    def test_diagnostic_failures_never_rewrite_the_outcome(self) -> None:
+        module = "agentstatus_bridge.transports.codex_queue"
+        for target in (f"{module}.os.path.realpath", f"{module}.os.stat", f"{module}.cli_version"):
+            with self.subTest(target=target):
+                transport = self.transport()
+                with patch(target, side_effect=RuntimeError("SYNTHETIC")) as failing:
+                    outcome = self.deliver(transport)
+                self.assertTrue(failing.called)
+                self.assertEqual((outcome.delivery, outcome.provider_ref), (Delivery.QUEUED, ITEM.lower()))
+                self.assertEqual(outcome.detail, {VERSION_KEY: UNKNOWN_VERSION, OUTPUT_KEY: "recognized"})
+
+    def test_version_is_cached_per_release_and_failures_are_not(self) -> None:
+        transport = self.transport()
+        self.deliver(transport)
+        self.deliver(transport)
+        self.assertEqual(len(self.version_calls()), 1)
+        # 升级之后 realpath 变了：重新查
+        self.switch("0.156.0")
+        self.assertEqual(self.deliver(transport).detail[VERSION_KEY], "0.156.0")
+        self.assertEqual(len(self.version_calls()), 2)
+        # 查询失败得到的 unknown 不缓存：下一次投递重试并能记出版本
+        self.switch("0.155.1")
+        for failure in (RunResult(1, "", "boom"), subprocess.TimeoutExpired(["codex"], 3)):
+            with self.subTest(failure=type(failure).__name__):
+                fresh = self.transport()
+                self.version_results["0.155.1"] = failure
+                self.assertEqual(self.deliver(fresh).detail[VERSION_KEY], UNKNOWN_VERSION)
+                del self.version_results["0.155.1"]
+                self.assertEqual(self.deliver(fresh).detail[VERSION_KEY], "0.155.1")
+
+    def test_same_release_rewritten_in_place_is_asked_again(self) -> None:
+        # 同一路径被原地覆盖（mtime 变、realpath 不变）也要重查：缓存键里的 mtime 就是为这个（Codex 实现复核 C01）
+        transport = self.transport()
+        self.deliver(transport)
+        binary = self.releases["0.155.1"]
+        before = binary.stat()
+        os.utime(binary, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+        self.deliver(transport)
+        self.assertEqual(len(self.version_calls()), 2)
+
+    def test_realpath_failing_only_after_the_call_keeps_the_outcome(self) -> None:
+        real = os.path.realpath
+        calls = 0
+
+        def fail_second(path: str) -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("SYNTHETIC")
+            return real(path)
+
+        with patch("agentstatus_bridge.transports.codex_queue.os.path.realpath", side_effect=fail_second):
+            outcome = self.deliver()
+        self.assertEqual(calls, 2)
+        self.assertEqual((outcome.delivery, outcome.provider_ref), (Delivery.QUEUED, ITEM.lower()))
+        self.assertEqual(outcome.detail[VERSION_KEY], UNKNOWN_VERSION)
+
+    def test_version_output_must_have_the_exact_shape(self) -> None:
+        accepted = {
+            "codex-cli 0.156.0": "0.156.0",
+            "  codex-cli 0.156.0\n": "0.156.0",
+            "codex-cli 0.156.0-alpha.1": "0.156.0-alpha.1",
+            "codex-cli 0.156.0+build.123": "0.156.0+build.123",
+        }
+        for stdout, version in accepted.items():
+            with self.subTest(stdout=stdout):
+                self.assertEqual(parse_version(stdout), version)
+        # 旧实现取最后一个空白分隔 token：这些会分别得到 warning、7.8.9 与一个 100 字符的「版本」
+        rejected = ["codex-cli 0.156.0\nsynthetic warning", "unrelated 7.8.9", "codex-cli " + "x" * 100,
+                    "codex-cli 1.2.3-" + "a" * 60, "", "codex-cli", "codex-cli 0.156", "codex-cli 0.156.0 extra"]
+        for stdout in rejected:
+            with self.subTest(stdout=stdout[:24]):
+                self.assertIsNone(parse_version(stdout))
+
+        def only_stderr(_argv: Sequence[str], _timeout: float) -> RunResult:
+            return RunResult(0, "", "codex-cli 0.156.0")
+
+        self.assertIsNone(cli_version(executable="/x/codex", runner=only_stderr))
+
+    def test_evidence_summary_counts_only_well_formed_samples_of_the_current_version(self) -> None:
+        details = [
+            {VERSION_KEY: "0.156.0", OUTPUT_KEY: "recognized"},
+            {VERSION_KEY: "0.156.0", OUTPUT_KEY: "unrecognized"},
+            {VERSION_KEY: "0.155.1", OUTPUT_KEY: "recognized"},  # 旧版本的样本不算进当前版本
+            {VERSION_KEY: UNKNOWN_VERSION, OUTPUT_KEY: "recognized"},
+            {VERSION_KEY: "0.156.0"},  # 超时之类：有版本没有输出评定
+            {VERSION_KEY: "0.156.0", OUTPUT_KEY: "weird"},
+            {VERSION_KEY: 156, OUTPUT_KEY: "recognized"},
+            {},
+        ]
+        self.assertEqual(
+            summarize_queue_evidence(details, "0.156.0"),
+            {"version": "0.156.0", "window": 200, "state": "ok", "recognized": 1, "unrecognized": 1, "unknownVersion": 1,
+             "otherVersion": 1},
+        )
+        self.assertEqual(summarize_queue_evidence([], "0.156.0")["state"], "no_samples")
+        self.assertEqual(summarize_queue_evidence(None, "0.156.0")["state"], "ledger_unreadable")
+        self.assertEqual(summarize_queue_evidence(details, None)["state"], "version_unavailable")
 
 
 def _task_and_attempt(role: Role = Role.HANDOFF) -> tuple[Task, Attempt]:
@@ -352,6 +596,9 @@ class ClaudeSocketTests(unittest.TestCase):
         outcome = self._deliver()
         thread.join(5.0)
         self.assertEqual((outcome.delivery, outcome.reason), (Delivery.DELIVERED, "claude_delivered"))
+        # 真实 transport 产出的明细满足诊断视图规则（DESIGN §45.43 2.3）；priority 值受运维覆盖影响，只核键集
+        self.assertEqual(set(outcome.detail), {"priority", "senderClass", "receipt"})
+        self.assertFalse(project_delivery_detail(outcome.detail)[1])
         frame = json.loads(bytes(self.received).decode("utf-8"))
         self.assertEqual(frame["msg_id"], "0f0f0f0f-0000-4000-8000-000000000001")
 
@@ -361,6 +608,8 @@ class ClaudeSocketTests(unittest.TestCase):
             outcome = self._deliver()
         thread.join(5.0)
         self.assertEqual((outcome.delivery, outcome.provider_ref), (Delivery.WRITTEN, "0f0f0f0f-0000-4000-8000-000000000001"))
+        self.assertEqual(set(outcome.detail), {"priority", "senderClass"})
+        self.assertFalse(project_delivery_detail(outcome.detail)[1])
 
     def test_peer_mismatch_writes_nothing(self) -> None:
         thread = self._serve(None)

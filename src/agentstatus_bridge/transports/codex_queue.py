@@ -1,15 +1,20 @@
-"""Codex 原生 thread 队列：调用 `codex queue`，并按固定版本的已知文案给出可读失败原因。
+"""Codex 原生 thread 队列：调用 `codex queue`，按已知文案给出可读失败原因，并为每次外调留下版本与输出证据。
 
-依据 codex-cli 0.154.0（rust-v0.154.0 源码）：成功时 stdout 为
-`Queued message <queue item id> for thread <thread id>.`；运行期错误一律 exit 1，
-stderr 为 `Error: ...` 错误链。只有在插入队列之前就失败的已知文案才判为 FAILED
-（可证明未入队）；存储/传输错误、超时、无法解析的输出都判为 UNKNOWN，不自动重发。
+分类规则的依据是源码审查（最近一次：0.156.0 / `fe74a774`，DESIGN §45.44 第三节）：成功时 stdout 为
+`Queued message <queue item id> for thread <thread id>.`；运行期错误一律 exit 1，stderr 为 `Error: ...`
+错误链。只有在插入队列之前就失败的已知文案才判为 FAILED（可证明未入队）；存储/传输错误、超时、
+无法解析的输出都判为 UNKNOWN，不自动重发。分类是「已知子串优先」：一条新错误若恰好包含已知拒收子串
+仍会命中 FAILED，所以这里不宣称对未来的错误 fail-safe。
+
+`ab doctor` 只统计已见样本（`codexVersion` / `queueOutput` 两个键），不替代源码审查。这两个键是本模块
+与 doctor 的仓内约定（DESIGN §45.44 四）：写方是 `CodexQueueTransport.deliver`，读方是
+`summarize_queue_evidence`，改名或删除须两处同改。
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import re
@@ -21,14 +26,28 @@ from ..model import Consumption, Delivery, Endpoint, Provider
 from ..paths import codex_home
 from . import DeliveryContext, DeliveryOutcome
 
-VERIFIED_VERSION_PREFIX = "0.154."
 QUEUE_TIMEOUT_SECONDS = 60.0
+# 投递后查版本的超时：它在 finish_send 之前，缓存未命中时本条落账与 worker 发下一条最多因此晚这么久
+VERSION_TIMEOUT_SECONDS = 3.0
 # Linux 单个 argv 字符串上限为 128 KiB；留余量，超过则可证明未外调
 MAX_ARGV_MESSAGE_BYTES = 120 * 1024
 
 _QUEUED = re.compile(
     r"Queued message (?P<item>[0-9a-fA-F-]{36}) for thread (?P<thread>[0-9a-fA-F-]{36})\."
 )
+
+# 投递证据（DESIGN §45.44 二.2）：本模块写、summarize_queue_evidence 读
+VERSION_KEY = "codexVersion"
+OUTPUT_KEY = "queueOutput"
+UNKNOWN_VERSION = "unknown"
+OUTPUT_RECOGNIZED = "recognized"
+OUTPUT_UNRECOGNIZED = "unrecognized"
+EVIDENCE_WINDOW = 200
+
+# `codex --version` 的整行形状：Clap package version，允许预发布与构建后缀；不截断、不从别的输出里抠
+_VERSION_LINE = re.compile(r"codex-cli (?P<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)")
+_MAX_VERSION_LENGTH = 64
+_UNRECOGNIZED_ERROR = "codex_queue_unrecognized_error"
 
 # (stderr 子串, 原因码)：均发生在写入队列之前
 _KNOWN_REJECTIONS: tuple[tuple[str, str], ...] = (
@@ -117,7 +136,7 @@ def classify_failure(stderr: str) -> tuple[Delivery, str]:
     for needle, reason in _UNCERTAIN_ERRORS:
         if needle in stderr:
             return Delivery.UNKNOWN, reason
-    return Delivery.UNKNOWN, "codex_queue_unrecognized_error"
+    return Delivery.UNKNOWN, _UNRECOGNIZED_ERROR
 
 
 class CodexQueueTransport:
@@ -128,6 +147,8 @@ class CodexQueueTransport:
     def __init__(self, *, executable: str | None = None, runner: Runner | None = None) -> None:
         self._executable = executable
         self._runner = runner or _default_runner
+        # 只缓存成功值；键是（release 真实路径, mtime）。worker 单进程单线程，挂在实例上即可
+        self._version_cache: tuple[tuple[str, int], str] | None = None
 
     def _resolve_executable(self) -> str | None:
         return self._executable or shutil.which("codex")
@@ -141,23 +162,90 @@ class CodexQueueTransport:
             return DeliveryOutcome(Delivery.FAILED, "codex_cli_missing")
         thread = endpoint.ref.native_id
         argv = [executable, "queue", "--thread", thread, "--message", text]
+        # 外调前先记下入口此刻指向哪个 release：自动升级会在投递期间原子切换 `current` 链接
+        before = _realpath(executable)
         try:
             result = self._runner(argv, QUEUE_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
-            return DeliveryOutcome(Delivery.UNKNOWN, "codex_queue_timeout")
+            # 没拿到完整的命令结果：记版本，不评输出（可能有部分 stdout，不据此判断）
+            return DeliveryOutcome(
+                Delivery.UNKNOWN, "codex_queue_timeout", detail=self._evidence(executable, before, None)
+            )
         except OSError:
-            # 启动进程失败发生在任何写入之前
+            # 启动进程失败发生在任何写入之前；根本没有外调，不留证据
             return DeliveryOutcome(Delivery.FAILED, "codex_cli_missing")
-        if result.returncode == 2:
-            # clap 参数错误在任何请求之前退出
-            return DeliveryOutcome(Delivery.FAILED, "codex_cli_usage_error", detail={"exitCode": 2})
-        if result.returncode != 0:
-            delivery, reason = classify_failure(result.stderr)
-            return DeliveryOutcome(delivery, reason, detail={"exitCode": result.returncode})
-        match = _QUEUED.search(result.stdout)
-        if match is None or match.group("thread").lower() != thread.lower():
-            return DeliveryOutcome(Delivery.UNKNOWN, "codex_queue_unparsed_output")
-        return DeliveryOutcome(Delivery.QUEUED, "codex_queued", provider_ref=match.group("item").lower())
+        outcome, output = _interpret(result, thread)
+        return replace(outcome, detail={**outcome.detail, **self._evidence(executable, before, output)})
+
+    def _evidence(self, executable: str, before: str | None, output: str | None) -> dict[str, object]:
+        evidence: dict[str, object] = {VERSION_KEY: self._executed_version(executable, before)}
+        if output is not None:
+            evidence[OUTPUT_KEY] = output
+        return evidence
+
+    def _executed_version(self, executable: str, before: str | None) -> str:
+        """执行这次投递的 codex 版本；取不到、或不能确定前后是同一个程序时为 unknown。
+
+        诊断步骤的**任何**异常都在这里就地吞掉：dispatch 会把 transport 冒泡出来的异常改成 UNKNOWN，
+        一旦冒泡就会把已经拿到的 QUEUED 覆盖掉（DESIGN §45.44 二.5）。
+        """
+        try:
+            after = os.path.realpath(executable)
+            if before is None or after != before:
+                # 投递期间入口被切换：不把这次的结果归到任何一个版本
+                return UNKNOWN_VERSION
+            # 用外调前解析出的 release 路径查版本；mtime 是归档时间，只防同一路径被原地覆盖
+            key = (before, os.stat(before).st_mtime_ns)
+            if self._version_cache is not None and self._version_cache[0] == key:
+                return self._version_cache[1]
+            version = cli_version(executable=before, runner=self._runner, timeout=VERSION_TIMEOUT_SECONDS)
+            if version is None:
+                # 失败不缓存：否则首次超时一次，整个 worker 生命周期都会因「程序没变」而永远记 unknown
+                return UNKNOWN_VERSION
+            self._version_cache = (key, version)
+            return version
+        except Exception:
+            return UNKNOWN_VERSION
+
+
+def _realpath(path: str) -> str | None:
+    try:
+        return os.path.realpath(path)
+    except Exception:  # 诊断步骤不能影响投递本身
+        return None
+
+
+def _interpret(result: RunResult, thread: str) -> tuple[DeliveryOutcome, str | None]:
+    """把一次完整结束的 `codex queue` 映射为投递结局，外加这次输出是否落在已知接口之内。
+
+    `queueOutput` 不等于投递成功：已知拒收（FAILED）、存储/传输错误与 thread 不符（UNKNOWN）都算 recognized。
+    """
+    code = result.returncode
+    if code < 0:
+        # 被信号终止：进程没有正常结束，没有结果可评，不写 queueOutput
+        delivery, reason = classify_failure(result.stderr)
+        return DeliveryOutcome(delivery, reason, detail={"exitCode": code}), None
+    if code == 2:
+        # clap 参数错误在任何请求之前退出。我们的 argv 是固定的，被拒只可能是上游改了接口，
+        # 所以记 unrecognized——否则上游改掉 `--thread` 后每次投递都失败，doctor 却报「未识别 0 次」
+        return (
+            DeliveryOutcome(Delivery.FAILED, "codex_cli_usage_error", detail={"exitCode": 2}),
+            OUTPUT_UNRECOGNIZED,
+        )
+    if code != 0:
+        delivery, reason = classify_failure(result.stderr)
+        output = OUTPUT_UNRECOGNIZED if reason == _UNRECOGNIZED_ERROR else OUTPUT_RECOGNIZED
+        return DeliveryOutcome(delivery, reason, detail={"exitCode": code}), output
+    match = _QUEUED.search(result.stdout)
+    if match is None:
+        return DeliveryOutcome(Delivery.UNKNOWN, "codex_queue_unparsed_output"), OUTPUT_UNRECOGNIZED
+    if match.group("thread").lower() != thread.lower():
+        # 格式认得、语义不符：原因码仍与「格式不认得」共用，只在 queueOutput 上区分
+        return DeliveryOutcome(Delivery.UNKNOWN, "codex_queue_unparsed_output"), OUTPUT_RECOGNIZED
+    return (
+        DeliveryOutcome(Delivery.QUEUED, "codex_queued", provider_ref=match.group("item").lower()),
+        OUTPUT_RECOGNIZED,
+    )
 
 
 def queue_database_path() -> Path:
@@ -187,16 +275,64 @@ def queue_item_state(item_id: str, *, database: Path | None = None) -> Consumpti
     return Consumption.STILL_QUEUED if int(row[0]) > 0 else Consumption.LEFT_QUEUE
 
 
-def cli_version(*, executable: str | None = None, runner: Runner | None = None) -> str | None:
-    """读取 `codex --version`（纯元数据命令）。"""
+def cli_version(
+    *, executable: str | None = None, runner: Runner | None = None, timeout: float = 10.0
+) -> str | None:
+    """读取 `codex --version`（纯元数据命令），只接受整行恰为 `codex-cli <版本>` 的输出。"""
     binary = executable or shutil.which("codex")
     if binary is None:
         return None
     try:
-        result = (runner or _default_runner)([binary, "--version"], 10.0)
+        result = (runner or _default_runner)([binary, "--version"], timeout)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
         return None
-    parts = result.stdout.strip().split()
-    return parts[-1] if parts else None
+    return parse_version(result.stdout)
+
+
+def parse_version(stdout: str) -> str | None:
+    """严格验形：多行、额外输出、其他前缀、超长一律 None，绝不截断冒充一个版本（DESIGN §45.44 二.4）。"""
+    match = _VERSION_LINE.fullmatch(stdout.strip())
+    if match is None:
+        return None
+    version = match.group("version")
+    return version if len(version) <= _MAX_VERSION_LENGTH else None
+
+
+def summarize_queue_evidence(
+    details: Sequence[Mapping[str, object]] | None, version: str | None
+) -> dict[str, object]:
+    """doctor 用：把最近最多 EVIDENCE_WINDOW 条 Codex 尝试的 delivery_detail 汇成计数（DESIGN §45.44 二.6）。
+
+    `details` 为 None 表示账本读取失败——**不伪装成零样本**。只有 `queueOutput` 取合法枚举、
+    `codexVersion` 是字符串的记录才算样本；缺失、未知枚举都不解释成成功或失败。
+    """
+    evidence: dict[str, object] = {"version": version, "window": EVIDENCE_WINDOW}
+    if version is None:
+        return {**evidence, "state": "version_unavailable"}
+    if details is None:
+        return {**evidence, "state": "ledger_unreadable"}
+    recognized = unrecognized = unknown_version = other_version = 0
+    for detail in details:
+        output = detail.get(OUTPUT_KEY)
+        seen = detail.get(VERSION_KEY)
+        if output not in (OUTPUT_RECOGNIZED, OUTPUT_UNRECOGNIZED) or not isinstance(seen, str):
+            continue
+        if seen == UNKNOWN_VERSION:
+            unknown_version += 1
+        elif seen != version:
+            # 记在别的版本下：自动升级后的常态，窗口里多半全是升级前的样本（Fable 实现复核 P3-1）
+            other_version += 1
+        elif output == OUTPUT_RECOGNIZED:
+            recognized += 1
+        else:
+            unrecognized += 1
+    return {
+        **evidence,
+        "state": "ok" if recognized or unrecognized else "no_samples",
+        "recognized": recognized,
+        "unrecognized": unrecognized,
+        "unknownVersion": unknown_version,
+        "otherVersion": other_version,
+    }

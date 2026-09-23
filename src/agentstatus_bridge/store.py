@@ -31,6 +31,7 @@ from .model import (
     Delivery,
     EndpointRef,
     Flow,
+    Provider,
     Role,
     Task,
     Verdict,
@@ -978,6 +979,25 @@ class Store:
                 "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (_ARCHIVED_RISK_KEY, str(min(count + 1, 9999))),
             )
+
+    def recent_codex_details(self, *, limit: int) -> list[dict[str, Any]]:
+        """最近最多 limit 条 **Codex 目标**尝试的 delivery_detail，供 doctor 统计投递证据（DESIGN §45.44 二.6）。
+
+        只投影 target 与 delivery_detail，不读 body/result。按 created_at 倒序、id 为稳定次键；
+        `json_extract` 遇到坏 JSON 会让整条查询报错，所以先用 CASE 判 json_valid，Python 侧再按 EndpointRef 复核一次。
+        """
+        rows = self._conn.execute(
+            "SELECT target, delivery_detail FROM attempts"
+            " WHERE CASE WHEN json_valid(target) THEN json_extract(target, '$.provider') END = ?"
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            (Provider.CODEX.value, int(limit)),
+        ).fetchall()
+        details: list[dict[str, Any]] = []
+        for row in rows:
+            ref = EndpointRef.from_json(row["target"])
+            if ref is not None and ref.provider is Provider.CODEX:
+                details.append(_load_dict(row["delivery_detail"]))
+        return details
 
     def archived_risk_count(self) -> int:
         row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (_ARCHIVED_RISK_KEY,)).fetchone()

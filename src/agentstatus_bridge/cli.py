@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 import sys
@@ -70,7 +71,7 @@ from .naming import command_name
 from .paths import device_name, state_dir
 from .reports import ReportError, ReportInput, apply_report, file_reference
 from .store import DB_NAME, MAX_BODY_BYTES, Store, StoreError
-from .transports.codex_queue import VERIFIED_VERSION_PREFIX, cli_version
+from .transports.codex_queue import EVIDENCE_WINDOW, cli_version, summarize_queue_evidence
 from .closure import ACCEPTED, CLOSED, ClosureOutcome, queue_closures
 from .dispatch import needs_worker, select_generation
 from .worker import ensure_worker, read_log_tail, run_worker, wait_for_worker, worker_running
@@ -225,7 +226,34 @@ def _ref_document(ref: EndpointRef | None) -> dict[str, object] | None:
     }
 
 
+# 投递明细的诊断视图（DESIGN §45.43 2.3/2.4）。键集随 provider 变化、不承诺稳定，不能拿来做调度、
+# 终态或身份判定——判断请用 delivery/deliveryReason 这些合同字段。不合规的键值整体省略并打标记，
+# 不截断、不放占位串：截断后的值与真实值、占位串与真实字符串都无从分辨（Codex 复核 R02）。
+# 这道规则只约束形状与体积，不保证无正文；写入方不放正文、路径、凭据仍是硬要求。
+_DETAIL_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}")
+_DETAIL_STRING_LIMIT = 64
+
+
+def project_delivery_detail(detail: Mapping[str, object]) -> tuple[dict[str, object], bool]:
+    """按诊断视图规则投影账本里的 `delivery_detail`，返回（可展示的键值, 是否省略过）。"""
+    shown: dict[str, object] = {}
+    redacted = False
+    for key, value in detail.items():
+        if isinstance(key, str) and _DETAIL_KEY.fullmatch(key) and _is_short_scalar(value):
+            shown[key] = value
+        else:
+            redacted = True
+    return shown, redacted
+
+
+def _is_short_scalar(value: object) -> bool:
+    if value is None or isinstance(value, bool | int):
+        return True
+    return isinstance(value, str) and len(value) <= _DETAIL_STRING_LIMIT
+
+
 def _attempt_document(attempt: Attempt, *, include_body: bool) -> dict[str, object]:
+    detail, redacted = project_delivery_detail(attempt.delivery_detail)
     document: dict[str, object] = {
         "seq": attempt.seq,
         "role": attempt.role.value,
@@ -237,6 +265,9 @@ def _attempt_document(attempt: Attempt, *, include_body: bool) -> dict[str, obje
         "delivery": attempt.delivery.value,
         "deliveryReason": attempt.delivery_reason,
         "deliveryAt": attempt.delivery_at,
+        "deliveryDetail": detail,
+        # 为 true 时展示的不是账本原值的全集，不得与账本做字节级比对
+        "deliveryDetailRedacted": redacted,
         "providerRef": attempt.provider_ref,
         "consumption": attempt.consumption.value,
         "work": attempt.work.value,
@@ -1117,8 +1148,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         checks["workerRunning"] = False
         checks["workerLockError"] = f"{type(error).__name__}（errno {error.errno}）"
     checks.update({
+        # 只显示、不判定：Codex 会自动升级，写死的版本前缀每升一次就自己过期一次（DESIGN §45.44）
         "codexVersion": version,
-        "codexVersionVerified": bool(version and version.startswith(VERIFIED_VERSION_PREFIX)),
+        # 占位保住显示顺序，读完账本后填入
+        "codexQueueEvidence": summarize_queue_evidence(None, version),
         "claudeRegistryReadable": os.access(claude_sessions_dir(), os.R_OK),
         "claudeInboxDirectory": inbox_directory().is_dir(),
         "agentstatusRuntimeAvailable": bool(agentstatus_runtime()),
@@ -1129,6 +1162,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             checks["ledgerOk"] = True
             checks["archivedWithNativeRisk"] = store.archived_risk_count()
             checks["summaryState"] = summary.STATE_LABELS.get(summary.status(root, store)["state"], "未知")
+            try:
+                details = store.recent_codex_details(limit=EVIDENCE_WINDOW)
+            except sqlite3.Error:
+                details = None  # 读失败就说读失败，不伪装成零样本
+            checks["codexQueueEvidence"] = summarize_queue_evidence(details, version)
     except StoreError as error:
         checks["ledgerOk"] = False
         checks["ledgerError"] = error.code
@@ -1145,7 +1183,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "workerRunning": "后台 worker 运行中",
         "workerLockError": "worker 锁文件异常",
         "codexVersion": "Codex CLI 版本",
-        "codexVersionVerified": "Codex 版本已核对排队协议",
         "claudeRegistryReadable": "Claude 会话注册表可读",
         "claudeInboxDirectory": "Claude 回执目录存在",
         "agentstatusRuntimeAvailable": "AgentStatus 忙闲状态可读",
@@ -1156,6 +1193,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "workerLog": "worker 最近日志",
     }
     for key, value in checks.items():
+        if key == "codexQueueEvidence" and isinstance(value, dict):
+            print(queue_evidence_text(value))
+            continue
         if isinstance(value, list):
             print(f"{labels.get(key, key)}：" + ("（无）" if not value else ""))
             for line in value:
@@ -1164,6 +1204,36 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         shown = "是" if value is True else "否" if value is False else value
         print(f"{labels.get(key, key)}：{shown}")
     return EXIT_OK
+
+
+def queue_evidence_text(evidence: Mapping[str, object]) -> str:
+    """doctor 的「Codex 输出证据」一行（DESIGN §45.44 二.6）。计数只说明输出落没落在已知分支，不说投递成败。"""
+    state = evidence.get("state")
+    if state == "version_unavailable":
+        return "Codex 输出证据：当前 codex 版本不可用，无法关联样本"
+    if state == "ledger_unreadable":
+        return "Codex 输出证据：账本读取失败，无法统计"
+    version = evidence.get("version")
+    head = f"Codex 输出证据（最近最多 {evidence.get('window')} 条 Codex 尝试）："
+    if state == "ok":
+        unrecognized = evidence.get("unrecognized")
+        text = (
+            f"{head}{version} 命中已知分支 {evidence.get('recognized')} 次，未识别 {unrecognized} 次；"
+            "此统计不代表投递成功、执行完成或所有错误分支都已验证；CLI 版本也不证明它所连 app-server 的版本"
+        )
+        if isinstance(unrecognized, int) and unrecognized > 0:
+            # 未识别的尝试之后仍可能由接收方汇报确证而变成已送达，所以不说「是否送达不明」
+            text += f"；上游输出或接口可能变了，这些尝试的当前投递状态以 `{command_name()} status` 为准，可能已由接收方汇报确证"
+    else:
+        text = f"{head}{version} 在本次查询窗口内没有可用样本（旧记录可能未记这两个字段）"
+    other = evidence.get("otherVersion")
+    if isinstance(other, int) and other > 0:
+        # 升级后第一次看 doctor 的常态：样本都在，只是记在升级前的版本下
+        text += f"；另有 {other} 次记于其他版本（多半是升级前的投递）"
+    unknown = evidence.get("unknownVersion")
+    if isinstance(unknown, int) and unknown > 0:
+        text += f"；另有 {unknown} 次未能确定执行投递的版本"
+    return text
 
 
 def _refresh_summary(*, force: bool = False, revive: bool = False) -> summary.PublishResult | None:

@@ -443,6 +443,8 @@ class DiscoveryTests(unittest.TestCase):
             # 0.154 的 agents 是交互 TUI（上游 run_interactive_tui），不能当非交互排除
             "agents_is_tui": (["codex", "agents"], True),
             "execpolicy": (["codex", "execpolicy", "check"], False),
+            # 0.156.0 的隐藏子命令（clap hide=true，`--help` 不列）：直接执行 TCP tunnel helper，不是 TUI
+            "tcp_tunnel_hidden": (["codex", "tcp-tunnel"], False),
             "cloud_tasks_alias": (["codex", "cloud-tasks"], False),
             # 长选项串不能把子命令挤出有界窗口，否则 exec 会被当成可投递目标
             "many_config_then_exec": (["codex", *sum(([f"-c", f"k{i}=v"] for i in range(20)), []), "exec"], False),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 import fcntl
 import threading
@@ -19,7 +20,7 @@ from agentstatus_bridge import cli, naming, paths
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
 from agentstatus_bridge.endpoints import Caller
 from agentstatus_bridge.hints import PaneState
-from agentstatus_bridge.model import Consumption, Delivery, Endpoint, Provider, Role, Runtime, Verdict, Work
+from agentstatus_bridge.model import Consumption, Delivery, Endpoint, EndpointRef, Flow, Provider, Role, Runtime, Verdict, Work
 from agentstatus_bridge.procfs import ProcessInfo
 from agentstatus_bridge.store import Store, StoreError
 from bridge_support import endpoint, ref
@@ -228,6 +229,174 @@ class CliTests(unittest.TestCase):
         self.assertEqual((stale.delivery, stale.delivery_reason), (Delivery.CANCELLED, "notice_outdated"))
         # 新一轮照常排队；已送达的回执不会被追回（这里只有未发出的那条被作废）
         self.assertEqual((latest.role, latest.delivery), (Role.HANDOFF, Delivery.PENDING))
+
+    def test_delivery_detail_projection_omits_whole_values_and_flags_it(self) -> None:
+        """不合规的键值整体省略并打标记，不截断、不放占位串（DESIGN §45.43 2.3，Codex 复核 R02）。
+
+        截断后的 64 个 `a` 与真实的 64 个 `a` 无从分辨；占位串 `"<omitted>"` 本身也是合法字符串。
+        所以合规值原样展示（包括恰好 64 字符、包括字面量 `"<omitted>"`），不合规的只能靠标记告诉读方。
+        """
+        ok = {"priority": "later", "senderPid": 12, "receipt": None, "flag": True,
+              "exact": "a" * 64, "literal": "<omitted>"}
+        self.assertEqual(cli.project_delivery_detail(ok), (ok, False))
+        for bad in ({"long": "a" * 65}, {"nested": {"text": "x"}}, {"items": [1]}, {"ratio": 0.5},
+                    {"bad key": "x"}, {"9lead": "x"}, {"k" * 33: "x"}):
+            with self.subTest(bad=bad):
+                shown, redacted = cli.project_delivery_detail({"priority": "next", **bad})
+                self.assertEqual(shown, {"priority": "next"})
+                self.assertTrue(redacted)
+        # 坏项在前、合法项在后：省略标记不能被后面的合法项复位（Codex 实现复核 C01）
+        self.assertEqual(cli.project_delivery_detail({"bad key": "x", "priority": "later"}), ({"priority": "later"}, True))
+        self.assertEqual(cli.project_delivery_detail({"priority\n": "later", "good": None}), ({"good": None}, True))
+
+    def test_json_views_carry_the_delivery_detail_diagnostic(self) -> None:
+        """五个带 --json 的命令共用 `_task_document`，都要带上投递明细与省略标记（DESIGN §45.43 2.1）。"""
+        self.caller = as_agent(LEAD)
+        code, out, err = self.run_cli("send", "--to", "codex@impl", "-m", "实现 X", "--no-wait", "--json")
+        self.assertEqual(code, cli.EXIT_OK, err)
+        views = {"send": json.loads(out)}
+        task_id = views["send"]["id"]
+        self.mark_sent(task_id)
+        views["status"] = json.loads(self.run_cli("status", task_id, "--json")[1])
+        views["tasks"] = json.loads(self.run_cli("tasks", "--json")[1])["tasks"][0]
+        views["wait"] = json.loads(self.run_cli("wait", task_id, "--until", "sent", "--timeout", "0", "--json")[1])
+        self.caller = as_agent(IMPL)
+        views["report"] = json.loads(self.run_cli("report", task_id, "--ack", "--json")[1])
+        for name, document in views.items():
+            with self.subTest(command=name):
+                self.assertTrue(document["attempts"])
+                for attempt in document["attempts"]:
+                    self.assertIsInstance(attempt["deliveryDetail"], dict)
+                    self.assertIs(attempt["deliveryDetailRedacted"], False)
+        # 还没发出时明细是空对象；发出后 begin_send 记下的发送方进程出现在里面
+        self.assertEqual(views["send"]["attempts"][0]["deliveryDetail"], {})
+        self.assertEqual(views["status"]["attempts"][0]["deliveryDetail"], {"senderPid": 1, "senderStart": "1"})
+
+    def record_attempts(self, rows: Sequence[tuple[float, EndpointRef, Mapping[str, object]]]) -> None:
+        """经 store 落若干条已发出的尝试，created_at 与 delivery_detail 可控（每个任务最多 60 条，受单任务上限约束）。"""
+        with self.store() as store:
+            task_id: str | None = None
+            count = 0
+            for created, target, detail in rows:
+                if task_id is None or count >= 60:
+                    task, attempt = store.create_task(
+                        title="证据", flow=Flow.HANDOFF, origin=None, origin_class=None, reviewer=None,
+                        target=target, body="x", refs=[], now=created,
+                    )
+                    task_id, count = task.id, 1
+                else:
+                    attempt = store.add_attempt(
+                        task_id, role=Role.HANDOFF, target=target, body="x", refs=[], now=created,
+                        sender=None, sender_class=None,
+                    )
+                    count += 1
+                store.begin_send(attempt.id, now=created, pid=1, start_ticks="1")
+                store.finish_send(
+                    attempt.id, delivery=Delivery.QUEUED, reason="codex_queued", provider_ref=None, detail=dict(detail), now=created
+                )
+
+    def doctor(self, version: str | None = "0.156.0") -> tuple[dict[str, object], str]:
+        with patch.object(cli, "cli_version", return_value=version):
+            code, out, err = self.run_cli("doctor", "--json")
+            self.assertEqual(code, cli.EXIT_OK, err)
+            text_code, text, text_err = self.run_cli("doctor")
+            self.assertEqual(text_code, cli.EXIT_OK, text_err)
+        document = json.loads(out)
+        self.assertNotIn("codexVersionVerified", document)
+        evidence = document["codexQueueEvidence"]
+        assert isinstance(evidence, dict)
+        line = next(item for item in text.splitlines() if item.startswith("Codex 输出证据"))
+        return evidence, line
+
+    SAMPLE = {"codexVersion": "0.156.0", "queueOutput": "recognized"}
+
+    def test_doctor_codex_evidence_texts(self) -> None:
+        """四种文字各一例（DESIGN §45.44 二.6）；写死版本前缀的 codexVersionVerified 已删。"""
+        evidence, line = self.doctor(None)
+        self.assertEqual((evidence["state"], line), ("version_unavailable", "Codex 输出证据：当前 codex 版本不可用，无法关联样本"))
+        evidence, line = self.doctor()
+        self.assertEqual(evidence["state"], "no_samples")
+        self.assertIn("0.156.0 在本次查询窗口内没有可用样本（旧记录可能未记这两个字段）", line)
+        self.record_attempts([(1.0, IMPL.ref, dict(self.SAMPLE)), (2.0, IMPL.ref, {"codexVersion": "unknown", "queueOutput": "recognized"})])
+        evidence, line = self.doctor()
+        self.assertEqual((evidence["recognized"], evidence["unrecognized"], evidence["unknownVersion"]), (1, 0, 1))
+        self.assertIn("（最近最多 200 条 Codex 尝试）：0.156.0 命中已知分支 1 次，未识别 0 次", line)
+        self.assertIn("此统计不代表投递成功、执行完成或所有错误分支都已验证", line)
+        self.assertIn("另有 1 次未能确定执行投递的版本", line)
+        with patch.object(Store, "recent_codex_details", side_effect=sqlite3.OperationalError("synthetic")):
+            evidence, line = self.doctor()
+        # 读失败不能显示成零样本
+        self.assertEqual((evidence["state"], line), ("ledger_unreadable", "Codex 输出证据：账本读取失败，无法统计"))
+
+    def test_doctor_window_follows_creation_time_not_insertion_order(self) -> None:
+        # 先插入、但创建时间最新的那条仍在窗口里：排序按 created_at，不按 rowid
+        self.record_attempts([(10_000.0, IMPL.ref, dict(self.SAMPLE))] + [(float(i), IMPL.ref, {}) for i in range(1, 201)])
+        evidence, _ = self.doctor()
+        self.assertEqual((evidence["state"], evidence["recognized"]), ("ok", 1))
+
+    def test_doctor_sample_older_than_the_window_is_reported_as_no_samples(self) -> None:
+        # 第 201 条（最旧）有样本、最近 200 条没有：说「窗口内无可用样本」，不说「没有投递」
+        self.record_attempts([(1000.0 + i, IMPL.ref, {}) for i in range(200)] + [(1.0, IMPL.ref, dict(self.SAMPLE))])
+        evidence, line = self.doctor()
+        self.assertEqual(evidence["state"], "no_samples")
+        self.assertIn("在本次查询窗口内没有可用样本", line)
+
+    def test_doctor_window_only_counts_codex_targets(self) -> None:
+        # 200 条更新的 Claude 尝试即使带着同名键也不占窗口、不计数
+        self.record_attempts([(1.0, IMPL.ref, dict(self.SAMPLE))] + [(float(i), REVIEW.ref, dict(self.SAMPLE)) for i in range(2, 202)])
+        evidence, _ = self.doctor()
+        self.assertEqual((evidence["recognized"], evidence["unrecognized"]), (1, 0))
+
+    def test_doctor_after_an_upgrade_says_the_samples_belong_to_another_version(self) -> None:
+        """自动升级后的常态：窗口里全是旧版本样本，不能说成「旧记录可能未记字段」了事（Fable 实现复核 P3-1）。"""
+        self.record_attempts([(1.0, IMPL.ref, dict(self.SAMPLE)), (2.0, IMPL.ref, dict(self.SAMPLE))])
+        evidence, line = self.doctor("0.157.0")
+        self.assertEqual((evidence["state"], evidence["otherVersion"]), ("no_samples", 2))
+        self.assertIn("另有 2 次记于其他版本（多半是升级前的投递）", line)
+        # 只有「版本未能确定」的样本时，无样本那句后面也要带上这一条
+        self.record_attempts([(3.0, IMPL.ref, {"codexVersion": "unknown", "queueOutput": "recognized"})])
+        _, line = self.doctor("0.157.0")
+        self.assertIn("另有 1 次未能确定执行投递的版本", line)
+
+    def test_doctor_window_breaks_creation_ties_by_id_descending(self) -> None:
+        self.record_attempts([(123.0, IMPL.ref, dict(self.SAMPLE)), (123.0, IMPL.ref, {})])
+        with self.store() as store:
+            newest = store._conn.execute(  # pyright: ignore[reportPrivateUsage]
+                "SELECT delivery_detail FROM attempts ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertEqual(store.recent_codex_details(limit=1), [json.loads(newest["delivery_detail"])])
+
+    def test_doctor_window_never_reads_message_bodies_or_results(self) -> None:
+        # 只投影必要列：用 SQLite authorizer 直接禁读正文与结果列，SELECT * 会在这里报错（Codex 实现复核 C01）
+        self.record_attempts([(123.0, IMPL.ref, dict(self.SAMPLE))])
+
+        def authorize(action: int, table: str | None, column: str | None, *_: object) -> int:
+            if action == sqlite3.SQLITE_READ and table == "attempts" and column in ("body", "result"):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        with self.store() as store:
+            store._conn.set_authorizer(authorize)  # pyright: ignore[reportPrivateUsage]
+            [detail] = store.recent_codex_details(limit=200)
+        self.assertEqual({key: detail[key] for key in self.SAMPLE}, self.SAMPLE)
+
+    def test_doctor_does_not_call_an_unrecognized_but_acknowledged_attempt_undelivered(self) -> None:
+        """Codex 用临时账本走过：finish_send(UNKNOWN, unrecognized) 后再 ACK，结局是 DELIVERED、detail 仍在。"""
+        task_id = self.send()
+        with self.store() as store:
+            attempt = store.attempts(task_id)[-1]
+            store.begin_send(attempt.id, now=1.0, pid=1, start_ticks="1")
+            store.finish_send(attempt.id, delivery=Delivery.UNKNOWN, reason="codex_queue_unparsed_output", provider_ref=None,
+                              detail={"codexVersion": "0.156.0", "queueOutput": "unrecognized"}, now=2.0)
+        self.caller = as_agent(IMPL)
+        code, _out, err = self.run_cli("report", task_id, "--ack", "--json")
+        self.assertEqual(code, cli.EXIT_OK, err)
+        status = json.loads(self.run_cli("status", task_id, "--json")[1])["attempts"][0]
+        self.assertEqual((status["delivery"], status["deliveryDetail"]["queueOutput"]), ("delivered", "unrecognized"))
+        evidence, line = self.doctor()
+        self.assertEqual(evidence["unrecognized"], 1)
+        self.assertIn(f"以 `{CMD} status` 为准，可能已由接收方汇报确证", line)
+        self.assertNotIn("是否送达不明", line)
 
     def test_retry_is_atomic_when_the_new_attempt_cannot_be_written(self) -> None:
         """作废旧通知与追加返工必须同进同退（Codex 复审 F01）。

@@ -19,6 +19,7 @@ from agentstatus_bridge.dispatch import (
     native_priority,
 )
 from agentstatus_bridge import dispatch, store as store_module
+from agentstatus_bridge.cli import project_delivery_detail
 from agentstatus_bridge.envelope import parse_header
 from agentstatus_bridge.model import (
     CLOSURE_KIND,
@@ -198,6 +199,37 @@ class DispatchTests(unittest.TestCase):
         failed = self._attempt(attempt.id)
         self.assertEqual((failed.delivery, failed.delivery_reason), (Delivery.FAILED, "target_ambiguous_thread"))
         self.assertEqual(self.codex.calls, [])
+
+    def test_stored_delivery_detail_always_projects_cleanly(self) -> None:
+        """dispatch 与 store 写进账本的 delivery_detail 都满足诊断视图规则（DESIGN §45.43 2.3）。
+
+        明细透出后 CLI 就是这些字段的出口。这条读回账本逐行检查，守住今天的写入方没塞进不合形的值；
+        并用带合成标记的异常消息证明异常只记类型名、消息正文不落账。
+        """
+        marker = "SYNTHETIC_PRIVATE_MARKER"
+        target = ref()
+        self.endpoints = [endpoint(target)]
+        scenarios: list[tuple[DeliveryOutcome | None, Exception | None]] = [
+            (DeliveryOutcome(Delivery.QUEUED, "codex_queued", provider_ref="item-1"), None),
+            (DeliveryOutcome(Delivery.FAILED, "codex_thread_not_found", detail={"exitCode": 1}), None),
+            (DeliveryOutcome(Delivery.WRITTEN, "claude_written", provider_ref="m1",
+                             detail={"priority": "later", "senderClass": "bypass"}), None),
+            (DeliveryOutcome(Delivery.DELIVERED, "claude_delivered", provider_ref="m2",
+                             detail={"priority": "next", "senderClass": "bypass", "receipt": "inline"}), None),
+            (None, RuntimeError(f"{marker} /tmp/{marker}/file")),
+        ]
+        for outcome, error in scenarios:
+            self.dispatcher.transports[Provider.CODEX] = RecordingTransport(Provider.CODEX, outcome, error)  # type: ignore[index]
+            self._task(target)
+            self._run()
+        rows = [item for task in self.store.list_tasks(include_finished=True) for item in self.store.attempts(task.id)]
+        self.assertEqual(len(rows), len(scenarios))
+        for attempt in rows:
+            with self.subTest(reason=attempt.delivery_reason):
+                self.assertFalse(project_delivery_detail(attempt.delivery_detail)[1], attempt.delivery_detail)
+                self.assertNotIn(marker, json.dumps(attempt.delivery_detail))
+        [crashed] = [item for item in rows if item.delivery_reason == "transport_exception"]
+        self.assertEqual(crashed.delivery_detail.get("exception"), "RuntimeError")
 
     def test_transport_exception_is_unknown_and_never_resent(self) -> None:
         target = ref()
