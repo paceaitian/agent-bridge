@@ -5,7 +5,7 @@
     "src/agentstatus_bridge/cli.py": "87ead5afa15cbd6e61a1c22ea14e61871eff396fdf0669700a4f8101615e1078",
     "src/agentstatus_bridge/closure.py": "dc7b8727255abb3d029a8fcfd530fd7f43bcd8880654061d274ea0f8b4b1ebc3",
     "src/agentstatus_bridge/dispatch.py": "02a34d7a8c4fc2e6d13601663ce312795edeb3acdb3fb185fe0ad4a5cb1aa8b3",
-    "src/agentstatus_bridge/endpoints.py": "2be82e27bd87bbd4be8a07ceba4a9625c4cfb444557c9da15343f1d0f18257a9",
+    "src/agentstatus_bridge/endpoints.py": "0f6acfd193db5045ab024f276ecdb48835b1117280d40ebaa7163985663530f7",
     "src/agentstatus_bridge/envelope.py": "0dfaadc86d9c0a2c4506afee370fb0db3a2235cfab6cf81bf3e0babbe0800300",
     "src/agentstatus_bridge/hints.py": "af49486312dc65d3b1fe10b268c3747926d523f71489beae9b5815e7c4d3220e",
     "src/agentstatus_bridge/ids.py": "2bd663be53b52b458ceec4460ff16efad321462a13faa0ac85633dbffb667491",
@@ -39,7 +39,7 @@
     "tests/test_bridge_worker.py": "bff778415e0d6be74a1d25773209c795c384d00a5a542010ac3d5c4b70db689b"
   },
   "source": {
-    "commit": "ee5f1a64daf198ea82fbb213d2287c50cf9191a7",
+    "commit": "a4ffe2585cd95d6e3594e172c737d4106bd7995d",
     "repository": "agentstatus"
   }
 }

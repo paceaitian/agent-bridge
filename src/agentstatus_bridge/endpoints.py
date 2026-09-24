@@ -4,8 +4,9 @@
 收件通道；加一个 agent 就是加一条注册表项加一个发现函数（DESIGN §45.34）。
 
 - Claude：读 `~/.claude/sessions/<pid>.json` 注册表，核对 PID 启动时刻与消息 socket 属主。
-- Codex：扫描 `codex` 进程打开的 rollout 文件确定 thread；只接受 tmux pane 内的交互 TUI，
-  排除 app-server、exec 等非交互进程（它们不是用户能看到的会话）。
+- Codex：扫描 `codex` 进程打开的 rollout 文件确定 thread；终端证据优先 tmux pane，没有 pane 时回退到
+  控制终端（DESIGN §45.33，控制终端只是候选门槛、不证明是 TUI）；按启动参数排除 app-server、exec 等
+  非交互子命令，既无 pane 又无控制终端的进程也排除（它们不是用户能看到的会话）。
 - Grok：读 `~/.grok/active_sessions.json`，再用 `comm` 与进程持有的 events 文件核实；只读，
   没有收件通道，只能作为发起方。
 - 运行状态：Claude 用注册表 busy/idle；Codex 与 Grok 用 AgentStatus D-Bus（不自动启动）按 pane 读取。
