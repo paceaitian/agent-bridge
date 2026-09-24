@@ -85,6 +85,12 @@ def codex_home() -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".codex"
 
 
+def codex_sqlite_home() -> Path | None:
+    """Codex 状态库目录：上游 `CODEX_SQLITE_HOME` 设置时用它，否则由调用方退回 codex_home（DESIGN §45.48 R2）。"""
+    configured = os.environ.get("CODEX_SQLITE_HOME")
+    return Path(configured).expanduser() if configured else None
+
+
 def grok_home() -> Path:
     """Grok 数据根目录；尊重 `GROK_HOME`（grok 自己用它定位 `config.toml` 与 `trace-exports/`）。"""
     configured = os.environ.get("GROK_HOME")

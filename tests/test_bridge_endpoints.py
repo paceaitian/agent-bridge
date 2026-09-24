@@ -63,6 +63,8 @@ class DiscoveryTests(unittest.TestCase):
             proc_root=self.proc.root,
             claude_sessions=self.sessions,
             codex_home=self.codex_home,
+            # 显式不继承外部 CODEX_SQLITE_HOME：状态库只在合成的 codex_home 里找（Codex §45.48 实现复核 C01）
+            codex_sqlite_home=None,
             grok_home=self.grok_home,
             panes=lambda: self.panes,
             runtime=lambda: self._view(),

@@ -59,6 +59,10 @@ ISSUE_LABELS: dict[str, str] = {
     "peer_protocol_unsupported": "Claude 消息协议版本不支持",
     "no_inbox": "只读：没有收件通道，只能由它发起",
     "shared_process": "同一进程里还有别的会话",
+    # Codex 子代理与同进程多根（DESIGN §45.48 R2）
+    "subagent_only": "进程里只看得到 Codex 子代理 thread，不能作为目标",
+    "subagent_threads": "进程里还挂着子代理 thread",
+    "multiple_roots": "同一进程里有多个根会话（按会话 ID 选择）",
 }
 REASON_TEXTS: dict[str, str] = {
     **READABLE_REASONS,
@@ -84,6 +88,7 @@ REASON_TEXTS: dict[str, str] = {
     "target_gone": "目标会话已不在（可能已退出或换了新会话）",
     "target_no_thread_yet": "目标 Codex 还没有会话 thread（先在里面发一句话）",
     "target_ambiguous_thread": "目标 Codex 进程打开了多个 thread，无法确定投递位置",
+    "target_subagent_only": "目标只看得到 Codex 子代理 thread（子代理只经根会话收件），不能作为目标",
     "target_shared_thread": "目标 thread 同时被多个进程加载，可能由另一个进程执行；确认后加 --allow-shared",
     "target_socket_unavailable": "目标 Claude 的消息 socket 不可用",
     "target_peer_protocol_unsupported": "目标 Claude 版本的消息协议不受支持",
@@ -91,6 +96,9 @@ REASON_TEXTS: dict[str, str] = {
     "reviewer_is_target": "复核方不能是实现方",
     "reporter_mismatch": "只有收到这项任务的会话才能汇报",
     "reporter_unattributed": "无法确认汇报来自哪个会话（需要在 tmux 里的 agent 会话中运行）",
+    "reporter_is_subagent": "子代理不能代替根会话汇报，请由根会话汇报",
+    "sender_is_subagent": "子代理不能发起协作任务，请由根会话发起",
+    "caller_unattributed": "看得见 agent 进程，但认不出是哪个会话（例如 Codex 进程开着多个 thread 且定不下根），不能以会话身份发起",
     "manual_flag_required": "在终端里代为汇报需要加 --manual",
     "stale_attempt": "这是旧的一次交接，任务已有更新的尝试",
     "attempt_not_found": "找不到这次交接",

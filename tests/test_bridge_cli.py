@@ -91,6 +91,19 @@ class CliTests(unittest.TestCase):
             store.begin_send(attempt.id, now=1.0, pid=1, start_ticks="1")
             store.finish_send(attempt.id, delivery=delivery, reason="test", provider_ref=None, detail={}, now=2.0)
 
+    def test_peers_json_lists_the_threads_a_codex_process_holds(self) -> None:
+        """诊断用：多 thread 的 Codex 进程在 peers --json 里列出持有集合（DESIGN §45.48 R1，Codex 实现复核 C02）。"""
+        root, child = "019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa", "019a0000-cccc-7ccc-8ccc-cccccccccccc"
+        holder = Endpoint(ref=ref(Provider.CODEX, root, pid=5000, pane="%8", label="holder"),
+                          issues=("subagent_threads",), threads=(root, child), thread_consumers=((root, 1), (child, 1)))
+        self.endpoints = [IMPL, holder]
+        code, out, err = self.run_cli("peers", "--json")
+        self.assertEqual(code, cli.EXIT_OK, err)
+        rows = {row["nativeId"]: row for row in json.loads(out)["peers"]}
+        self.assertEqual(rows[root]["threads"], [root, child])
+        self.assertEqual(rows[root]["issues"], ["subagent_threads"])
+        self.assertEqual(rows["impl-thread"]["threads"], [])
+
     def test_peers_and_doctor_show_the_local_device(self) -> None:
         """设备名要有人看得见：peers 每行一列、doctor 一行（DESIGN §45.35）。"""
         with patch.object(cli, "device_name", return_value="test-box"):

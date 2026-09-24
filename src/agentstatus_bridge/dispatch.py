@@ -29,6 +29,7 @@ from .model import (
     Delivery,
     Endpoint,
     EndpointRef,
+    UNRESOLVED_NATIVE_ID,
     Provider,
     Role,
     Task,
@@ -123,7 +124,11 @@ def select_generation(target: EndpointRef, endpoints: list[Endpoint]) -> tuple[E
     返回 (端点, None)；没有同会话端点时 (None, None)；多个同会话端点且选定代际已不在时
     (None, "generation_ambiguous")，不猜选哪一个。
     """
-    same = [item for item in endpoints if item.ref.native_id != "-" and item.ref.same_session(target)]
+    same = (
+        _codex_generation_candidates(target, endpoints)
+        if target.provider is Provider.CODEX
+        else [item for item in endpoints if item.ref.same_session(target)]
+    )
     for item in same:
         if item.ref.pid == target.pid and item.ref.start_ticks == target.start_ticks:
             return item, None
@@ -132,6 +137,34 @@ def select_generation(target: EndpointRef, endpoints: list[Endpoint]) -> tuple[E
     if len(same) > 1:
         return None, "generation_ambiguous"
     return None, None
+
+
+def _codex_generation_candidates(target: EndpointRef, endpoints: list[Endpoint]) -> list[Endpoint]:
+    """Codex 目标在每个进程代际里的候选，每个代际最多一项（DESIGN §45.48 R4）。
+
+    同一代际内优先 `native_id` 等于目标的端点；没有时再用仍持有目标 thread 的未定根端点，并按目标 thread
+    解析（身份取目标、按该 thread 重算消费者与 `shared_thread`）。只看已定根时同进程多根的端点都带着全部
+    持有集合，所以不能对所有端点按「持有」匹配；也不在跨代际比较之前全局丢掉未定根端点，否则会否决仍
+    持有目标的原代际、掩盖多代际歧义（Codex §45.48 第二轮 R02）。账本里旧的 `"-"` 目标匹配不到任何端点。
+    """
+    thread = target.native_id.lower()
+    if thread == UNRESOLVED_NATIVE_ID:
+        return []
+    chosen: dict[tuple[int, str], Endpoint] = {}
+    for item in endpoints:
+        if item.ref.provider is not Provider.CODEX:
+            continue
+        key = (item.ref.pid, item.ref.start_ticks)
+        if item.ref.native_id.lower() == thread:
+            chosen[key] = item
+        elif (
+            key not in chosen
+            and item.ref.native_id == UNRESOLVED_NATIVE_ID
+            and "subagent_only" not in item.issues
+            and item.holds(thread)
+        ):
+            chosen[key] = item.for_thread(thread)
+    return list(chosen.values())
 
 
 def needs_worker(store: Store, now: float, *, reminders: bool = True) -> bool:

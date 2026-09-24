@@ -21,6 +21,7 @@ from . import procfs
 from .ids import short
 from .endpoints import Caller
 from .model import (
+    UNRESOLVED_NATIVE_ID,
     Attempt,
     Delivery,
     Flow,
@@ -191,6 +192,12 @@ def _select_attempt(task: Task, attempts: list[Attempt], report: ReportInput) ->
 
 def _attribute(attempt: Attempt, report: ReportInput, caller: Caller, proc_root: Path) -> str:
     """核验汇报来源，返回 agent 或 manual。"""
+    if caller.rejection == "subagent":
+        # Codex 子代理不能代替根会话汇报：与根会话自己的汇报撞 result_already_submitted（DESIGN §45.48 R3）
+        raise ReportError("reporter_is_subagent")
+    if caller.endpoint is not None and caller.endpoint.ref.native_id == UNRESOLVED_NATIVE_ID:
+        # 认不出是哪个 thread 不是身份（§45.48 R5）：按未归属报，不说成「不是收件会话」
+        raise ReportError("reporter_unattributed")
     if caller.endpoint is not None:
         ref = caller.endpoint.ref
         if not ref.same_session(attempt.target):

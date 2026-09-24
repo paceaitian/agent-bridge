@@ -50,6 +50,7 @@ from .model import (
     HANDED_OVER,
     PHASE_LABELS,
     PROVEN_UNDELIVERED,
+    UNRESOLVED_NATIVE_ID,
     Attempt,
     Consumption,
     Delivery,
@@ -176,6 +177,20 @@ def _receiver_class(endpoint: Endpoint) -> str | None:
     if info is None or info.start_ticks != endpoint.ref.start_ticks:
         return None
     return permission_class(Caller(None, info))
+
+
+def _check_sender(caller: Caller) -> None:
+    """发起方必须是认得出的会话或用户本人（DESIGN §45.48 R3/R5）。
+
+    Codex 子代理不能发起；看得见 agent 进程或环境迹象却认不出是哪个会话时拒绝，不把 agent 发起的任务
+    落成 `origin=None`（那等于伪装成用户，回执身份也丢了）；`"-"` 不是身份，同样拒绝。
+    """
+    if caller.rejection == "subagent":
+        raise CliError("sender_is_subagent")
+    if caller.endpoint is not None and caller.endpoint.ref.native_id == UNRESOLVED_NATIVE_ID:
+        raise CliError("caller_unattributed")
+    if caller.endpoint is None and not caller.is_user_shell:
+        raise CliError("caller_unattributed")
 
 
 def _check_target(endpoint: Endpoint, *, allow_shared: bool) -> None:
@@ -474,7 +489,10 @@ def cmd_peers(args: argparse.Namespace) -> int:
                 "runtime": item.runtime.value,
                 "permissionClass": _receiver_class(item),
                 "issues": list(item.issues),
-                "self": caller.endpoint is item,
+                # 该进程持有的全部 Codex thread（诊断用，只在运行期，不进账本；DESIGN §45.48 R1）
+                "threads": list(item.threads),
+                # 按身份比较而不是对象相等：R3 可能生成解析后的副本（DESIGN §45.48）
+                "self": caller.endpoint is not None and caller.endpoint.ref == item.ref,
             }
         )
     if args.json:
@@ -605,6 +623,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     refs = [file_reference(path, cwd=cwd) for path in args.ref]
     endpoints = discover()
     caller = identify_caller(endpoints)
+    _check_sender(caller)
     target = _resolve(args.to, endpoints)
     _check_target(target, allow_shared=args.allow_shared)
     if caller.endpoint is not None and caller.endpoint.ref.same_session(target.ref):

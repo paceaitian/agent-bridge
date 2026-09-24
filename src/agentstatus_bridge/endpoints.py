@@ -21,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import stat
 import subprocess
 import tomllib
@@ -29,17 +30,23 @@ from typing import Any
 from . import procfs
 from .hints import PaneState
 from .ids import opaque_id
-from .model import Endpoint, EndpointRef, Provider, Runtime
-from .paths import claude_sessions_dir, codex_home, grok_home
+from .model import UNRESOLVED_NATIVE_ID, Endpoint, EndpointRef, Provider, Runtime
+from .paths import claude_sessions_dir, codex_home, codex_sqlite_home, grok_home
 
 MAX_REGISTRY_FILES = 256
 # 允许 observer 证据比注册表状态时刻早多少：实测正常后台窗口里早约 0.09 秒，漏 hook 时差一整轮（§45.37）
 EVIDENCE_SKEW_SECONDS = 5.0
 MAX_REGISTRY_BYTES = 64 * 1024
 _REGISTRY_NAME = re.compile(r"[0-9]+\.json")
-_ROLLOUT = re.compile(
-    r"/rollout-[^/]*-(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
-)
+# rollout 文件名：`rollout-<时刻>-<thread>.jsonl`；thread 回退（TUI 回溯编辑）后为 `rollout-<时刻>-<thread>_<rollout>.jsonl`，
+# 取 thread 段（DESIGN §45.48 R6）
+_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_ROLLOUT = re.compile(rf"/rollout-[^/]*-(?P<uuid>{_UUID})(?:_{_UUID})?\.jsonl$")
+# Codex 状态库：`state_<版本>.sqlite`；版本号编进文件名，两个 Codex 版本可能共用一个目录（DESIGN §45.48 R2）
+_CODEX_STATE_DB = re.compile(r"state_(?P<version>[0-9]{1,4})\.sqlite")
+# 单元变体的 SessionSource 在状态库里存成裸字符串（如 `cli`），对象变体存 JSON 文本
+_BARE_SOURCE = re.compile(r"[a-z0-9_-]{1,32}")
+CODEX_STATE_TIMEOUT_SECONDS = 0.2
 # Grok 的会话事件文件：`~/.grok/sessions/<urlencode 过的 cwd>/<会话 UUID>/events.jsonl`；
 # 目录名是编码过的工作目录，不解码，只认结尾的 UUID 段（DESIGN §45.34）
 _GROK_EVENTS = re.compile(
@@ -367,6 +374,8 @@ class DiscoverySources:
     proc_root: Path = procfs.DEFAULT_PROC
     claude_sessions: Path = field(default_factory=claude_sessions_dir)
     codex_home: Path = field(default_factory=codex_home)
+    # Codex 状态库所在目录；上游 `CODEX_SQLITE_HOME` 覆盖 codex_home（DESIGN §45.48 R2）
+    codex_sqlite_home: Path | None = field(default_factory=codex_sqlite_home)
     grok_home: Path = field(default_factory=grok_home)
     panes: Callable[[], Mapping[int, PaneInfo]] = tmux_panes
     runtime: Callable[[], ObserverView] = agentstatus_view
@@ -500,6 +509,77 @@ def _discover_claude(
     return endpoints
 
 
+def _codex_source_kind(value: object) -> str | None:
+    """把状态库 `threads.source` 分成 root / subagent；认不出返回 None（DESIGN §45.48 R2）。
+
+    沿用上游 `is_non_root_agent`：对象键 `subagent`、`internal` 是非根，`custom` 是对象形式的根；
+    单元变体（`cli`/`exec`/`vscode`/`mcp`/`unknown`）存成裸字符串，都是根。其他形态一律未知——包括上游不会
+    写出的 JSON 字符串形态（`"cli"`、`"subagent"`），不按裸串判根，免得把非根判成根（Fable 实现复核 P3-1）。
+    只在内存里判定，原文不进日志、peers、账本或错误输出。
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if value[0] == "{":
+        try:
+            data = json.loads(value)
+        except ValueError:
+            return None
+        if not isinstance(data, dict) or len(data) != 1:
+            return None
+        key = next(iter(data))
+        if key in {"subagent", "internal"}:
+            return "subagent"
+        return "root" if key == "custom" else None
+    return "root" if _BARE_SOURCE.fullmatch(value) else None
+
+
+def _classify_codex_threads(sources: DiscoverySources, threads: set[str]) -> dict[str, str]:
+    """只读 Codex 状态库给 thread 分类：返回认得出的 thread → root/subagent；认不出的不在结果里。
+
+    只选 `id, source` 两列、只按持有的 thread 查询、`mode=ro` 打开、短超时；按版本号降序逐个探测
+    `state_<n>.sqlite`，取第一个查询成功且能查到任一持有 thread 的库。任何错误都当作「没有分类证据」，
+    调用方据此退回今天的歧义处理，不猜（DESIGN §45.48 R2）。
+    """
+    if not threads:
+        return {}
+    root = sources.codex_sqlite_home or sources.codex_home
+    try:
+        names = [entry.name for entry in os.scandir(root) if entry.is_file(follow_symlinks=False)]
+    except OSError:
+        return {}
+    candidates = sorted(
+        (int(match.group("version")), name) for name in names if (match := _CODEX_STATE_DB.fullmatch(name))
+    )
+    wanted = sorted(threads)
+    for _, name in reversed(candidates):
+        try:
+            connection = sqlite3.connect(
+                f"{(root / name).as_uri()}?mode=ro", uri=True, timeout=CODEX_STATE_TIMEOUT_SECONDS
+            )
+        except (sqlite3.Error, ValueError):
+            continue
+        try:
+            # 缺表、缺列或库忙都会让这条查询抛 sqlite3.Error，跳到下一个库即可，不另外探列（变异反证 Q09：
+            # 探列与查询出错走的是同一个结果，是冗余的防御）
+            placeholders = ", ".join("?" for _ in wanted)
+            rows = connection.execute(
+                f"SELECT id, source FROM threads WHERE id IN ({placeholders})", wanted
+            ).fetchall()
+        except sqlite3.Error:
+            continue
+        finally:
+            connection.close()
+        if not rows:
+            continue
+        kinds: dict[str, str] = {}
+        for thread_id, source in rows:
+            kind = _codex_source_kind(source)
+            if isinstance(thread_id, str) and kind is not None:
+                kinds[thread_id.lower()] = kind
+        return kinds
+    return {}
+
+
 def _discover_codex(
     sources: DiscoverySources, panes: Mapping[int, PaneInfo], runtime: ObserverView
 ) -> list[Endpoint]:
@@ -515,9 +595,11 @@ def _discover_codex(
                 continue
             match = _ROLLOUT.search(target)
             if match is not None:
+                # 同一 thread 的普通与回退后两种文件同时打开时自然去重
                 threads.add(match.group("uuid"))
         processes[pid] = (info, threads)
-    # 同一 thread 被几个进程打开（含非终端进程）：多于一个时消费者不唯一
+    # 同一 thread 被几个进程打开（含非终端进程）：多于一个时消费者不唯一。在过滤非交互进程之前统计，
+    # 并随端点按 thread 保留，解析出身份后按该 thread 重算（DESIGN §45.48 R1、Codex F03）
     consumers = Counter(thread for _, threads in processes.values() for thread in threads)
     # 终端分组只用于本次发现（丢掉同一终端里的启动包装进程），不进会话身份；键带类型，pane 与 tty 不互相混组
     by_terminal: dict[tuple[object, ...], list[tuple[procfs.ProcessInfo, set[str], PaneInfo | None]]] = {}
@@ -532,41 +614,67 @@ def _discover_codex(
         else:
             continue  # 既无 pane 又无控制终端：app-server、SDK、Desktop 等
         by_terminal.setdefault(group, []).append((info, threads, pane))
-    endpoints: list[Endpoint] = []
-    for candidates in by_terminal.values():
+    for group_key, candidates in list(by_terminal.items()):
         # 同一 pane 里的启动包装进程没有 rollout，只保留真正持有 thread 的进程
         if any(threads for _, threads, _ in candidates):
-            candidates = [candidate for candidate in candidates if candidate[1]]
+            by_terminal[group_key] = [candidate for candidate in candidates if candidate[1]]
+    # 所有交互进程的持有集合合并成一次查询（包括只有一个 thread 的，Codex §45.48 第二轮 R01）
+    kinds = _classify_codex_threads(
+        sources, {thread for candidates in by_terminal.values() for _, threads, _ in candidates for thread in threads}
+    )
+    endpoints: list[Endpoint] = []
+    for candidates in by_terminal.values():
         for info, threads, pane in candidates:
-            issues: list[str] = []
-            native_id = "-"
-            if not threads:
-                issues.append("no_thread_yet")
-            elif len(threads) > 1:
-                issues.append("ambiguous_thread")
-            else:
-                native_id = next(iter(threads))
-                if consumers[native_id] > 1:
-                    issues.append("shared_thread")
             state = runtime.get(pane.pane_id) if pane is not None else None
-            endpoints.append(
-                Endpoint(
-                    ref=EndpointRef(
-                        provider=Provider.CODEX,
-                        native_id=native_id,
-                        pid=info.pid,
-                        start_ticks=info.start_ticks,
-                        pane=pane.pane_id if pane is not None else None,
-                        label=pane.session_name if pane is not None else None,
-                        server_pid=pane.server_pid if pane is not None else None,
-                    ),
-                    runtime=state if state is not None else Runtime.UNKNOWN,
-                    runtime_source="agentstatus" if state is not None else "none",
-                    consumers=consumers[native_id] if native_id != "-" else 0,
-                    issues=tuple(issues),
-                )
+            base = Endpoint(
+                ref=EndpointRef(
+                    provider=Provider.CODEX,
+                    native_id=UNRESOLVED_NATIVE_ID,
+                    pid=info.pid,
+                    start_ticks=info.start_ticks,
+                    pane=pane.pane_id if pane is not None else None,
+                    label=pane.session_name if pane is not None else None,
+                    server_pid=pane.server_pid if pane is not None else None,
+                ),
+                runtime=state if state is not None else Runtime.UNKNOWN,
+                runtime_source="agentstatus" if state is not None else "none",
+                consumers=0,
+                threads=tuple(sorted(threads)),
+                thread_consumers=tuple((thread, consumers[thread]) for thread in sorted(threads)),
             )
+            endpoints.extend(_codex_endpoints_for(base, threads, kinds))
     return endpoints
+
+
+def _codex_endpoints_for(base: Endpoint, threads: set[str], kinds: Mapping[str, str]) -> list[Endpoint]:
+    """按持有集合与状态库分类生成一个 Codex 进程的端点（DESIGN §45.48 R2）。
+
+    已知子代理从不成为可寻址端点；单 thread 的根或未知保持今天的行为（未知时功能优先，走旧兼容路径）；
+    多 thread 只有「恰好一个根、其余都是已知子代理」才定根，多个根每根一个端点，有未知就如实报歧义。
+    """
+    if not threads:
+        return [replace(base, issues=("no_thread_yet",))]
+    roots = sorted(thread for thread in threads if kinds.get(thread) == "root")
+    subagents = [thread for thread in threads if kinds.get(thread) == "subagent"]
+    unknown = len(threads) - len(roots) - len(subagents)
+    if len(threads) == 1:
+        [thread] = threads
+        if thread in subagents:
+            return [replace(base, issues=("subagent_only",))]
+        return [base.for_thread(thread)]
+    if unknown:
+        return [replace(base, issues=("ambiguous_thread",))]
+    if not roots:
+        return [replace(base, issues=("subagent_only",))]
+    extra = ("subagent_threads",) if subagents else ()
+    if len(roots) == 1:
+        resolved = base.for_thread(roots[0])
+        return [replace(resolved, issues=resolved.issues + extra)]
+    found: list[Endpoint] = []
+    for root in roots:
+        resolved = base.for_thread(root)
+        found.append(replace(resolved, issues=resolved.issues + ("multiple_roots",) + extra))
+    return found
 
 
 def _discover_grok(
@@ -656,15 +764,41 @@ def _claude_caller_env(env: Mapping[str, str], endpoints: list[Endpoint]) -> lis
     return narrowed or matches
 
 
+def _codex_env_identity(env: Mapping[str, str]) -> tuple[str, str] | None:
+    """由 Codex 注入的两个变量判定调用者：("subagent", 自身 thread) 或 ("root", 根 thread)；缺变量返回 None。
+
+    上游保证 `CODEX_SESSION_ID` 是根 thread、`CODEX_THREAD_ID` 是执行这条命令的 thread 自己，所以两者不等
+    就是子代理——无状态判定，不依赖这一轮发现看到几个 fd（DESIGN §45.48 R3）。大小写不敏感比较。
+    """
+    thread = env.get("CODEX_THREAD_ID")
+    session = env.get("CODEX_SESSION_ID")
+    if not thread or not session:
+        return None
+    if thread.lower() != session.lower():
+        return ("subagent", thread.lower())
+    return ("root", thread.lower())
+
+
 def _codex_caller_env(env: Mapping[str, str], endpoints: list[Endpoint]) -> list[Endpoint]:
-    """按 `CODEX_THREAD_ID` 匹配（Codex 注入的是大写形式的 UUID）。"""
+    """按 `CODEX_THREAD_ID` 匹配（大小写不敏感比较）；精确端点优先，否则按它解析仍持有它的未定根端点。
+
+    子代理（两个变量不等）不在这里匹配：它由 identify_caller 明确拒绝，不能借根会话的端点（§45.48 R3）。
+    """
     thread = env.get("CODEX_THREAD_ID")
     if not thread:
         return []
+    identity = _codex_env_identity(env)
+    if identity is not None and identity[0] == "subagent":
+        return []
+    lowered = thread.lower()
+    codex = [item for item in endpoints if item.ref.provider is Provider.CODEX]
+    exact = [item for item in codex if item.ref.native_id.lower() == lowered]
+    if exact:
+        return exact
     return [
-        item
-        for item in endpoints
-        if item.ref.provider is Provider.CODEX and item.ref.native_id.lower() == thread.lower()
+        item.for_thread(lowered)
+        for item in codex
+        if item.ref.native_id == UNRESOLVED_NATIVE_ID and item.holds(lowered)
     ]
 
 
@@ -713,7 +847,8 @@ ADAPTERS: dict[Provider, ProviderAdapter] = {
         comm="codex",
         discover=_discover_codex,
         caller_env=_codex_caller_env,
-        env_markers=("CODEX_THREAD_ID",),
+        # CODEX_SESSION_ID 也算 agent 迹象：PID 命名空间看不到祖先、只剩根变量时不误当用户（§45.48 R3）
+        env_markers=("CODEX_THREAD_ID", "CODEX_SESSION_ID"),
     ),
     Provider.GROK: ProviderAdapter(
         provider=Provider.GROK,
@@ -817,6 +952,8 @@ class Caller:
     agent_process: procfs.ProcessInfo | None
     via: str | None = None  # ancestry / environment
     agent_env: bool = False
+    # 明确认出但不允许以会话身份行事的调用者：目前只有 "subagent"（Codex 子代理，DESIGN §45.48 R3）
+    rejection: str | None = None
 
     @property
     def is_user_shell(self) -> bool:
@@ -850,8 +987,12 @@ def identify_caller(
     by_pid: dict[int, list[Endpoint]] = {}
     for item in endpoints:
         by_pid.setdefault(item.ref.pid, []).append(item)
+    codex_identity = _codex_env_identity(env)
     for info in chain:
         candidates = [item for item in by_pid.get(info.pid, ()) if item.ref.start_ticks == info.start_ticks]
+        if info.comm == "codex" and codex_identity is not None:
+            # 在唯一候选快路径之前统一判定 Codex 调用者，不以本轮看到几个 fd 为前提（DESIGN §45.48 R3）
+            return _codex_caller(codex_identity, info, candidates, agent_env)
         if len(candidates) == 1:
             return Caller(candidates[0], info, "ancestry", agent_env)
         if candidates:
@@ -859,12 +1000,37 @@ def identify_caller(
             return Caller(picked, info, "environment" if picked is not None else None, agent_env)
         if info.comm in _AGENT_COMMS:
             return Caller(None, info, None, agent_env)
+    if codex_identity is not None and codex_identity[0] == "subagent":
+        # 看不见祖先、只能靠环境变量时同样拦下子代理
+        return Caller(None, None, None, agent_env, rejection="subagent")
     found = _caller_from_env(env, endpoints)
     if found is not None:
         info = procfs.read_process(found.ref.pid, proc_root)
         visible = info if info is not None and info.start_ticks == found.ref.start_ticks else None
         return Caller(found, visible, "environment", agent_env)
     return Caller(None, None, None, agent_env)
+
+
+def _codex_caller(
+    identity: tuple[str, str], info: procfs.ProcessInfo, candidates: list[Endpoint], agent_env: bool
+) -> Caller:
+    """最近的 agent 祖先是 Codex 且带着两个身份变量时的调用者（DESIGN §45.48 R3）。
+
+    子代理明确拒绝；根 thread T 优先选 `native_id == T` 的端点，否则按 T 解析本进程的候选——T 暂时不在
+    持有集合里（writer 写入恢复时 fd 会短暂消失）也照样归属。护栏不在归属侧：汇报时 `reports._attribute`
+    既有的投递代际核对（`reporter_generation_mismatch`）拦住另一个仍在的实际接收进程（Fable 实现复核 P3-4）。这条正面
+    证据不被状态库分类或别的根否决。本进程没有任何候选（不在终端里等）时认不出是哪个会话。
+    """
+    kind, thread = identity
+    if kind == "subagent":
+        return Caller(None, info, None, agent_env, rejection="subagent")
+    for item in candidates:
+        if item.ref.native_id == thread:
+            return Caller(item, info, "environment", agent_env)
+    if candidates:
+        holding = [item for item in candidates if item.holds(thread)]
+        return Caller((holding or candidates)[0].for_thread(thread), info, "environment", agent_env)
+    return Caller(None, info, None, agent_env)
 
 
 def _caller_from_env(

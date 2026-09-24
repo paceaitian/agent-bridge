@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import json
 import re
@@ -229,8 +229,16 @@ class EndpointRef:
         return _TOKEN_UNSAFE.sub("-", self.display())[:64]
 
     def same_session(self, other: EndpointRef) -> bool:
-        """同一原生会话/thread（进程可以不同）。"""
-        return self.provider is other.provider and self.native_id == other.native_id
+        """同一原生会话/thread（进程可以不同）。
+
+        `"-"` 表示「还认不出是哪个 thread」，不是身份：两个 `"-"` 不是同一会话，否则一个认不出身份的
+        Codex 会话能对另一个认不出身份的会话的任务做决定（DESIGN §45.48 R5）。
+        """
+        return (
+            self.provider is other.provider
+            and self.native_id == other.native_id
+            and self.native_id != UNRESOLVED_NATIVE_ID
+        )
 
     def same_generation(self, other: EndpointRef) -> bool:
         """同一原生会话且同一进程代际。"""
@@ -241,10 +249,16 @@ class EndpointRef:
         )
 
 
-# 这些问题使端点不能作为投递目标；shared_thread 可由调用方显式放行
+# 这些问题使端点不能作为投递目标；shared_thread 可由调用方显式放行。
+# subagent_only：进程可见的 thread 全是 Codex 子代理，不可作收件人（DESIGN §45.48 R2）
 BLOCKING_ISSUES = frozenset(
-    {"no_thread_yet", "ambiguous_thread", "socket_unavailable", "peer_protocol_unsupported", "no_inbox"}
+    {"no_thread_yet", "ambiguous_thread", "subagent_only", "socket_unavailable", "peer_protocol_unsupported",
+     "no_inbox"}
 )
+# 认不出是哪个 thread 时的占位 native_id（不是身份，见 EndpointRef.same_session）
+UNRESOLVED_NATIVE_ID = "-"
+# 端点身份未定的问题：按某个 thread 解析出身份后，这些问题对该身份不再成立
+_IDENTITY_ISSUES = frozenset({"no_thread_yet", "ambiguous_thread", "subagent_only", "multiple_roots"})
 
 
 @dataclass(frozen=True)
@@ -258,11 +272,34 @@ class Endpoint:
     name: str | None = None
     consumers: int = 1
     issues: tuple[str, ...] = ()
+    # 该进程持有的全部 rollout thread 与各自的消费者数（同一次完整发现里统计，含不作为端点展示的非交互进程）。
+    # 仅 Codex、仅运行期：不进 EndpointRef、不落账本（DESIGN §45.48 R1）
+    threads: tuple[str, ...] = ()
+    thread_consumers: tuple[tuple[str, int], ...] = ()
 
     @property
     def blocking_issues(self) -> tuple[str, ...]:
         """阻止投递的问题。"""
         return tuple(issue for issue in self.issues if issue in BLOCKING_ISSUES)
+
+    def holds(self, thread: str) -> bool:
+        """这个进程是否持有该 thread（大小写不敏感）。"""
+        lowered = thread.lower()
+        return any(item == lowered for item in self.threads)
+
+    def for_thread(self, thread: str) -> Endpoint:
+        """按该进程持有的某个根 thread 解析出的端点：身份取这个 thread，消费者数与 `shared_thread` 按它重算。
+
+        R2/R3/R4 共用这一个入口（DESIGN §45.48 R4、Codex F03）：只消去已解决的身份问题，不沿用 `"-"` 或
+        另一个根的能力字段；`--allow-shared` 的合同因此对解析后的身份照常生效。
+        """
+        lowered = thread.lower()
+        counts = dict(self.thread_consumers)
+        consumers = counts.get(lowered, 1)
+        issues = tuple(issue for issue in self.issues if issue not in _IDENTITY_ISSUES and issue != "shared_thread")
+        if consumers > 1:
+            issues = ("shared_thread",) + issues
+        return replace(self, ref=replace(self.ref, native_id=lowered), consumers=consumers, issues=issues)
 
 
 @dataclass(frozen=True)
