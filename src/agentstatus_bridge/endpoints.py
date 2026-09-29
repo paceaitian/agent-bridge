@@ -25,13 +25,13 @@ import re
 import sqlite3
 import stat
 import subprocess
-import tomllib
 from typing import Any
 
 from . import procfs
-from .hints import PaneState
+from .codex_argv import _codex_class, _codex_non_interactive
 from .ids import opaque_id
 from .model import UNRESOLVED_NATIVE_ID, Endpoint, EndpointRef, Provider, Runtime
+from .observer_dbus import ObserverRow, ObserverView, agentstatus_view
 from .paths import claude_sessions_dir, codex_home, codex_sqlite_home, grok_home
 
 MAX_REGISTRY_FILES = 256
@@ -53,84 +53,7 @@ CODEX_STATE_TIMEOUT_SECONDS = 0.2
 _GROK_EVENTS = re.compile(
     r"/(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/events\.jsonl$"
 )
-# 这些 Codex 子命令不是交互 TUI，不能作为任务目标（DESIGN §45.33.2、§45.44 二.7）。名单依据：0.156.0 `--help`
-# 可见的非交互子命令 + 固定源码（`fe74a774`）中 `hide=true` 的隐藏子命令 `tcp-tunnel`（`--help` 不列隐藏子命令）；
-# 另含 `--help` 未列出（已删或隐藏）的历史名。`agents`/`resume`/`fork` 是交互，故意不在内；
-# `app` 只在 macOS/Windows 编译，本桥 Linux 范围不收
-_CODEX_NON_TUI = frozenset(
-    {
-        "app-server",
-        "apply",
-        "a",
-        "archive",
-        "cloud",
-        "cloud-tasks",
-        "completion",
-        "debug",
-        "delete",
-        "doctor",
-        "exec",
-        "e",
-        "exec-server",
-        "execpolicy",
-        "features",
-        "help",
-        "login",
-        "logout",
-        "mcp",
-        "mcp-server",
-        "migrate-rollouts",
-        "plugin",
-        "proto",
-        "queue",
-        "remote-control",
-        "responses-api-proxy",
-        "review",
-        "sandbox",
-        "stdio-to-uds",
-        "tcp-tunnel",
-        "unarchive",
-        "update",
-    }
-)
-# 取值型全局选项：识别启动模式时要连它的取值一起跳过，否则 `--profile x exec` 会被误判成交互会话
-_CODEX_VALUE_OPTIONS = frozenset(
-    {
-        "-a",
-        "--add-dir",
-        "--ask-for-approval",
-        "-c",
-        "-C",
-        "--cd",
-        "--config",
-        "--disable",
-        "--enable",
-        "-i",
-        "--image",
-        "--local-provider",
-        "-m",
-        "--model",
-        "-p",
-        "--profile",
-        "--remote",
-        "--remote-auth-token-env",
-        "-s",
-        "--sandbox",
-    }
-)
-# 多值选项（上游 num_args = 1..）：空格写法后续非选项 token 仍属于它，直到出现下一个选项；
-# 所以 `-i a.png exec` 里的 exec 是图片名（仍是交互 TUI）。内联写法 `--image=a.png`/`-i=a.png` 只带一个取值，其后的 exec 仍是子命令。
-_CODEX_MULTI_VALUE_OPTIONS = frozenset({"-i", "--image"})
-# 交互子命令：扫到它就确定是 TUI，不再看后面的 token
-_CODEX_TUI_SUBCOMMANDS = frozenset({"agents", "fork", "resume"})
-# AgentStatus observer 的 D-Bus 名称；桥可脱离 AgentStatus 运行，所以自带常量，由对照用例守住不漂移（DESIGN §45.33.7）
-AGENTSTATUS_BUS_NAME = "org.paceaitian.AgentStatus1"
-AGENTSTATUS_OBJECT_PATH = "/org/paceaitian/AgentStatus1"
-AGENTSTATUS_INTERFACE_NAME = AGENTSTATUS_BUS_NAME
 _SELECTOR_NORMALIZE = re.compile(r"[\s_]+")
-# 会话键只需要满足一件事：不可能和 pane id 相撞（pane 形如 `%12`）。这里只要求含 `:` 且有界——
-# 比 observer 自己的键格式更严没有收益，反而会在上游改键形状时静默丢行、让放行永远不发生（审计 P3-4）
-_OBSERVER_KEY = re.compile(r"[^%\s][^\s]{0,126}:[^\s]{1,64}")
 # Claude 2.1.x 注册表 status：waiting 为对话框打开，shell 为正在执行 shell 命令
 _CLAUDE_STATUS = {
     "idle": Runtime.IDLE,
@@ -181,19 +104,6 @@ def tmux_panes() -> dict[int, PaneInfo]:
     return panes
 
 
-def _positive_count(value: Any) -> bool:
-    """observer 的计数字段：正整数才算数。缺字段、非整数、布尔、0 与负数都当作没有，不比写方更严（DESIGN §45.35）。"""
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-
-def _has_background_work(item: Mapping[str, Any]) -> bool:
-    """本轮之外仍在跑的工作：后台任务与可显示的子代理各自独立计数，任一为正即算。
-
-    定时任务（`scheduledWorkCount`）不算——它是「将来会跑」而不是「现在在跑」，不影响对方能否收件。
-    """
-    return _positive_count(item.get("backgroundWorkCount")) or _positive_count(item.get("activeChildren"))
-
-
 def _evidence_covers(evidence_at: float | None, status_at_ms: Any) -> bool:
     """observer 的证据要和注册表这次状态变化对得上：同一时刻附近或更新，才准用来放开忙判。
 
@@ -231,143 +141,6 @@ def _claude_background_row(
     return row if row.pane == (pane.pane_id if pane is not None else None) else None
 
 
-def _map_agentstatus_runtime(item: Mapping[str, Any]) -> Runtime:
-    # 与 observer 公开文档一致：stale/unavailable 的快照不代表当前状态
-    if item.get("freshness") in {"stale", "unavailable"}:
-        return Runtime.UNKNOWN
-    if item.get("attentionState") == "action_required":
-        return Runtime.WAITING
-    state = item.get("runtimeState")
-    if state == "ready":
-        # 本轮已结束：还有后台工作在跑时面板仍显示运行中，但对方能收件（DESIGN §45.37）
-        return Runtime.BACKGROUND if _has_background_work(item) else Runtime.IDLE
-    if state in {"thinking", "working", "starting"}:
-        return Runtime.BUSY
-    return Runtime.UNKNOWN
-
-
-def _pane_state(item: Mapping[str, Any]) -> PaneState:
-    ended = item.get("lastTurnEndedAt")
-    return PaneState(
-        runtime=_map_agentstatus_runtime(item),
-        last_turn_ended_at=float(ended) if isinstance(ended, (int, float)) and not isinstance(ended, bool) else None,
-        fresh=item.get("freshness") not in {"stale", "unavailable"},
-    )
-
-
-@dataclass(frozen=True)
-class ObserverRow:
-    """observer 对一个对象的观察：运行状态、该状态被确认的时刻、它属于哪个 pane。
-
-    `runtime_at` 取自 observer 的 `runtimeUpdatedAt`——最后一次**真正设置过这条会话 runtime**
-    的事件时刻。子代理结束、存活心跳这类不改父会话 runtime 的事件不会刷新它，所以它才有资格
-    充当「这条会话的前台轮次已经结束」的证据；`lastEventAt` 只说明「最近有任何动静」（审计 R01）。
-    """
-
-    runtime: Runtime
-    runtime_at: float | None
-    pane: str | None
-    fresh: bool = True
-
-
-@dataclass(frozen=True)
-class ObserverView:
-    """一次 ListSessions 快照，按两套互不相交的键索引。
-
-    - `%pane`：pane 级观察，供**收紧**判定使用（等待用户、Codex/Grok 的忙闲）；
-    - `provider:hex`：observer 的会话键（含运行代际键 `claude-gen:…`），是**放开**原生忙判的唯一
-      凭据——pane 会被换会话或别的 provider 复用，会话身份不会（DESIGN §45.37，审计 F02）。
-
-    两套键不可能相撞：pane 形如 `%12`，会话键必含 `:`。`get()` 与原来的 `Mapping[str, Runtime]`
-    同形，只收紧不放开的调用方照旧。
-    """
-
-    rows: Mapping[str, ObserverRow] = field(default_factory=dict)
-
-    def get(self, key: str) -> Runtime | None:
-        row = self.rows.get(key)
-        return row.runtime if row is not None else None
-
-    def row(self, key: str) -> ObserverRow | None:
-        return self.rows.get(key)
-
-    @property
-    def states(self) -> dict[str, Runtime]:
-        return {key: row.runtime for key, row in self.rows.items()}
-
-
-def agentstatus_view() -> ObserverView:
-    """经 AgentStatus D-Bus 读取一次快照；daemon 不在或出错时返回空视图，不启动它。"""
-    rows: dict[str, ObserverRow] = {}
-    for item in _observer_rows():
-        seen = item.get("runtimeUpdatedAt")
-        pane = item.get("paneId")
-        row = ObserverRow(
-            runtime=_map_agentstatus_runtime(item),
-            runtime_at=float(seen) if isinstance(seen, (int, float)) and not isinstance(seen, bool) else None,
-            pane=pane if isinstance(pane, str) else None,
-            fresh=item.get("freshness") not in {"stale", "unavailable"},
-        )
-        key = item.get("key")
-        for index in (row.pane, key if isinstance(key, str) and _OBSERVER_KEY.fullmatch(key) else None):
-            if index is None:
-                continue
-            previous = rows.get(index)
-            if previous is not None:
-                # 同一个 pane 可能有多行（换会话、残留代际）。新鲜的那行说了算，否则一条 stale 行
-                # 会按行序把当前状态盖成未知（审计 P3-2）
-                if previous.fresh and not row.fresh:
-                    continue
-                # 两行都新鲜时偏向更保守的一边：pane 索引只用于收紧，等待用户不该被行序覆盖（审计 P3-B）
-                if previous.fresh and row.fresh and previous.runtime is Runtime.WAITING:
-                    continue
-            # 整行替换，不把状态和证据时刻拼在一起
-            rows[index] = row
-    return ObserverView(rows)
-
-
-def agentstatus_runtime() -> dict[str, Runtime]:
-    """按键索引的运行状态；`doctor` 用它判断 AgentStatus 可读，不需要证据时刻。"""
-    return agentstatus_view().states
-
-
-def agentstatus_panes() -> dict[str, PaneState]:
-    """经 AgentStatus D-Bus 读取各 pane 的运行状态与最近一轮结束时刻；不可用时返回空，不启动 daemon。"""
-    return {
-        str(item["paneId"]): _pane_state(item) for item in _observer_rows() if isinstance(item.get("paneId"), str)
-    }
-
-
-def _observer_rows() -> list[Mapping[str, Any]]:
-    """读一次 ListSessions 并返回其中的对象行；不可用、超限或格式不对时返回空。"""
-    try:
-        import gi
-
-        gi.require_version("Gio", "2.0")
-        from gi.repository import Gio  # pyright: ignore[reportAttributeAccessIssue]
-
-        proxy = Gio.DBusProxy.new_for_bus_sync(
-            Gio.BusType.SESSION,
-            Gio.DBusProxyFlags.DO_NOT_AUTO_START,
-            None,
-            AGENTSTATUS_BUS_NAME,
-            AGENTSTATUS_OBJECT_PATH,
-            AGENTSTATUS_INTERFACE_NAME,
-            None,
-        )
-        flags = getattr(Gio.DBusCallFlags, "NO_AUTO_START", Gio.DBusCallFlags.NONE)
-        reply = proxy.call_sync("ListSessions", None, flags, 2000, None)
-        raw = reply.unpack()[0]
-        if not isinstance(raw, str) or len(raw) > 4 * 1024 * 1024:
-            return []
-        sessions = json.loads(raw)
-    except Exception:  # 可选数据源：任何失败都只意味着“状态未知”
-        return []
-    if not isinstance(sessions, list):
-        return []
-    return [item for item in sessions if isinstance(item, dict)]
-
-
 @dataclass
 class DiscoverySources:
     """发现所用的数据源；测试可替换为合成目录和假 tmux/D-Bus。"""
@@ -381,35 +154,6 @@ class DiscoverySources:
     panes: Callable[[], Mapping[int, PaneInfo]] = tmux_panes
     runtime: Callable[[], ObserverView] = agentstatus_view
     uid: int = field(default_factory=os.getuid)
-
-
-def _codex_non_interactive(tokens: Sequence[str]) -> bool:
-    """按有界 argv 判断 Codex 是否以明确的非交互子命令启动（DESIGN §45.33.2、§45.33.6）。
-
-    跟随上游 0.154 的解析（0.156.0 已按源码逐项核对取值型全局选项，2026-09-22）：跳过已知全局选项及其取值（多值选项的空格写法吞掉后续非选项 token，内联写法只带一个），
-    `--` 之后是字面参数；**位置参数之后仍可能出现子命令**（`codex hello exec` 实际进入 exec），所以未知 token 不终止扫描，
-    继续找第一个落在子命令表里的 token；一个都没有就是交互（裸 `codex`、`codex "初始要求"`）。
-    """
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "--":
-            return False
-        if token.startswith("-"):
-            name, inline, _ = token.partition("=")
-            if not inline and name in _CODEX_MULTI_VALUE_OPTIONS:
-                index += 1
-                while index < len(tokens) and not tokens[index].startswith("-"):
-                    index += 1
-                continue
-            index += 2 if not inline and name in _CODEX_VALUE_OPTIONS else 1
-            continue
-        if token in _CODEX_NON_TUI:
-            return True
-        if token in _CODEX_TUI_SUBCOMMANDS:
-            return False
-        index += 1
-    return False
 
 
 def _pane_for(pid: int, panes: Mapping[int, PaneInfo], proc_root: Path) -> PaneInfo | None:
@@ -1059,88 +803,6 @@ def _argv_tokens(pid: int, proc_root: Path) -> list[str]:
         return []
     # 只用于识别启动标志，不保存也不输出
     return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
-
-
-def _toml_string(raw: str) -> str:
-    text = raw.strip()
-    try:
-        parsed = tomllib.loads(f"v = {text}").get("v")
-    except tomllib.TOMLDecodeError:
-        return text.strip("'\"")
-    return parsed if isinstance(parsed, str) else text
-
-
-def _codex_cli_overrides(tokens: list[str]) -> tuple[str | None, str | None, bool, bool]:
-    """解析 Codex 启动参数：(审批策略, 沙箱模式, 是否完全绕过, 是否选了 profile)。
-
-    专用参数 `-a/-s` 优先于 `-c` 覆盖，与出现顺序无关；同一类内后出现者生效。
-    """
-    flag_approval: str | None = None
-    flag_sandbox: str | None = None
-    kv_approval: str | None = None
-    kv_sandbox: str | None = None
-    bypass = False
-    profile = False
-    index = 1
-    while index < len(tokens):
-        token = tokens[index]
-        name, separator, inline = token.partition("=")
-        if separator:
-            value: str | None = inline
-            step = 1
-        else:
-            value = tokens[index + 1] if index + 1 < len(tokens) else None
-            step = 2
-        if token in ("--dangerously-bypass-approvals-and-sandbox", "--yolo"):
-            bypass = True
-            step = 1
-        elif name in ("-a", "--ask-for-approval") and value is not None:
-            flag_approval = value
-        elif name in ("-s", "--sandbox") and value is not None:
-            flag_sandbox = value
-        elif name in ("-p", "--profile") and value is not None:
-            profile = True
-        elif name in ("-c", "--config") and value is not None:
-            key, equals, raw = value.partition("=")
-            if equals:
-                key = key.strip()
-                if key == "approval_policy":
-                    kv_approval = _toml_string(raw)
-                elif key == "sandbox_mode":
-                    kv_sandbox = _toml_string(raw)
-                elif key == "profile":
-                    profile = True
-        else:
-            step = 1
-        index += step
-    approval = flag_approval if flag_approval is not None else kv_approval
-    sandbox = flag_sandbox if flag_sandbox is not None else kv_sandbox
-    return approval, sandbox, bypass, profile
-
-
-def _codex_class(tokens: list[str], config_path: Path) -> str | None:
-    """按 Codex 的配置优先级（启动参数 > -c 覆盖 > profile > 用户配置）判断权限类别。"""
-    approval, sandbox, bypass, profile = _codex_cli_overrides(tokens)
-    if bypass:
-        return "bypass"
-    try:
-        with config_path.open("rb") as handle:
-            config = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError):
-        config = {}
-    if "profile" in config:
-        profile = True
-    if not profile:
-        # 选了 profile 时其取值无法可靠重建，只用启动参数里明确给出的值
-        if approval is None and isinstance(config.get("approval_policy"), str):
-            approval = config["approval_policy"]
-        if sandbox is None and isinstance(config.get("sandbox_mode"), str):
-            sandbox = config["sandbox_mode"]
-    if approval is None:
-        return None
-    if approval != "never":
-        return "prompting"
-    return "bypass" if sandbox == "danger-full-access" else None
 
 
 def permission_class(

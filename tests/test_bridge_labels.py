@@ -6,7 +6,7 @@ from dataclasses import replace
 from itertools import product
 import unittest
 
-from agentstatus_bridge import cli, labels
+from agentstatus_bridge import cli, labels, views
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
 from agentstatus_bridge.ids import short
 from agentstatus_bridge.labels import next_step
@@ -105,7 +105,7 @@ class NextStepTests(unittest.TestCase):
         self.assertEqual(accept.command, f"{CMD} accept {'a' * 32}")
 
     def test_cli_text_is_unchanged_by_refactor(self) -> None:
-        # 拆分前 cli._next_step 的原文逐字冻结（短 ID）
+        # 拆分前 cli._next_step（§48 R6 起在 views）的原文逐字冻结（短 ID）
         tid = short("a" * 32)
         cases = [
             (task(control="paused"), [attempt(delivery=Delivery.PENDING)], f"{CMD} resume {tid} 继续发送"),
@@ -133,7 +133,7 @@ class NextStepTests(unittest.TestCase):
         ]
         for item, attempts, expected in cases:
             with self.subTest(expected=expected):
-                self.assertEqual(cli._next_step(item, attempts), expected)
+                self.assertEqual(views._next_step(item, attempts), expected)
 
     def test_every_runtime_has_a_label(self) -> None:
         # 打印路径是直接下标（cli.peers / cli.send），漏一个成员就是 KeyError 而不是难看的文案

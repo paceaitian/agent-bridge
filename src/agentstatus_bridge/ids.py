@@ -6,18 +6,12 @@ import hashlib
 import re
 import secrets
 
-_FULL_ID = re.compile(r"[0-9a-f]{32}")
 _ID_PREFIX = re.compile(r"[0-9a-f]{4,32}")
 
 
 def new_id() -> str:
     """生成新的 32 位十六进制标识；标识只由桥生成，调用方不能指定。"""
     return secrets.token_hex(16)
-
-
-def is_full_id(value: str) -> bool:
-    """判断是否为完整标识。"""
-    return bool(_FULL_ID.fullmatch(value))
 
 
 def is_id_prefix(value: str) -> bool:

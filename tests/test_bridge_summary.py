@@ -13,86 +13,34 @@ from pathlib import Path
 import signal
 import stat
 import subprocess
-from tempfile import TemporaryDirectory
 from typing import Any
 import unittest
 from unittest.mock import patch
 
-from agentstatus_bridge import cli, summary
+from agentstatus_bridge import cli, doctor, summary
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
 from agentstatus_bridge.endpoints import PaneInfo, tmux_panes
 from agentstatus_bridge.ids import opaque_id
 from agentstatus_bridge.model import (
     CLOSURE_KIND,
     NOTICE_KIND_OPTION,
-    Attempt,
     Consumption,
     Delivery,
     EndpointRef,
     Flow,
     Provider,
     Role,
-    Task,
     Verdict,
     Work,
     describe,
 )
 from agentstatus_bridge.store import DB_NAME, Store
 from agentstatus_bridge.worker import run_worker
-from bridge_support import RecordingTransport, ref
+from bridge_support import LedgerCase, RecordingTransport, new_task, ref
 import test_bridge_cli as cli_tests
 import test_bridge_labels as label_tests
 import test_bridge_worker as worker_tests
 
-
-def new_task(store: Store, **changes: Any) -> tuple[Task, Attempt]:
-    options: dict[str, Any] = {
-        "title": "实现 X",
-        "flow": Flow.HANDOFF,
-        "origin": None,
-        "origin_class": None,
-        "reviewer": None,
-        "target": ref(),
-        "body": "正文哨兵 BODY-SENTINEL",
-        "refs": [],
-        "now": 100.0,
-    }
-    options.update(changes)
-    return store.create_task(**options)
-
-
-class LedgerCase(unittest.TestCase):
-    def setUp(self) -> None:
-        temporary = TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name) / "bridge"
-        self.store = Store.open(self.root)
-        self.addCleanup(lambda: self.store.close())
-
-    def create(self, **changes: Any) -> tuple[Task, Attempt]:
-        return new_task(self.store, **changes)
-
-    def deliver(self, attempt: Attempt, delivery: Delivery, *, now: float = 110.0, detail: dict[str, Any] | None = None) -> None:
-        self.assertTrue(self.store.begin_send(attempt.id, now=now - 1, pid=os.getpid(), start_ticks="1"))
-        self.assertTrue(
-            self.store.finish_send(
-                attempt.id, delivery=delivery, reason="synthetic", provider_ref=None, detail=detail or {}, now=now
-            )
-        )
-
-    def publish(self, **options: Any) -> summary.PublishResult:
-        return summary.publish(self.store, self.root, **options)
-
-    def document(self) -> dict[str, Any]:
-        return json.loads((self.root / summary.SUMMARY_NAME).read_text(encoding="utf-8"))
-
-    def entry(self, task_id: str) -> dict[str, Any]:
-        return next(item for item in self.document()["tasks"] if item["id"] == task_id)
-
-    def current(self, attempt: Attempt) -> Attempt:
-        loaded = self.store.get_attempt(attempt.id)
-        assert loaded is not None
-        return loaded
 
 
 class RevisionTests(LedgerCase):
@@ -426,9 +374,6 @@ class TokenTests(LedgerCase):
 
 
 class BindingTests(LedgerCase):
-    def keys(self, attempt: Attempt) -> list[dict[str, str]]:
-        return summary.binding(self.current(attempt))["observerKeys"]
-
     def test_delivered_generation_is_taken_as_one_tuple(self) -> None:
         selected = replace(ref(Provider.CODEX, "thread-a", pid=111, start="100", pane="%91"), server_pid=333)
         _, attempt = self.create(target=selected)
@@ -636,8 +581,8 @@ class SummaryCliTests(unittest.TestCase):
     def test_doctor_shows_summary_state(self) -> None:
         self.send()
         with (
-            patch.object(cli, "cli_version", return_value="0.154.0"),
-            patch("agentstatus_bridge.endpoints.agentstatus_runtime", return_value={}),
+            patch.object(doctor, "cli_version", return_value="0.154.0"),
+            patch.object(doctor, "agentstatus_runtime", return_value={}),
         ):
             code, out, err = self.run_cli("doctor", "--json")
         self.assertEqual(code, cli.EXIT_OK, err)

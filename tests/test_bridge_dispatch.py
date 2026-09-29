@@ -19,7 +19,7 @@ from agentstatus_bridge.dispatch import (
     native_priority,
 )
 from agentstatus_bridge import dispatch, store as store_module
-from agentstatus_bridge.cli import project_delivery_detail
+from agentstatus_bridge.views import project_delivery_detail
 from agentstatus_bridge.envelope import parse_header
 from agentstatus_bridge.model import (
     CLOSURE_KIND,

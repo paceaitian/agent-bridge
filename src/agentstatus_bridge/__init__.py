@@ -7,8 +7,6 @@
 
 from __future__ import annotations
 
-__all__ = ["PROTOCOL_VERSION", "__version__"]
+__all__ = ["__version__"]
 
 __version__ = "0.1.0.dev0"
-# 消息头与报告协议版本；不兼容变更须递增并保留旧版本拒绝路径
-PROTOCOL_VERSION = 1

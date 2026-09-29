@@ -537,10 +537,6 @@ def _is_count(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
 def _is_finite(value: object) -> bool:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return False

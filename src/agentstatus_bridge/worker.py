@@ -22,7 +22,7 @@ from .dispatch import Dispatcher, LogFn
 from .endpoints import ADAPTERS, discover
 from .model import Endpoint, Provider
 from .naming import COMMAND_ENV, command_name
-from .paths import ensure_private_dir, state_dir
+from .paths import STATE_DIR_ENV, ensure_private_dir, state_dir
 from .store import Store, StoreError
 from .transports import Transport
 from .transports.claude_peer import ClaudeInbox, ClaudePeerTransport
@@ -167,7 +167,7 @@ def ensure_worker(root: Path | None = None) -> bool:
     if worker_running(directory):
         return False
     env = worker_environment(os.environ)
-    env["AB_STATE_DIR"] = str(directory)
+    env[STATE_DIR_ENV] = str(directory)
     # worker 由 `python -m` 拉起，argv0 是解释器：把调用方解析出的命令名显式传下去，
     # 否则页脚会退回默认名而不是用户实际敲的那个（DESIGN §45.36）
     env[COMMAND_ENV] = command_name()

@@ -9,21 +9,16 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 import json
-import os
-import re
 import sqlite3
 from pathlib import Path
 import sys
 import time
-from typing import Any
 
 from . import __version__, procfs, summary
 from .endpoints import (
     Caller,
     ResolveError,
-    agentstatus_panes,
     discover,
     identify_caller,
     permission_class,
@@ -44,24 +39,18 @@ from .labels import (  # 标签表移至 labels 供摘要与 worker 共用；此
     role_label,
 )
 from .model import (
-    CLOSURE_KIND,
-    CLOSURE_STATE_OPTION,
-    DELIVERY_NEEDS_ATTENTION,
     HANDED_OVER,
     PHASE_LABELS,
     PROVEN_UNDELIVERED,
     UNRESOLVED_NATIVE_ID,
     Attempt,
-    Consumption,
     Delivery,
     Endpoint,
     EndpointRef,
     Flow,
     Phase,
-    Provider,
     ReportKind,
     Role,
-    Runtime,
     Task,
     Verdict,
     Work,
@@ -69,13 +58,24 @@ from .model import (
     work_attempts,
 )
 from .naming import command_name
+from .observer_dbus import agentstatus_panes
 from .paths import device_name, state_dir
 from .reports import ReportError, ReportInput, apply_report, file_reference
 from .store import DB_NAME, MAX_BODY_BYTES, Store, StoreError
-from .transports.codex_queue import EVIDENCE_WINDOW, cli_version, summarize_queue_evidence
 from .closure import ACCEPTED, CLOSED, ClosureOutcome, queue_closures
 from .dispatch import needs_worker, select_generation
-from .worker import ensure_worker, read_log_tail, run_worker, wait_for_worker, worker_running
+from .doctor import collect_checks, print_checks
+from .views import (
+    _NO_HINT,
+    _TargetHint,
+    _age,
+    _closure_document,
+    _describe_result,
+    _print_closure,
+    _print_task,
+    _task_document,
+)
+from .worker import ensure_worker, run_worker, wait_for_worker, worker_running
 
 EXIT_OK = 0
 EXIT_TARGET = 2
@@ -123,23 +123,6 @@ def _open_store() -> Store:
 
 def _print_json(document: object) -> None:
     print(json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True))
-
-
-def _age(timestamp: float | None, now: float) -> str:
-    if timestamp is None:
-        return ""
-    seconds = max(0, int(now - timestamp))
-    if seconds < 60:
-        return f"{seconds} 秒前"
-    if seconds < 3600:
-        return f"{seconds // 60} 分钟前"
-    if seconds < 86400:
-        return f"{seconds // 3600} 小时前"
-    return f"{seconds // 86400} 天前"
-
-
-def _clock(timestamp: float) -> str:
-    return time.strftime("%m-%d %H:%M:%S", time.localtime(timestamp))
 
 
 # ---- 目标与调用者 ----
@@ -230,87 +213,6 @@ def _hold_hint(target: Endpoint, sender_class: str | None) -> str | None:
 # ---- 文档与显示 ----
 
 
-def _ref_document(ref: EndpointRef | None) -> dict[str, object] | None:
-    if ref is None:
-        return None
-    return {
-        "provider": ref.provider.value,
-        "name": ref.display(),
-        "pane": ref.pane,
-        "nativeId": ref.native_id,
-    }
-
-
-# 投递明细的诊断视图（DESIGN §45.43 2.3/2.4）。键集随 provider 变化、不承诺稳定，不能拿来做调度、
-# 终态或身份判定——判断请用 delivery/deliveryReason 这些合同字段。不合规的键值整体省略并打标记，
-# 不截断、不放占位串：截断后的值与真实值、占位串与真实字符串都无从分辨（Codex 复核 R02）。
-# 这道规则只约束形状与体积，不保证无正文；写入方不放正文、路径、凭据仍是硬要求。
-_DETAIL_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}")
-_DETAIL_STRING_LIMIT = 64
-
-
-def project_delivery_detail(detail: Mapping[str, object]) -> tuple[dict[str, object], bool]:
-    """按诊断视图规则投影账本里的 `delivery_detail`，返回（可展示的键值, 是否省略过）。"""
-    shown: dict[str, object] = {}
-    redacted = False
-    for key, value in detail.items():
-        if isinstance(key, str) and _DETAIL_KEY.fullmatch(key) and _is_short_scalar(value):
-            shown[key] = value
-        else:
-            redacted = True
-    return shown, redacted
-
-
-def _is_short_scalar(value: object) -> bool:
-    if value is None or isinstance(value, bool | int):
-        return True
-    return isinstance(value, str) and len(value) <= _DETAIL_STRING_LIMIT
-
-
-def _attempt_document(attempt: Attempt, *, include_body: bool) -> dict[str, object]:
-    detail, redacted = project_delivery_detail(attempt.delivery_detail)
-    document: dict[str, object] = {
-        "seq": attempt.seq,
-        "role": attempt.role.value,
-        "target": _ref_document(attempt.target),
-        "sender": _ref_document(attempt.sender),
-        "senderClass": attempt.sender_class,
-        "messageId": attempt.message_id,
-        "createdAt": attempt.created_at,
-        "delivery": attempt.delivery.value,
-        "deliveryReason": attempt.delivery_reason,
-        "deliveryAt": attempt.delivery_at,
-        "deliveryDetail": detail,
-        # 为 true 时展示的不是账本原值的全集，不得与账本做字节级比对
-        "deliveryDetailRedacted": redacted,
-        "providerRef": attempt.provider_ref,
-        "consumption": attempt.consumption.value,
-        "work": attempt.work.value,
-        "workAt": attempt.work_at,
-        "result": attempt.result,
-        "refs": attempt.refs,
-        "bodyBytes": len(attempt.body.encode("utf-8")),
-    }
-    if attempt.is_closure:
-        # 结束回执（DESIGN §45.31）：role 仍是 notice，另标类别与终态
-        document["kind"] = CLOSURE_KIND
-        document["closure"] = attempt.options.get(CLOSURE_STATE_OPTION)
-    if include_body:
-        document["body"] = attempt.body
-    return document
-
-
-@dataclass(frozen=True)
-class _TargetHint:
-    """查询时派生的对方提示：停下未汇报的轮次结束时刻（§45.9），或当前未发现对方会话（§45.32）；两者互斥。"""
-
-    stopped_at: float | None = None
-    missing: bool = False
-
-
-_NO_HINT = _TargetHint()
-
-
 def _target_hint(
     attempts: list[Attempt], endpoints: list[Endpoint], panes: Mapping[str, PaneState], now: float
 ) -> _TargetHint:
@@ -329,142 +231,6 @@ def _target_hint(
 def _observations() -> tuple[list[Endpoint], dict[str, PaneState]]:
     """查询命令用的只读观察：活端点与 AgentStatus pane 快照；任一不可用时提示自然缺席。"""
     return discover(), agentstatus_panes()
-
-
-def _task_document(
-    store: Store,
-    task: Task,
-    *,
-    include_body: bool = False,
-    events: bool = False,
-    hint: _TargetHint = _NO_HINT,
-) -> dict[str, object]:
-    attempts = store.attempts(task.id)
-    view = describe(task, attempts)
-    document: dict[str, object] = {
-        "id": task.id,
-        "title": task.title,
-        "flow": task.flow.value,
-        "phase": view.phase.value,
-        "phaseLabel": PHASE_LABELS[view.phase],
-        "reason": view.reason,
-        "reasonText": reason_text(view.reason),
-        "origin": _ref_document(task.origin),
-        "reviewer": _ref_document(task.reviewer),
-        "control": task.control,
-        "verdict": task.verdict.value if task.verdict else None,
-        "createdAt": task.created_at,
-        "updatedAt": task.updated_at,
-        "acceptedAt": task.accepted_at,
-        "closedAt": task.closed_at,
-        "targetStoppedWithoutReport": hint.stopped_at is not None,
-        "targetTurnEndedAt": hint.stopped_at,
-        "targetSessionMissing": hint.missing,
-        "attempts": [_attempt_document(item, include_body=include_body) for item in attempts],
-    }
-    if events:
-        document["events"] = store.events(task.id)
-    return document
-
-
-def _next_step(task: Task, attempts: list[Attempt]) -> str | None:
-    step = next_step(task, attempts, ref=short(task.id))
-    return step.text if step is not None else None
-
-
-def _describe_result(result: dict[str, Any] | None) -> list[str]:
-    if not result:
-        return []
-    lines: list[str] = []
-    note = result.get("note")
-    if isinstance(note, str) and note:
-        lines.append(f"说明：{note}")
-    files = result.get("files")
-    if isinstance(files, list):
-        for item in files:
-            if isinstance(item, dict):
-                lines.append(f"文件：{item.get('path')}（sha256 {str(item.get('sha256', ''))[:12]}）")
-    commit = result.get("commit")
-    if isinstance(commit, dict):
-        mark = "" if commit.get("verified") else "（本机未找到该提交）"
-        lines.append(f"提交：{commit.get('commit')}{mark}")
-    return lines
-
-
-def _print_task(
-    store: Store, task: Task, *, now: float, show_body: bool, hint: _TargetHint = _NO_HINT
-) -> None:
-    attempts = store.attempts(task.id)
-    view = describe(task, attempts)
-    cmd = command_name()
-    title = f"「{task.title}」" if task.title else ""
-    print(f"任务 {short(task.id)} {title} {PHASE_LABELS[view.phase]}：{reason_text(view.reason)}")
-    flow = "交接" if task.flow is Flow.HANDOFF else f"实现 → 复核（{task.reviewer.display() if task.reviewer else '?'}）"
-    origin = task.origin.display() if task.origin else "用户"
-    print(f"流程：{flow}；发起：{origin}；创建于 {_age(task.created_at, now)}")
-    for attempt in attempts:
-        delivery = DELIVERY_LABELS[attempt.delivery]
-        if attempt.delivery_reason and attempt.delivery is not Delivery.PENDING:
-            text = reason_text(attempt.delivery_reason)
-            if text and text != delivery:
-                delivery = f"{delivery}（{text}）"
-        consumption = CONSUMPTION_LABELS[attempt.consumption]
-        if consumption:
-            delivery = f"{delivery}，{consumption}"
-        work = "" if attempt.role is Role.NOTICE else f"；工作：{WORK_LABELS[attempt.work]}"
-        print(f"  #{attempt.seq} {role_label(attempt)} → {attempt.target.display()}：{delivery}{work}")
-        for line in _describe_result(attempt.result):
-            print(f"      {line}")
-        if show_body:
-            for line in attempt.body.splitlines():
-                print(f"      | {line}")
-    if hint.stopped_at is not None and view.current is not None:
-        print(
-            f"提示：{view.current.target.display()} 这一轮已在 {_clock(hint.stopped_at)} 结束，但还没有汇报"
-            f"（可能忘了运行 {cmd} report，或在等人回复）；可去对方会话查看或请它补报；确需重发用 "
-            f"{cmd} retry {short(task.id)} --force（对方可能已在执行），不再需要可 {cmd} close {short(task.id)}"
-        )
-    if hint.missing and view.current is not None:
-        current = view.current
-        ref = short(task.id)
-        # 未确证离开 Codex 队列时消息可能还在原生队列里，恢复同一 thread 后会继续执行（docs/ab.md §7）
-        maybe_queued = (
-            current.target.provider is Provider.CODEX
-            and current.delivery is Delivery.QUEUED
-            and current.consumption is not Consumption.LEFT_QUEUE
-        )
-        if maybe_queued:
-            action = (
-                f"消息尚未确认离开 Codex 队列，若仍在，恢复同一 thread 后可能继续执行，勿直接重发；"
-                f"确需 {cmd} retry {ref} --force 重发或加 --to 改派，都可能重复执行"
-            )
-        else:
-            action = f"确已退出可恢复该会话后 {cmd} retry {ref} --force 重发（对方可能已处理过），或加 --to 改派"
-        print(
-            f"提示：当前未发现 {current.target.display()} 的会话（可能已退出，也可能暂时无法识别），还没有汇报，"
-            f"先去确认；{action}；不再需要可 {cmd} close {ref}"
-        )
-    step = _next_step(task, attempts)
-    if step:
-        print(f"下一步：{step}")
-    events = store.events(task.id, limit=20)
-    if events:
-        print("时间线：")
-        for event in events:
-            kind = str(event["kind"])
-            label = EVENT_LABELS.get(kind)
-            if label is None and kind.startswith("delivery_"):
-                label = reason_text(kind)
-            if label is None and kind.startswith("consumption_"):
-                try:
-                    label = CONSUMPTION_LABELS[Consumption(kind.removeprefix("consumption_"))] or kind
-                except ValueError:
-                    label = kind
-            detail = event["detail"] if isinstance(event["detail"], dict) else {}
-            extra = detail.get("note") or detail.get("text") or reason_text(detail.get("reason"))
-            suffix = f"：{str(extra)[:160]}" if extra else ""
-            seq = f" #{event['attemptSeq']}" if event["attemptSeq"] else ""
-            print(f"  {_clock(float(event['at']))}{seq} {label or kind}{suffix}")
 
 
 # ---- 命令 ----
@@ -902,26 +668,6 @@ def _closure_decider(caller: Caller) -> tuple[EndpointRef | None, str]:
     return None, "用户"
 
 
-def _closure_document(outcome: ClosureOutcome) -> dict[str, object]:
-    return {
-        "queued": [
-            {"seq": item.seq, "target": item.target.display()} for item in outcome.queued
-        ],
-        "skipped": [
-            {"role": recipient.source.role.value, "target": recipient.target.display(), "capacity": capacity}
-            for recipient, capacity in outcome.skipped
-        ],
-    }
-
-
-def _print_closure(outcome: ClosureOutcome) -> None:
-    if outcome.queued:
-        names = "、".join(item.target.display() for item in outcome.queued)
-        print(f"已排队结束回执 → {names}（进对方原生队列，不需要汇报）")
-    for recipient, _capacity in outcome.skipped:
-        print(f"排队容量已满，未给 {recipient.target.display()} 排结束回执")
-
-
 def _cancel_ordinary_pending(store: Store, attempts: list[Attempt], *, reason: str, now: float) -> None:
     """取消尚未发出的普通消息；已排队的结束回执照发（DESIGN §45.31.2）。"""
     for attempt in attempts:
@@ -1144,115 +890,12 @@ def cmd_worker(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    from .endpoints import agentstatus_runtime
-    from .paths import claude_sessions_dir, state_dir_source
-    from .transports.claude_peer import inbox_directory
-
-    version = cli_version()
-    root = state_dir()
-    # 账本根与命令名是「这套装置到底在用哪个账本」的可读事实：默认值是独立版的，
-    # 集成版由入口脚本绑回现役根，绑没绑上只看这两行（DESIGN §45.36）
-    checks: dict[str, object] = {
-        "abVersion": __version__,
-        "command": command_name(),
-        "device": device_name(),
-        "ledger": str(root),
-        "stateRoot": str(root),
-        "stateRootSource": state_dir_source(),
-    }
-    try:
-        checks["workerRunning"] = worker_running(root)
-    except OSError as error:
-        # 锁文件异常时给出原因，拉起失败的提示把人指到这里（Opus 复审 P3-b）
-        checks["workerRunning"] = False
-        checks["workerLockError"] = f"{type(error).__name__}（errno {error.errno}）"
-    checks.update({
-        # 只显示、不判定：Codex 会自动升级，写死的版本前缀每升一次就自己过期一次（DESIGN §45.44）
-        "codexVersion": version,
-        # 占位保住显示顺序，读完账本后填入
-        "codexQueueEvidence": summarize_queue_evidence(None, version),
-        "claudeRegistryReadable": os.access(claude_sessions_dir(), os.R_OK),
-        "claudeInboxDirectory": inbox_directory().is_dir(),
-        "agentstatusRuntimeAvailable": bool(agentstatus_runtime()),
-        "workerLog": read_log_tail(root, lines=5),
-    })
-    try:
-        with Store.open(root) as store:
-            checks["ledgerOk"] = True
-            checks["archivedWithNativeRisk"] = store.archived_risk_count()
-            checks["summaryState"] = summary.STATE_LABELS.get(summary.status(root, store)["state"], "未知")
-            try:
-                details = store.recent_codex_details(limit=EVIDENCE_WINDOW)
-            except sqlite3.Error:
-                details = None  # 读失败就说读失败，不伪装成零样本
-            checks["codexQueueEvidence"] = summarize_queue_evidence(details, version)
-    except StoreError as error:
-        checks["ledgerOk"] = False
-        checks["ledgerError"] = error.code
+    checks = collect_checks()
     if args.json:
         _print_json(checks)
         return EXIT_OK
-    labels = {
-        "abVersion": f"{command_name()} 版本",
-        "command": "对外命令名",
-        "device": "本机设备名",
-        "ledger": "任务账本目录",
-        "stateRoot": "状态根目录",
-        "stateRootSource": "状态根来源",
-        "workerRunning": "后台 worker 运行中",
-        "workerLockError": "worker 锁文件异常",
-        "codexVersion": "Codex CLI 版本",
-        "claudeRegistryReadable": "Claude 会话注册表可读",
-        "claudeInboxDirectory": "Claude 回执目录存在",
-        "agentstatusRuntimeAvailable": "AgentStatus 忙闲状态可读",
-        "ledgerOk": "任务账本正常",
-        "ledgerError": "账本错误",
-        "archivedWithNativeRisk": "已关闭但对方可能仍在执行的任务",
-        "summaryState": "协作摘要",
-        "workerLog": "worker 最近日志",
-    }
-    for key, value in checks.items():
-        if key == "codexQueueEvidence" and isinstance(value, dict):
-            print(queue_evidence_text(value))
-            continue
-        if isinstance(value, list):
-            print(f"{labels.get(key, key)}：" + ("（无）" if not value else ""))
-            for line in value:
-                print(f"  {line}")
-            continue
-        shown = "是" if value is True else "否" if value is False else value
-        print(f"{labels.get(key, key)}：{shown}")
+    print_checks(checks)
     return EXIT_OK
-
-
-def queue_evidence_text(evidence: Mapping[str, object]) -> str:
-    """doctor 的「Codex 输出证据」一行（DESIGN §45.44 二.6）。计数只说明输出落没落在已知分支，不说投递成败。"""
-    state = evidence.get("state")
-    if state == "version_unavailable":
-        return "Codex 输出证据：当前 codex 版本不可用，无法关联样本"
-    if state == "ledger_unreadable":
-        return "Codex 输出证据：账本读取失败，无法统计"
-    version = evidence.get("version")
-    head = f"Codex 输出证据（最近最多 {evidence.get('window')} 条 Codex 尝试）："
-    if state == "ok":
-        unrecognized = evidence.get("unrecognized")
-        text = (
-            f"{head}{version} 命中已知分支 {evidence.get('recognized')} 次，未识别 {unrecognized} 次；"
-            "此统计不代表投递成功、执行完成或所有错误分支都已验证；CLI 版本也不证明它所连 app-server 的版本"
-        )
-        if isinstance(unrecognized, int) and unrecognized > 0:
-            # 未识别的尝试之后仍可能由接收方汇报确证而变成已送达，所以不说「是否送达不明」
-            text += f"；上游输出或接口可能变了，这些尝试的当前投递状态以 `{command_name()} status` 为准，可能已由接收方汇报确证"
-    else:
-        text = f"{head}{version} 在本次查询窗口内没有可用样本（旧记录可能未记这两个字段）"
-    other = evidence.get("otherVersion")
-    if isinstance(other, int) and other > 0:
-        # 升级后第一次看 doctor 的常态：样本都在，只是记在升级前的版本下
-        text += f"；另有 {other} 次记于其他版本（多半是升级前的投递）"
-    unknown = evidence.get("unknownVersion")
-    if isinstance(unknown, int) and unknown > 0:
-        text += f"；另有 {unknown} 次未能确定执行投递的版本"
-    return text
 
 
 def _refresh_summary(*, force: bool = False, revive: bool = False) -> summary.PublishResult | None:

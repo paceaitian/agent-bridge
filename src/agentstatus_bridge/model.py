@@ -240,14 +240,6 @@ class EndpointRef:
             and self.native_id != UNRESOLVED_NATIVE_ID
         )
 
-    def same_generation(self, other: EndpointRef) -> bool:
-        """同一原生会话且同一进程代际。"""
-        return (
-            self.same_session(other)
-            and self.pid == other.pid
-            and self.start_ticks == other.start_ticks
-        )
-
 
 # 这些问题使端点不能作为投递目标；shared_thread 可由调用方显式放行。
 # subagent_only：进程可见的 thread 全是 Codex 子代理，不可作收件人（DESIGN §45.48 R2）

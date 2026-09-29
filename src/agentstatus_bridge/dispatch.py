@@ -642,14 +642,6 @@ class Dispatcher:
         )
         return applied
 
-    def apply_reply(self, reply_address: str, text: str) -> bool:
-        """立即关联并写入一条原生回复；写入失败时抛 StoreError（由 handle_frame 负责排队重放）。"""
-        resolved = self.resolve_reply(reply_address, text)
-        if resolved is None:
-            return False
-        self._record_reply(resolved)
-        return True
-
     def resolve_reply(self, reply_address: str, text: str) -> ResolvedReply | None:
         """在回复到达时确定它的关联；对不上任何消息时返回 None。
 

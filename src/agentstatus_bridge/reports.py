@@ -32,10 +32,10 @@ from .model import (
     Work,
     work_attempts,
 )
-from .store import MAX_BODY_BYTES, Store, StoreError
+from .labels import next_step
+from .store import MAX_BODY_BYTES, MAX_FILES, Store, StoreError
 
 MAX_NOTE_CHARS = 4000
-MAX_FILES = 16
 MAX_HASH_BYTES = 256 * 1024 * 1024
 _COMMIT = re.compile(r"[0-9a-fA-F]{7,64}")
 _UNSENT = (Delivery.PENDING, Delivery.SENDING, Delivery.CANCELLED)
@@ -333,8 +333,6 @@ def apply_report(
             and not current_task.origin.same_session(attempt.target)
         ):
             # 发起方最容易忘的是收尾：按本次写入后的阶段写明下一步（验收/返工/关闭），事务内读得到刚写入的状态
-            from .labels import next_step  # labels 依赖本模块的 MAX_FILES，放在函数内避免循环导入
-
             written_task = store.get_task(task.id) or current_task
             step = next_step(written_task, store.attempts(task.id), ref=short(task.id))
             followups.append(

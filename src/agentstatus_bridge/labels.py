@@ -6,8 +6,7 @@ from dataclasses import dataclass
 
 from .model import Attempt, Consumption, Delivery, Phase, Role, Runtime, Task, Work, describe
 from .naming import command_name
-from .reports import MAX_FILES
-from .store import MAX_BODY_BYTES
+from .store import MAX_BODY_BYTES, MAX_FILES
 from .transports.codex_queue import READABLE_REASONS
 
 # 原因文案里的命令名占位：文案是模块级常量，只能在 `reason_text` 里按本次进程的入口名替换

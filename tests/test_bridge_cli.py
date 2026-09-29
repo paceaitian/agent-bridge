@@ -12,11 +12,13 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from agentstatus_bridge import cli, naming, paths
+from agentstatus_bridge import cli, doctor, naming, paths, views
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
 from agentstatus_bridge.endpoints import Caller
 from agentstatus_bridge.hints import PaneState
@@ -59,11 +61,15 @@ class CliTests(unittest.TestCase):
                     "AB_CLAUDE_SESSIONS_DIR": str(Path(self._tmp.name) / "claude-sessions"),
                 },
             ),
-            patch.object(cli, "cli_version", return_value=None),
+            patch.object(doctor, "cli_version", return_value=None),
+            # doctor 的 agentstatus_runtime 读的是真实 session bus：8 个 doctor 用例原来都连到本机 daemon（§48.1 第 3 条）
+            patch.object(doctor, "agentstatus_runtime", return_value={}),
             patch.object(cli, "discover", side_effect=lambda: list(self.endpoints)),
             patch.object(cli, "identify_caller", side_effect=lambda _endpoints: self.caller),
             patch.object(cli, "ensure_worker", return_value=False),
             patch.object(cli, "worker_running", side_effect=lambda _root: self.worker_up),
+            # cli 的 _worker_up 与 doctor 各读一份（§48 R7 起 doctor 在自己的模块里 import）
+            patch.object(doctor, "worker_running", side_effect=lambda _root: self.worker_up),
             patch.object(cli, "_receiver_class", return_value="bypass"),
         ]
         for item in patches:
@@ -106,7 +112,7 @@ class CliTests(unittest.TestCase):
 
     def test_peers_and_doctor_show_the_local_device(self) -> None:
         """设备名要有人看得见：peers 每行一列、doctor 一行（DESIGN §45.35）。"""
-        with patch.object(cli, "device_name", return_value="test-box"):
+        with patch.object(cli, "device_name", return_value="test-box"), patch.object(doctor, "device_name", return_value="test-box"):
             code, out, err = self.run_cli("peers", "--json")
             self.assertEqual(code, cli.EXIT_OK, err)
             rows = json.loads(out)["peers"]
@@ -117,6 +123,16 @@ class CliTests(unittest.TestCase):
             self.assertEqual(json.loads(out)["device"], "test-box")
         code, out, _err = self.run_cli("doctor")
         self.assertIn("本机设备名", out)
+
+    def test_doctor_shows_the_loaded_package_path(self) -> None:
+        """doctor 的 JSON 多一个键、文字多一行「包路径」（DESIGN §48 R9）。"""
+        code, out, err = self.run_cli("doctor", "--json")
+        self.assertEqual(code, cli.EXIT_OK, err)
+        value = json.loads(out)["packagePath"]
+        self.assertTrue(value.startswith(("/", "~")), value)
+        self.assertTrue(value.endswith("/agentstatus_bridge"), value)
+        code, out, _err = self.run_cli("doctor")
+        self.assertIn(f"包路径：{value}\n", out)
 
     def test_read_only_target_is_refused_at_every_entry(self) -> None:
         self.endpoints = [IMPL, REVIEW, LEAD, endpoint(GROK.ref, issues=("no_inbox",))]
@@ -251,16 +267,16 @@ class CliTests(unittest.TestCase):
         """
         ok = {"priority": "later", "senderPid": 12, "receipt": None, "flag": True,
               "exact": "a" * 64, "literal": "<omitted>"}
-        self.assertEqual(cli.project_delivery_detail(ok), (ok, False))
+        self.assertEqual(views.project_delivery_detail(ok), (ok, False))
         for bad in ({"long": "a" * 65}, {"nested": {"text": "x"}}, {"items": [1]}, {"ratio": 0.5},
                     {"bad key": "x"}, {"9lead": "x"}, {"k" * 33: "x"}):
             with self.subTest(bad=bad):
-                shown, redacted = cli.project_delivery_detail({"priority": "next", **bad})
+                shown, redacted = views.project_delivery_detail({"priority": "next", **bad})
                 self.assertEqual(shown, {"priority": "next"})
                 self.assertTrue(redacted)
         # 坏项在前、合法项在后：省略标记不能被后面的合法项复位（Codex 实现复核 C01）
-        self.assertEqual(cli.project_delivery_detail({"bad key": "x", "priority": "later"}), ({"priority": "later"}, True))
-        self.assertEqual(cli.project_delivery_detail({"priority\n": "later", "good": None}), ({"good": None}, True))
+        self.assertEqual(views.project_delivery_detail({"bad key": "x", "priority": "later"}), ({"priority": "later"}, True))
+        self.assertEqual(views.project_delivery_detail({"priority\n": "later", "good": None}), ({"good": None}, True))
 
     def test_json_views_carry_the_delivery_detail_diagnostic(self) -> None:
         """五个带 --json 的命令共用 `_task_document`，都要带上投递明细与省略标记（DESIGN §45.43 2.1）。"""
@@ -309,7 +325,7 @@ class CliTests(unittest.TestCase):
                 )
 
     def doctor(self, version: str | None = "0.156.0") -> tuple[dict[str, object], str]:
-        with patch.object(cli, "cli_version", return_value=version):
+        with patch.object(doctor, "cli_version", return_value=version):
             code, out, err = self.run_cli("doctor", "--json")
             self.assertEqual(code, cli.EXIT_OK, err)
             text_code, text, text_err = self.run_cli("doctor")
@@ -818,7 +834,8 @@ class CliTests(unittest.TestCase):
 
     def test_broken_worker_lock_does_not_crash_send_or_doctor(self) -> None:
         # 锁文件异常（例如被替换成目录）：已写入账本的 send 与用来排查的 doctor 都不能打堆栈（Opus 审计 P3-6）
-        with patch.object(cli, "worker_running", side_effect=IsADirectoryError("worker.lock")):
+        with patch.object(cli, "worker_running", side_effect=IsADirectoryError("worker.lock")), \
+                patch.object(doctor, "worker_running", side_effect=IsADirectoryError("worker.lock")):
             code, out, err = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--no-wait")
             self.assertEqual(code, cli.EXIT_UNAVAILABLE)
             self.assertIn("已交给", out)
@@ -960,6 +977,60 @@ class DeviceNameTests(unittest.TestCase):
                 value = self.resolve(hostname, override)
                 self.assertEqual(value, expected)
                 self.assertRegex(value, r"^[A-Za-z0-9._-]{1,32}$")
+
+
+class PackagePathTests(unittest.TestCase):
+    """doctor 的 `packagePath`：包目录解开符号链接，与解析后的 home 比较再缩写（DESIGN §48 R9）。"""
+
+    def setUp(self) -> None:
+        self.package = Path(doctor.__file__).resolve().parent
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.temporary = Path(temporary.name).resolve()
+
+    def value(self, home: Path | str) -> str:
+        with patch.dict(os.environ, {"HOME": os.fspath(home)}):
+            return doctor.package_path()
+
+    def test_package_under_home_is_abbreviated(self) -> None:
+        self.assertEqual(self.value(self.package.parent), f"~/{self.package.name}")
+
+    def test_symlinked_home_is_resolved_before_comparing(self) -> None:
+        # 拿未解析的 HOME 去比会缩写不上，完整路径照样带出用户名
+        link = self.temporary / "home-link"
+        link.symlink_to(self.package.parent, target_is_directory=True)
+        self.assertEqual(self.value(link), f"~/{self.package.name}")
+
+    def test_unrelated_or_root_home_gives_the_full_path(self) -> None:
+        self.assertEqual(self.value(self.temporary), str(self.package))
+        self.assertEqual(self.value("/"), str(self.package))
+
+    def test_relative_or_empty_home_gives_the_full_path(self) -> None:
+        # 当前目录恰好是包的上级：相对 HOME 若先 resolve，会把它当成 home 误缩写（Fable 实现复核 P3-2）
+        original = os.getcwd()
+        os.chdir(self.package.parent)
+        self.addCleanup(os.chdir, original)
+        self.assertEqual(self.value("."), str(self.package))
+        self.assertEqual(self.value(""), str(self.package))
+
+    def test_unavailable_home_gives_the_full_path(self) -> None:
+        # 没有 HOME、pwd 也查不到时 Path.home() 抛 RuntimeError（Opus 实现复核 P3-3）
+        with patch.object(doctor.Path, "home", side_effect=RuntimeError("no home")):
+            self.assertEqual(doctor.package_path(), str(self.package))
+
+    def test_package_loaded_through_a_symlink_shows_the_real_directory(self) -> None:
+        link = self.temporary / "src-link"
+        link.symlink_to(self.package.parent, target_is_directory=True)
+        environment = {
+            "PATH": "/usr/bin:/bin", "HOME": os.fspath(self.temporary), "LANG": "C.UTF-8",
+            "PYTHONPATH": os.fspath(link), "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        result = subprocess.run(
+            [sys.executable, "-c", "from agentstatus_bridge.doctor import package_path; print(package_path())"],
+            env=environment, capture_output=True, text=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.package))
 
 
 class CommandNameTests(unittest.TestCase):

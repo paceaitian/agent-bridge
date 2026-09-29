@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from agentstatus_bridge import procfs
-from agentstatus_bridge.cli import project_delivery_detail
+from agentstatus_bridge.views import project_delivery_detail
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
 from agentstatus_bridge.envelope import parse_header, render
 from agentstatus_bridge.model import Attempt, Consumption, Delivery, EndpointRef, Flow, Provider, Role, Task
@@ -289,7 +289,7 @@ class CodexQueueEvidenceTests(unittest.TestCase):
         for target in (f"{module}.os.path.realpath", f"{module}.os.stat", f"{module}.cli_version"):
             with self.subTest(target=target):
                 transport = self.transport()
-                with patch(target, side_effect=RuntimeError("SYNTHETIC")) as failing:
+                with patch(target, side_effect=RuntimeError("SYNTHETIC")) as failing:  # layout: allow 循环替换同一传输的三个依赖点，逐个注入失败
                     outcome = self.deliver(transport)
                 self.assertTrue(failing.called)
                 self.assertEqual((outcome.delivery, outcome.provider_ref), (Delivery.QUEUED, ITEM.lower()))

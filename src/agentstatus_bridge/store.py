@@ -53,6 +53,8 @@ _MAY_HAVE_ARRIVED = frozenset(HANDED_OVER | {Delivery.UNKNOWN, Delivery.HELD})
 MAX_EVENTS_PER_TASK = 256
 MAX_BODY_BYTES = 64 * 1024
 MAX_TITLE_CHARS = 120
+# 一次报告最多引用的文件数；与其他账本记录上限放在一起，labels 与 reports 都从这里取（DESIGN §48 R2）
+MAX_FILES = 16
 FINISHED_RETENTION_SECONDS = 30 * 86400
 MAX_FINISHED_TASKS = 1000
 
@@ -1002,10 +1004,6 @@ class Store:
     def archived_risk_count(self) -> int:
         row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (_ARCHIVED_RISK_KEY,)).fetchone()
         return int(row["value"]) if row is not None and str(row["value"]).isdigit() else 0
-
-    def acknowledge_archived_risk(self) -> None:
-        with self._transaction() as conn:
-            conn.execute("DELETE FROM meta WHERE key = ?", (_ARCHIVED_RISK_KEY,))
 
     def prune(self, *, now: float) -> int:
         """删除超过保留期或数量上限的已结束任务；未结束任务从不自动删除。"""

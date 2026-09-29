@@ -10,22 +10,24 @@ from tempfile import TemporaryDirectory
 import unittest
 import unittest.mock
 
-from agentstatus_bridge import endpoints as endpoints_module
+from agentstatus_bridge import observer_dbus
 from agentstatus_bridge.endpoints import (
     ADAPTERS,
     DiscoverySources,
     MAX_REGISTRY_FILES,
-    _map_agentstatus_runtime,  # pyright: ignore[reportPrivateUsage]
-    ObserverRow,
-    ObserverView,
-    agentstatus_view,
-    _pane_state,  # pyright: ignore[reportPrivateUsage]
     PaneInfo,
     ResolveError,
     discover,
     identify_caller,
     permission_class,
     resolve_target,
+)
+from agentstatus_bridge.observer_dbus import (
+    ObserverRow,
+    ObserverView,
+    _map_agentstatus_runtime,  # pyright: ignore[reportPrivateUsage]
+    _pane_state,  # pyright: ignore[reportPrivateUsage]
+    agentstatus_view,
 )
 from agentstatus_bridge.hints import PaneState
 from agentstatus_bridge.ids import opaque_id
@@ -523,7 +525,7 @@ class AgentStatusMappingTests(unittest.TestCase):
             # 运行代际键也要收：放开判定优先查它（审计 R02）
             {"paneId": "%4", "key": f"claude-gen:{'d' * 24}", "runtimeState": "ready", "freshness": "fresh", "activeChildren": 1},
         ]
-        with unittest.mock.patch.object(endpoints_module, "_observer_rows", return_value=rows):
+        with unittest.mock.patch.object(observer_dbus, "_observer_rows", return_value=rows):
             snapshot = agentstatus_view()
         # 证据时刻取自 runtimeUpdatedAt（不是 lastEventAt）；不是数（True 也不是）或缺字段的行没有证据
         self.assertEqual(
@@ -553,17 +555,17 @@ class AgentStatusMappingTests(unittest.TestCase):
         stale = {"paneId": "%1", "runtimeState": "ready", "freshness": "stale"}
         for order in ([fresh, stale], [stale, fresh]):
             with self.subTest(order=[row["freshness"] for row in order]):
-                with unittest.mock.patch.object(endpoints_module, "_observer_rows", return_value=order):
+                with unittest.mock.patch.object(observer_dbus, "_observer_rows", return_value=order):
                     self.assertEqual(agentstatus_view().states, {"%1": Runtime.BUSY})
         # 两行都不新鲜时保持「最后一行胜出」，不引入新的偏好
         older = {"paneId": "%1", "runtimeState": "working", "freshness": "unavailable"}
-        with unittest.mock.patch.object(endpoints_module, "_observer_rows", return_value=[older, stale]):
+        with unittest.mock.patch.object(observer_dbus, "_observer_rows", return_value=[older, stale]):
             self.assertEqual(agentstatus_view().states, {"%1": Runtime.UNKNOWN})
         # 两行都新鲜时偏保守：等待用户不被行序覆盖（审计 P3-B）
         asking = {"paneId": "%1", "runtimeState": "working", "attentionState": "action_required", "freshness": "fresh"}
         for order in ([asking, fresh], [fresh, asking]):
             with self.subTest(order=[row.get("attentionState") for row in order]):
-                with unittest.mock.patch.object(endpoints_module, "_observer_rows", return_value=order):
+                with unittest.mock.patch.object(observer_dbus, "_observer_rows", return_value=order):
                     self.assertEqual(agentstatus_view().states, {"%1": Runtime.WAITING})
 
     def test_session_keys_are_taken_as_the_observer_writes_them(self) -> None:
@@ -576,7 +578,7 @@ class AgentStatusMappingTests(unittest.TestCase):
             {"key": "no-colon", "runtimeState": "ready", "freshness": "fresh"},
             {"key": "has space:" + "c" * 24, "runtimeState": "ready", "freshness": "fresh"},
         ]
-        with unittest.mock.patch.object(endpoints_module, "_observer_rows", return_value=rows):
+        with unittest.mock.patch.object(observer_dbus, "_observer_rows", return_value=rows):
             keys = set(agentstatus_view().rows)
         self.assertEqual(keys, {"claude:" + "a" * 24, "claude-gen:" + "b" * 40, "future.provider:XYZ-99"})
 

@@ -408,8 +408,6 @@ class BridgeStoreTests(unittest.TestCase):
         self.store.note_archived_risk()
         self.store.note_archived_risk()
         self.assertEqual(self.store.archived_risk_count(), 2)
-        self.store.acknowledge_archived_risk()
-        self.assertEqual(self.store.archived_risk_count(), 0)
 
 
 if __name__ == "__main__":

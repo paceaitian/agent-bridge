@@ -20,13 +20,13 @@ from agentstatus_bridge import endpoints as endpoints_module
 from agentstatus_bridge.dispatch import select_generation
 from agentstatus_bridge.endpoints import (
     DiscoverySources,
-    ObserverView,
     PaneInfo,
     ResolveError,
     discover,
     identify_caller,
     resolve_target,
 )
+from agentstatus_bridge.observer_dbus import ObserverView
 from agentstatus_bridge.model import Endpoint, Provider
 from agentstatus_bridge.procfs import ProcessInfo
 from agentstatus_bridge.reports import ReportError, _attribute  # pyright: ignore[reportPrivateUsage]
