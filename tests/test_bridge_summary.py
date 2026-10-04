@@ -420,6 +420,16 @@ class BindingTests(LedgerCase):
         self.assertEqual(self.entry(old_task.id)["origin"]["binding"]["observerKeys"], [])
         self.assertTrue(summary.is_valid(self.document()))
 
+    def test_a_daemon_origin_without_a_pane_stays_valid(self) -> None:
+        # Codex 托管 daemon 调用者端点作发起方：pid 是 daemon、没有 pane（DESIGN §53.4.3）；与 tty-only 端点一样没有键
+        daemon_origin = EndpointRef(Provider.CODEX, "019b0003-3333-7333-8333-333333333333", pid=900, start_ticks="100", pane=None)
+        task, _ = self.create(origin=daemon_origin, origin_class=None)
+        self.publish()
+        origin = self.entry(task.id)["origin"]
+        self.assertIsNone(origin["pane"])
+        self.assertEqual(origin["binding"]["observerKeys"], [])
+        self.assertTrue(summary.is_valid(self.document()))
+
     def test_endpoint_binding_is_optional_but_checked_when_present(self) -> None:
         origin = ref(Provider.CLAUDE, "session-origin", pane="%3")
         self.create(origin=origin, origin_class="bypass")

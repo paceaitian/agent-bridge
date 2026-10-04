@@ -164,8 +164,9 @@ class ReasonTextCommandTests(unittest.TestCase):
 
     def test_no_reason_text_ever_leaks_the_placeholder(self) -> None:
         carriers = [code for code, text in labels.REASON_TEXTS.items() if labels.PLACEHOLDER in text]
-        # 清理范围是 6 条，不是 3 条：DESIGN 与提交信息原来都记错了（独立 Opus 审计 P2-1）
-        self.assertEqual(len(carriers), 6, carriers)
+        # 清理范围是 6 条，不是 3 条：DESIGN 与提交信息原来都记错了（独立 Opus 审计 P2-1）；
+        # §53.3.8 加了 3 条（标题缺 id 的目标文案、汇报与发起的未归属文案都指向 doctor）
+        self.assertEqual(len(carriers), 9, carriers)
         for code in labels.REASON_TEXTS:
             with self.subTest(code=code):
                 self.assertNotIn(labels.PLACEHOLDER, labels.reason_text(code, command="testcmd"))

@@ -12,6 +12,7 @@ from pathlib import Path
 import sqlite3
 
 from . import __version__, summary
+from .endpoints import codex_title_report
 from .naming import command_name
 from .observer_dbus import agentstatus_runtime
 from .paths import claude_sessions_dir, device_name, state_dir, state_dir_source
@@ -66,6 +67,8 @@ def collect_checks() -> dict[str, object]:
     checks.update({
         # 只显示、不判定：Codex 会自动升级，写死的版本前缀每升一次就自己过期一次（DESIGN §45.44）
         "codexVersion": version,
+        # 托管 daemon 下按标题认会话：只有计数（DESIGN §53.5）
+        "codexThreadTitle": codex_title_report(),
         # 占位保住显示顺序，读完账本后填入
         "codexQueueEvidence": summarize_queue_evidence(None, version),
         "claudeRegistryReadable": os.access(claude_sessions_dir(), os.R_OK),
@@ -115,6 +118,10 @@ def print_checks(checks: dict[str, object]) -> None:
         if key == "codexQueueEvidence" and isinstance(value, dict):
             print(queue_evidence_text(value))
             continue
+        if key == "codexThreadTitle" and isinstance(value, dict):
+            for line in thread_title_lines(value):
+                print(line)
+            continue
         if isinstance(value, list):
             print(f"{labels.get(key, key)}：" + ("（无）" if not value else ""))
             for line in value:
@@ -122,6 +129,34 @@ def print_checks(checks: dict[str, object]) -> None:
             continue
         shown = "是" if value is True else "否" if value is False else value
         print(f"{labels.get(key, key)}：{shown}")
+
+
+def thread_title_lines(report: Mapping[str, object]) -> list[str]:
+    """doctor 的「Codex 窗口标题」几行（DESIGN §53.5）：只有计数与提示，不输出标题原文与 thread id。"""
+    if report.get("daemonMode") is not True:
+        return ["Codex 托管 daemon：未检测到 daemon 持有的会话（可能没用 daemon，或所有窗口都停在选择器）"]
+    lines = [f"Codex 窗口标题里的会话 id：{report.get('withThreadId')} 个能认出"]
+    short = report.get("shortThreadId")
+    if isinstance(short, int) and short > 0:
+        lines.append(
+            f"  其中 {short} 个的会话 id 被截短（标题超过 240 字符）：协作桥仍可能认出；走托管 daemon 的窗口，轮次结局不在面板上公开"
+            "（按进程关系定位的旧版或 --no-daemon 窗口不受影响）；缩短 terminal_title 配置后新开或重开窗口生效"
+        )
+    not_parsed = report.get("uuidNotParsed")
+    if isinstance(not_parsed, int) and not_parsed > 0:
+        lines.append(
+            f"  {not_parsed} 个标题里有会话 id 但认不出：确认 \"thread-id\" 已加在 [tui] terminal_title 列表末尾，"
+            "并且不紧挨 activity（紧挨时两者之间是空格，忙时粘在一起、空闲时又正常）"
+        )
+    missing = report.get("withoutThreadId")
+    if isinstance(missing, int) and missing > 0:
+        lines.append(
+            f"  {missing} 个 Codex 窗口的标题里没有会话 id：可能停在选择器、标题超过 240 字符，或没加 \"thread-id\"；"
+            "新开或重开 Codex 窗口生效"
+        )
+    if report.get("stateDbUnavailable") is True:
+        lines.append("  Codex 状态库读不到：正在看子代理的窗口可能被当成主会话")
+    return lines
 
 
 def queue_evidence_text(evidence: Mapping[str, object]) -> str:

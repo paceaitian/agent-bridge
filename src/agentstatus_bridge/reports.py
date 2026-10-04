@@ -19,12 +19,14 @@ import subprocess
 
 from . import procfs
 from .ids import short
-from .endpoints import Caller
+from .endpoints import Caller, codex_holdings
 from .model import (
     UNRESOLVED_NATIVE_ID,
     Attempt,
     Delivery,
+    EndpointRef,
     Flow,
+    Provider,
     ReportKind,
     Role,
     Task,
@@ -33,6 +35,7 @@ from .model import (
     work_attempts,
 )
 from .labels import next_step
+from .paths import codex_home as default_codex_home
 from .store import MAX_BODY_BYTES, MAX_FILES, Store, StoreError
 
 MAX_NOTE_CHARS = 4000
@@ -190,7 +193,23 @@ def _select_attempt(task: Task, attempts: list[Attempt], report: ReportInput) ->
     return found
 
 
-def _attribute(attempt: Attempt, report: ReportInput, caller: Caller, proc_root: Path) -> str:
+def _still_receiving(target: EndpointRef, pid: int, proc_root: Path, home: Path | None) -> bool:
+    """投递时记下的进程此刻是不是仍是实际接收方（它仍是同一代之后再问这一句）。
+
+    Codex：仍持有目标 thread（rollout 或 writer lock）才算——托管 daemon 下投递时记下的 TUI 只是视图，从不持有；
+    fd 读不到按不持有算（身份是上游注入的正面证据，DESIGN §53.4.2）。Claude 等：活着就算，规则不变——「持有」
+    只对 Codex 有定义，套用会让 §45.5 的护栏对 Claude 静默失效（§53 第 3 轮两方 P2）。
+    """
+    if target.provider is not Provider.CODEX:
+        return True
+    rollouts, locks = codex_holdings(pid, proc_root, home or default_codex_home())
+    thread = target.native_id.lower()
+    return thread in rollouts or thread in locks
+
+
+def _attribute(
+    attempt: Attempt, report: ReportInput, caller: Caller, proc_root: Path, *, codex_home: Path | None = None
+) -> str:
     """核验汇报来源，返回 agent 或 manual。"""
     if caller.rejection == "subagent":
         # Codex 子代理不能代替根会话汇报：与根会话自己的汇报撞 result_already_submitted（DESIGN §45.48 R3）
@@ -209,7 +228,14 @@ def _attribute(attempt: Attempt, report: ReportInput, caller: Caller, proc_root:
             isinstance(expected_pid, int)
             and isinstance(expected_start, str)
             and (ref.pid, ref.start_ticks) != (expected_pid, expected_start)
+            # 汇报方的 agent 进程就是投递进程本身：包装进程下的 TUI 在 F02 时组落到标题路径、端点换成包装进程，
+            # 但汇报的仍是收件人（Opus 实现复核第 2 轮 P3-1）
+            and not (
+                caller.agent_process is not None
+                and (caller.agent_process.pid, caller.agent_process.start_ticks) == (expected_pid, expected_start)
+            )
             and procfs.is_same_generation(expected_pid, expected_start, proc_root)
+            and _still_receiving(attempt.target, expected_pid, proc_root, codex_home)
         ):
             # 实际收到消息的进程仍在，另一个同会话进程不能替它汇报
             raise ReportError("reporter_generation_mismatch")
@@ -245,12 +271,13 @@ def apply_report(
     cwd: Path,
     git: GitRunner = _git_resolve_commit,
     proc_root: Path = procfs.DEFAULT_PROC,
+    codex_home: Path | None = None,
 ) -> ReportOutcome:
     """核验并原子记录一条汇报；必要时一并排队复核请求或发起方通知（由 worker 发送）。"""
     task = store.resolve_task(report.task_ref)
     # 事务外先做一次校验：尽早给出可读错误，避免无谓的文件 hash
     preview = _select_attempt(task, store.attempts(task.id), report)
-    _attribute(preview, report, caller, proc_root)
+    _attribute(preview, report, caller, proc_root, codex_home=codex_home)
     _check_kind(preview, report)
     # 固定首次选定的尝试：hash/提交校验期间若出现新尝试，事务内按 stale_attempt 拒绝，不会改投
     report = replace(report, attempt_seq=preview.seq)
@@ -267,7 +294,7 @@ def apply_report(
             raise ReportError("task_not_found")
         attempts = store.attempts(task.id)
         attempt = _select_attempt(current_task, attempts, report)
-        source = _attribute(attempt, report, caller, proc_root)
+        source = _attribute(attempt, report, caller, proc_root, codex_home=codex_home)
         _check_kind(attempt, report)
         kind = report.kind
         detail: dict[str, object] = {"source": source}

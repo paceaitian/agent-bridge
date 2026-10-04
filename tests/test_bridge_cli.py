@@ -64,6 +64,8 @@ class CliTests(unittest.TestCase):
             patch.object(doctor, "cli_version", return_value=None),
             # doctor 的 agentstatus_runtime 读的是真实 session bus：8 个 doctor 用例原来都连到本机 daemon（§48.1 第 3 条）
             patch.object(doctor, "agentstatus_runtime", return_value={}),
+            # doctor 的标题检查会扫真实 /proc 与 tmux（DESIGN §53.5）
+            patch.object(doctor, "codex_title_report", return_value={"daemonMode": False}),
             patch.object(cli, "discover", side_effect=lambda: list(self.endpoints)),
             patch.object(cli, "identify_caller", side_effect=lambda _endpoints: self.caller),
             patch.object(cli, "ensure_worker", return_value=False),
@@ -193,6 +195,30 @@ class CliTests(unittest.TestCase):
         code, out, _ = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--no-wait")
         self.assertEqual(code, cli.EXIT_OK)
         self.assertIn("后台 worker 正在发送", out)
+
+    def test_send_rejects_the_daemon_title_codes(self) -> None:
+        # Codex 托管 daemon 下按标题认领失败的四个码都阻断投递（DESIGN §53.3.8）
+        for issue in ("title_thread_missing", "title_thread_unmatched", "title_shows_subagent", "pane_process_ambiguous"):
+            with self.subTest(issue=issue):
+                self.endpoints = [endpoint(IMPL.ref, issues=(issue,))]
+                code, _, err = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+                self.assertEqual((code, f"target_{issue}" in err), (cli.EXIT_REJECTED, True))
+                self.assertNotIn("{command}", err)
+
+    def test_a_daemon_caller_cannot_send_to_the_window_showing_its_own_thread(self) -> None:
+        # daemon 调用者端点（pid 是 daemon、没有 pane）与显示同一 thread 的窗口是同一会话（DESIGN §53.4.3）
+        daemon_ref = EndpointRef(Provider.CODEX, IMPL.ref.native_id, pid=900, start_ticks="100", pane=None)
+        self.caller = Caller(Endpoint(ref=daemon_ref), ProcessInfo(900, 1000, "codex", "100"), "daemon")
+        code, _, err = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+        self.assertEqual((code, "target_is_self" in err), (cli.EXIT_REJECTED, True))
+        # 发给别的窗口可以：发起方就是这个没有 pane 的端点
+        code, _, err = self.run_cli("send", "--to", "%2", "-m", "x", "--no-wait")
+        self.assertEqual(code, cli.EXIT_OK, err)
+        with Store.open(self.state) as store:
+            [task] = store.list_tasks()
+        assert task.origin is not None
+        self.assertEqual((task.origin.pid, task.origin.pane), (900, None))
+        self.assertEqual(task.origin.display(), f"codex@{IMPL.ref.native_id[:8]}")
 
     def test_send_exit_codes(self) -> None:
         code, _, err = self.run_cli("send", "--to", "nope", "-m", "x", "--no-wait")

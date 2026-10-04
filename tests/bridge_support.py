@@ -227,15 +227,19 @@ _OTHER = _Value("other")
 
 
 class _Scope:
-    """测试模块或函数的一层作用域：import 别名与赋值绑定（本地名 → 候选值）。"""
+    """测试模块或函数的一层作用域：import 别名与赋值绑定（本地名 → 候选值）。
+    同一本地名的多个 import 来源（分支或顺序覆盖）全部保留，不让后一条覆盖前一条（Codex 补审② 复验 R01）。"""
 
     def __init__(self, parent: _Scope | None) -> None:
         self.parent = parent
-        self.imports: dict[str, str] = {}
+        self.imports: dict[str, list[str]] = {}
         self.bindings: dict[str, list[ast.expr | _Value]] = {}
 
     def bind(self, name: str, value: ast.expr | _Value) -> None:
         self.bindings.setdefault(name, []).append(value)
+
+    def bind_import(self, name: str, path: str) -> None:
+        self.imports.setdefault(name, []).append(path)
 
 
 def _scope_statements(body: Iterable[ast.stmt]) -> Iterable[ast.stmt]:
@@ -276,14 +280,14 @@ def _collect_scope(scope: _Scope, body: Iterable[ast.stmt]) -> None:
         if isinstance(statement, ast.Import):
             for alias in statement.names:
                 if alias.asname:
-                    scope.imports[alias.asname] = alias.name
+                    scope.bind_import(alias.asname, alias.name)
                 else:
                     top = alias.name.split(".")[0]
-                    scope.imports[top] = top
+                    scope.bind_import(top, top)
         elif isinstance(statement, ast.ImportFrom):
             if statement.level == 0 and statement.module:
                 for alias in statement.names:
-                    scope.imports[alias.asname or alias.name] = f"{statement.module}.{alias.name}"
+                    scope.bind_import(alias.asname or alias.name, f"{statement.module}.{alias.name}")
         elif isinstance(statement, ast.Assign):
             for target in statement.targets:
                 _bind_target(scope, target, statement.value)
@@ -310,13 +314,14 @@ def _collect_scope(scope: _Scope, body: Iterable[ast.stmt]) -> None:
 
 
 def _merge(values: Sequence[_Value]) -> _Value:
-    """候选值合并：有模块候选就逐个判；否则有非字面量就按非字面量；全是常量才是常量。"""
-    dotted = tuple(path for value in values if value.kind == "dotted" for path in value.paths)
-    if dotted:
-        return _Value("dotted", tuple(dict.fromkeys(dotted)))
+    """候选值合并：任一候选是必须审阅的非字面量就按非字面量，不能被可解析的候选消掉（Codex 补审② F01）；
+    否则有模块候选就逐个判；全是常量才是常量。"""
     for value in values:
         if value.kind == "nonliteral":
             return value
+    dotted = tuple(path for value in values if value.kind == "dotted" for path in value.paths)
+    if dotted:
+        return _Value("dotted", tuple(dict.fromkeys(dotted)))
     if values and all(value.kind == "constant" for value in values):
         return _Value("constant", tuple(path for value in values for path in value.paths))
     return _OTHER
@@ -334,10 +339,12 @@ def _resolve(expr: ast.expr | _Value, scope: _Scope, depth: int = 0) -> _Value:
     if isinstance(expr, ast.Name):
         current: _Scope | None = scope
         while current is not None:
-            if expr.id in current.imports:
-                return _Value("dotted", (current.imports[expr.id],))
-            if expr.id in current.bindings:
-                return _merge([_resolve(value, current, depth + 1) for value in current.bindings[expr.id]])
+            if expr.id in current.imports or expr.id in current.bindings:
+                # 同一作用域里 import 的名字又被赋值时，两个来源都是候选，不能 import 一命中就返回（Codex 补审② F01）；
+                # 同名的多个 import 来源也全是候选（复验 R01）
+                candidates = [_Value("dotted", tuple(current.imports[expr.id]))] if expr.id in current.imports else []
+                candidates.extend(_resolve(value, current, depth + 1) for value in current.bindings.get(expr.id, ()))
+                return _merge(candidates)
             current = current.parent
         return _OTHER
     if isinstance(expr, ast.Attribute):
@@ -997,6 +1004,7 @@ def check_moved_registry(
     纯持有 = import 绑定的本地名在 import 语句以外一次都没作为 Name(Load) 出现；
     注解、类体、默认值、模块层表达式都算读取，字符串注解不算。无关的同名定义不管。
     `holding_exceptions` 里是允许纯持有的「模块:本地名」（相对包根）。
+    经中间模块转手、同名有多个来源且只有部分是登记身份时，报 `moved-ambiguous-hold`（复验 R02）。
     """
     modules = package_modules(package_dir, package)
     facts = {module: _module_facts(os.fspath(path)) for module, path in modules.items()}
@@ -1009,16 +1017,32 @@ def check_moved_registry(
     def short(name: str) -> str:
         return name[len(package) + 1:] if name.startswith(f"{package}.") else ""
 
-    def origin(module: str, name: str, depth: int = 0) -> str | None:
-        if depth > 10 or module not in facts:
-            return None
-        if name in facts[module].defined:
-            return module
-        for binding in bindings[module]:
-            if binding.local == name and binding.source_module in facts:
-                return origin(binding.source_module, binding.source_name, depth + 1)
-        return None
+    def identities(module: str, name: str) -> frozenset[tuple[str, str]]:
+        """沿静态 import 别名追到全部可能的「定义模块, 定义名」；经中间模块改名转手的也追得到（Codex 补审② F02）。
 
+        同一模块里同名的定义与多条 import（分支或顺序覆盖）全部保留，不取首条当最终身份（复验 R02）；
+        不设层数上限（复验 N02）。按「可达的定义节点」求，每次查询共用一个已访问集合：环自然终止，
+        汇聚与重复的来源只走一次，工作量随节点与边数线性增长（第 3 轮 C01；import 环另由规则 3 报）。
+        包外或包里找不到的来源记成不透明身份，不当作空集合，与登记身份混在一起时归歧义（第 3 轮 C02）。
+        """
+        found: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str]] = set()
+        pending = [(module, name)]
+        while pending:
+            key = pending.pop()
+            if key in seen:
+                continue
+            seen.add(key)
+            current, local = key
+            if current not in facts:
+                found.add(key)
+                continue
+            if local in facts[current].defined:
+                found.add(key)
+            pending.extend((binding.source_module, binding.source_name) for binding in bindings[current] if binding.local == local)
+        return frozenset(found)
+
+    tracked: set[tuple[str, str]] = set()
     for move in moves:
         old, new = full(move.old), full(move.new)
         if new not in modules:
@@ -1029,27 +1053,32 @@ def check_moved_registry(
         count = facts[new].defined.get(move.name, 0)
         if count != 1:
             findings.append(LayoutFinding(os.fspath(modules[new]), 0, "moved-new-count", f"{new} 定义了 {move.name} {count} 次，应恰好 1 次"))
-        tracked = {move.name, *move.aliases}
-        for module, module_bindings in bindings.items():
-            reads: dict[str, int] | None = None
-            for binding in module_bindings:
-                if binding.source_name not in tracked or binding.source_module not in facts:
-                    continue
-                if origin(binding.source_module, binding.source_name) != new:
-                    continue
-                if (short(module), binding.local) in holding_exceptions:
-                    continue
-                if reads is None:
-                    reads = _name_reads(modules[module])
-                if not reads.get(binding.local, 0):
-                    findings.append(
-                        LayoutFinding(
-                            os.fspath(modules[module]),
-                            binding.line,
-                            "moved-pure-hold",
-                            f"{module} import 了 {binding.source_name}（本地名 {binding.local}）却一次都不读：回导出或残留 import",
-                        )
-                    )
+        tracked |= {(new, move.name), *((new, alias) for alias in move.aliases)}
+    # 先归一到定义身份再比，不按中间模块里的名字筛：`from .x import moved as other` 再转手也认得出（Codex 补审② F02）
+    for module, module_bindings in bindings.items():
+        reads: dict[str, int] | None = None
+        for binding in module_bindings:
+            found = identities(binding.source_module, binding.source_name)
+            hit = found & tracked
+            if not hit or (short(module), binding.local) in holding_exceptions:
+                continue
+            if reads is None:
+                reads = _name_reads(modules[module])
+            if reads.get(binding.local, 0):
+                continue
+            if found <= tracked:
+                rule = "moved-pure-hold"
+                detail = f"{module} import 了 {binding.source_name}（本地名 {binding.local}）却一次都不读：回导出或残留 import"
+            else:
+                # 来源里既有搬移符号又有别的：静态定不了到底持有哪个，不冒充确定的纯持有，也不放过（复验 R02）
+                rule = "moved-ambiguous-hold"
+                moved = "、".join(f"{source}:{name}" for source, name in sorted(hit))
+                others = "、".join(f"{source}:{name}" for source, name in sorted(found - tracked))
+                detail = (
+                    f"{module} import 的 {binding.local} 一次都不读，而它在中间模块里有多个同名来源："
+                    f"搬移符号 {moved}，以及 {others}；删掉这条不读的 import，或让中间模块改用不同本地名"
+                )
+            findings.append(LayoutFinding(os.fspath(modules[module]), binding.line, rule, detail))
     return findings
 
 

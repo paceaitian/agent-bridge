@@ -6,7 +6,8 @@
 - Claude：读 `~/.claude/sessions/<pid>.json` 注册表，核对 PID 启动时刻与消息 socket 属主。
 - Codex：扫描 `codex` 进程打开的 rollout 文件确定 thread；终端证据优先 tmux pane，没有 pane 时回退到
   控制终端（DESIGN §45.33，控制终端只是候选门槛、不证明是 TUI）；按启动参数排除 app-server、exec 等
-  非交互子命令，既无 pane 又无控制终端的进程也排除（它们不是用户能看到的会话）。
+  非交互子命令，既无 pane 又无控制终端的进程也排除（它们不是用户能看到的会话）。0.157 起托管 daemon
+  持有全部 thread、TUI 一个都不持有：这时按 TUI 标题末段的 thread-id 在 daemon 持有集里认领（DESIGN §53）。
 - Grok：读 `~/.grok/active_sessions.json`，再用 `comm` 与进程持有的 events 文件核实；只读，
   没有收件通道，只能作为发起方。
 - 运行状态：Claude 用注册表 busy/idle；Codex 与 Grok 用 AgentStatus D-Bus（不自动启动）按 pane 读取。
@@ -16,7 +17,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 import json
 import os
@@ -28,11 +29,11 @@ import subprocess
 from typing import Any
 
 from . import procfs
-from .codex_argv import _codex_class, _codex_non_interactive
+from .codex_argv import _codex_class, _codex_non_interactive, codex_app_server
 from .ids import opaque_id
 from .model import UNRESOLVED_NATIVE_ID, Endpoint, EndpointRef, Provider, Runtime
 from .observer_dbus import ObserverRow, ObserverView, agentstatus_view
-from .paths import claude_sessions_dir, codex_home, codex_sqlite_home, grok_home
+from .paths import claude_sessions_dir, codex_home as default_codex_home, codex_sqlite_home, grok_home
 
 MAX_REGISTRY_FILES = 256
 # 允许 observer 证据比注册表状态时刻早多少：实测正常后台窗口里早约 0.09 秒，漏 hook 时差一整轮（§45.37）
@@ -43,6 +44,19 @@ _REGISTRY_NAME = re.compile(r"[0-9]+\.json")
 # 取 thread 段（DESIGN §45.48 R6）
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _ROLLOUT = re.compile(rf"/rollout-[^/]*-(?P<uuid>{_UUID})(?:_{_UUID})?\.jsonl$")
+# writer lock：`<codex_home>/thread-writer-locks/<thread>.lock`；释放即删，别的进程瞬时撞上的显示 ` (deleted)`，全匹配自然排除
+_WRITER_LOCK = re.compile(rf"(?P<uuid>{_UUID})\.lock")
+# observer 按标题给 hook 定 pane 时前缀的最短长度（与 `agentstatus.adapters.tmux_title._HOOK_PREFIX_MIN` 相同，
+# 两边由 test_codex_hook_mode 对齐）：桥按持有集核对唯一，短前缀也能认；observer 没有持有集，短于它就不认
+OBSERVER_HOOK_PREFIX_MIN = 29
+# Codex 标题末段的 thread-id 项（DESIGN §53.3.1）：至少到第 4 组（20 个 hex，过了 UUIDv7 的时间戳与版本位），
+# 可带上游 32 字符截断的 `...` 与自动生成标题期间的 ` <Braille spinner>`
+_TITLE_THREAD_ID = re.compile(
+    r"(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}(?:-[0-9a-f]{1,12})?)(?:\.\.\.)?(?: [\u2800-\u28ff])?",
+    re.IGNORECASE,
+)
+# 标题任意位置的 UUID 形状：只给 doctor 区分「配了但没放在末尾或与 spinner 粘连」
+_TITLE_UUID_SHAPE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}", re.IGNORECASE)
 # Codex 状态库：`state_<版本>.sqlite`；版本号编进文件名，两个 Codex 版本可能共用一个目录（DESIGN §45.48 R2）
 _CODEX_STATE_DB = re.compile(r"state_(?P<version>[0-9]{1,4})\.sqlite")
 # 单元变体的 SessionSource 在状态库里存成裸字符串（如 `cli`），对象变体存 JSON 文本
@@ -69,6 +83,25 @@ class PaneInfo:
     pane_pid: int
     session_name: str
     server_pid: int | None = None
+    # 标题末段解析出的 thread-id 前缀（小写）；原始标题不进这里（DESIGN §53.3.2）
+    thread_prefix: str | None = None
+    # 标题任意位置有 UUID 形状（只给 doctor 用）
+    title_has_uuid: bool = False
+
+
+def title_thread_prefix(title: str) -> str | None:
+    """取 Codex 标题末段的 thread-id 前缀（小写）；末段不是这个形状就返回 None（DESIGN §53.3.1）。
+
+    只看按 ` | ` 切开后的最后一段：用户的 thread 名可能就像 hex，`thread-title` 回退出的完整 UUID 也不在末段。
+    """
+    match = _TITLE_THREAD_ID.fullmatch(title.rsplit(" | ", 1)[-1].strip())
+    return match.group("id").lower() if match is not None else None
+
+
+def _with_title(pane: PaneInfo, title: str | None) -> PaneInfo:
+    if title is None:
+        return pane
+    return replace(pane, thread_prefix=title_thread_prefix(title), title_has_uuid=_TITLE_UUID_SHAPE.search(title) is not None)
 
 
 def tmux_panes() -> dict[int, PaneInfo]:
@@ -102,6 +135,36 @@ def tmux_panes() -> dict[int, PaneInfo]:
             pane_id=parts[1], pane_pid=int(parts[0]), session_name=parts[3][:80], server_pid=int(parts[2])
         )
     return panes
+
+
+def tmux_pane_titles() -> dict[str, str]:
+    """读取各 pane 的标题（只读 list-panes）：pane_id → 原始标题，只在内存里用于抽 thread-id；tmux 不可用时返回空。
+
+    与 `tmux_panes` 分两次调用：现有格式里 `session_name` 放最后并允许含 tab，两个自由文本字段只能有一个
+    放末尾（DESIGN §53.3.2）。两次之间 pane 有变化时，对不上的 pane 当作没有标题，下次发现即恢复。
+    `-u` 让 tmux 不看调用方的 locale 也按 UTF-8 输出：非 UTF-8 环境下 tmux 会把 spinner 换成 `_`，
+    标题生成那几秒就认不出 thread-id（Opus 实现复核 P3-3）。
+    """
+    try:
+        completed = subprocess.run(
+            ["tmux", "-u", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=3.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode != 0:
+        return {}
+    titles: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        pane_id, separator, title = line.partition("\t")
+        if separator and re.fullmatch(r"%[0-9]+", pane_id):
+            titles[pane_id] = title
+    return titles
 
 
 def _evidence_covers(evidence_at: float | None, status_at_ms: Any) -> bool:
@@ -147,17 +210,23 @@ class DiscoverySources:
 
     proc_root: Path = procfs.DEFAULT_PROC
     claude_sessions: Path = field(default_factory=claude_sessions_dir)
-    codex_home: Path = field(default_factory=codex_home)
+    codex_home: Path = field(default_factory=default_codex_home)
     # Codex 状态库所在目录；上游 `CODEX_SQLITE_HOME` 覆盖 codex_home（DESIGN §45.48 R2）
     codex_sqlite_home: Path | None = field(default_factory=codex_sqlite_home)
     grok_home: Path = field(default_factory=grok_home)
     panes: Callable[[], Mapping[int, PaneInfo]] = tmux_panes
+    # pane_id → 原始标题（DESIGN §53.3.2）；测试给原始标题，经生产解析函数抽 thread-id
+    titles: Callable[[], Mapping[str, str]] = tmux_pane_titles
     runtime: Callable[[], ObserverView] = agentstatus_view
     uid: int = field(default_factory=os.getuid)
 
 
 def _pane_for(pid: int, panes: Mapping[int, PaneInfo], proc_root: Path) -> PaneInfo | None:
     for info in procfs.ancestry(pid, proc_root):
+        if info.comm == "codex" and codex_app_server(procfs.launch_tokens(info.pid, proc_root)):
+            # app-server 承载的是各个窗口的 thread，它是第一个 TUI 的子进程：它下面的进程不借那个 TUI 的 pane，
+            # 否则 daemon 工具里起的嵌套 agent 会被算进第一个窗口（DESIGN §53.3.3，Opus 第 1 轮 P2-5）
+            return None
         pane = panes.get(info.pid)
         if pane is not None:
             return pane
@@ -278,117 +347,296 @@ def _codex_source_kind(value: object) -> str | None:
     return "root" if _BARE_SOURCE.fullmatch(value) else None
 
 
-def _classify_codex_threads(sources: DiscoverySources, threads: set[str]) -> dict[str, str]:
-    """只读 Codex 状态库给 thread 分类：返回认得出的 thread → root/subagent；认不出的不在结果里。
+def _codex_source_parent(value: object) -> str | None:
+    """thread_spawn 子代理 `source` 里的 `parent_thread_id`（小写）；其他形态返回 None（DESIGN §53.3.6）。"""
+    if not isinstance(value, str) or not value.startswith("{"):
+        return None
+    try:
+        data = json.loads(value)
+    except ValueError:
+        return None
+    subagent = data.get("subagent") if isinstance(data, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    parent = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
+    return parent.lower() if isinstance(parent, str) and re.fullmatch(_UUID, parent.lower()) else None
+
+
+@dataclass(frozen=True)
+class CodexThreadClasses:
+    """状态库给出的分类：thread → root/subagent、thread_spawn 子代理 → 父 thread，以及库是否不可用。"""
+
+    kinds: dict[str, str] = field(default_factory=dict)
+    parents: dict[str, str] = field(default_factory=dict)
+    # 编号最大的库打不开或查询出错，或者一个库都没有（DESIGN §53.3.6）；旧库可读但查不到行不能掩盖它
+    unavailable: bool = False
+
+
+def _classify_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThreadClasses:
+    """只读 Codex 状态库给 thread 分类；认不出的不在结果里。
 
     只选 `id, source` 两列、只按持有的 thread 查询、`mode=ro` 打开、短超时；按版本号降序逐个探测
-    `state_<n>.sqlite`，取第一个查询成功且能查到任一持有 thread 的库。任何错误都当作「没有分类证据」，
-    调用方据此退回今天的歧义处理，不猜（DESIGN §45.48 R2）。
+    `state_<n>.sqlite`。每个 thread 以有它这一行的最新库为准，旧库只补前面的库里没有的 thread，都找到了就停
+    （Opus 实现复核 P3-2：两个版本共用目录时，daemon 持有的 thread 在新库、旧版 TUI 的 thread 只在旧库，
+    「取第一个有行的库」会把旧版窗口变成未知）。任何错误都当作「没有分类证据」，调用方据此退回今天的歧义处理，
+    不猜（DESIGN §45.48 R2）。
     """
     if not threads:
-        return {}
+        return CodexThreadClasses()
     root = sources.codex_sqlite_home or sources.codex_home
     try:
         names = [entry.name for entry in os.scandir(root) if entry.is_file(follow_symlinks=False)]
     except OSError:
-        return {}
+        return CodexThreadClasses(unavailable=True)
     candidates = sorted(
         (int(match.group("version")), name) for name in names if (match := _CODEX_STATE_DB.fullmatch(name))
     )
-    wanted = sorted(threads)
-    for _, name in reversed(candidates):
+    if not candidates:
+        return CodexThreadClasses(unavailable=True)
+    remaining = set(threads)
+    kinds: dict[str, str] = {}
+    parents: dict[str, str] = {}
+    newest_failed = False
+    for position, (_, name) in enumerate(reversed(candidates)):
+        if not remaining:
+            break
         try:
             connection = sqlite3.connect(
                 f"{(root / name).as_uri()}?mode=ro", uri=True, timeout=CODEX_STATE_TIMEOUT_SECONDS
             )
         except (sqlite3.Error, ValueError):
+            newest_failed = newest_failed or position == 0
             continue
         try:
             # 缺表、缺列或库忙都会让这条查询抛 sqlite3.Error，跳到下一个库即可，不另外探列（变异反证 Q09：
             # 探列与查询出错走的是同一个结果，是冗余的防御）
+            wanted = sorted(remaining)
             placeholders = ", ".join("?" for _ in wanted)
             rows = connection.execute(
                 f"SELECT id, source FROM threads WHERE id IN ({placeholders})", wanted
             ).fetchall()
         except sqlite3.Error:
+            newest_failed = newest_failed or position == 0
             continue
         finally:
             connection.close()
-        if not rows:
-            continue
-        kinds: dict[str, str] = {}
         for thread_id, source in rows:
+            if not isinstance(thread_id, str):
+                continue
+            # 有这一行的库就是这个 thread 的依据，source 认不出也不再去旧库找（查询只带还没分到类的 thread）
+            remaining.discard(thread_id.lower())
             kind = _codex_source_kind(source)
-            if isinstance(thread_id, str) and kind is not None:
+            if kind is not None:
                 kinds[thread_id.lower()] = kind
-        return kinds
-    return {}
+                parent = _codex_source_parent(source)
+                if parent is not None:
+                    parents[thread_id.lower()] = parent
+    return CodexThreadClasses(kinds, parents, newest_failed)
+
+
+@dataclass(frozen=True)
+class CodexProcess:
+    """一个 codex 进程的持有情况（DESIGN §53.3.4）：只在内存里，不进端点身份与账本。"""
+
+    info: procfs.ProcessInfo
+    app_server: bool
+    interactive: bool
+    rollouts: frozenset[str]
+    locks: frozenset[str]
+
+    @property
+    def holdings(self) -> frozenset[str]:
+        """rollout 或 writer lock 持有的全部 thread。"""
+        return self.rollouts | self.locks
+
+
+def codex_holdings(pid: int, proc_root: Path, home: Path) -> tuple[frozenset[str], frozenset[str]]:
+    """某个进程持有的 Codex thread：（rollout 持有集，writer lock 持有集）；fd 读不到时两个都是空集。
+
+    持有判定只有这一份实现，发现、doctor、调用者识别与汇报侧代际核对共用（DESIGN §53.3.4）：rollout 只认
+    `<home>/sessions/` 下的 rollout 文件名里的 thread 段；lock 精确比对 `<home>/thread-writer-locks/<thread>.lock`。
+    """
+    sessions_root = str(home / "sessions") + "/"
+    locks_root = str(home / "thread-writer-locks") + "/"
+    rollouts: set[str] = set()
+    locks: set[str] = set()
+    for target in procfs.open_file_targets(pid, proc_root):
+        if target.startswith(sessions_root):
+            match = _ROLLOUT.search(target)
+            if match is not None:
+                # 同一 thread 的普通与回退后两种文件同时打开时自然去重
+                rollouts.add(match.group("uuid"))
+        elif target.startswith(locks_root):
+            lock = _WRITER_LOCK.fullmatch(target[len(locks_root):])
+            if lock is not None:
+                locks.add(lock.group("uuid"))
+    return frozenset(rollouts), frozenset(locks)
+
+
+def scan_codex_holdings(proc_root: Path, home: Path) -> dict[int, CodexProcess]:
+    """本机全部 codex 进程的持有情况；发现与 doctor 共用（DESIGN §53.3.4）。"""
+    processes: dict[int, CodexProcess] = {}
+    for pid in procfs.list_pids(proc_root):
+        info = procfs.read_process(pid, proc_root)
+        if info is None or info.comm != "codex":
+            continue
+        tokens = procfs.launch_tokens(pid, proc_root)
+        rollouts, locks = codex_holdings(pid, proc_root, home)
+        processes[pid] = CodexProcess(info, codex_app_server(tokens), not _codex_non_interactive(tokens), rollouts, locks)
+    return processes
+
+
+def codex_daemon_mode(processes: Mapping[int, CodexProcess]) -> bool:
+    """有持有 thread 的 app-server 进程就是 daemon 模式；不看 `--managed-daemon` 参数（DESIGN §53.3.4）。"""
+    return any(process.app_server and process.holdings for process in processes.values())
 
 
 def _discover_codex(
     sources: DiscoverySources, panes: Mapping[int, PaneInfo], runtime: ObserverView
 ) -> list[Endpoint]:
-    sessions_root = str(sources.codex_home / "sessions") + "/"
-    processes: dict[int, tuple[procfs.ProcessInfo, set[str]]] = {}
-    for pid in procfs.list_pids(sources.proc_root):
-        info = procfs.read_process(pid, sources.proc_root)
-        if info is None or info.comm != "codex":
-            continue
-        threads: set[str] = set()
-        for target in procfs.open_file_targets(pid, sources.proc_root):
-            if not target.startswith(sessions_root):
-                continue
-            match = _ROLLOUT.search(target)
-            if match is not None:
-                # 同一 thread 的普通与回退后两种文件同时打开时自然去重
-                threads.add(match.group("uuid"))
-        processes[pid] = (info, threads)
-    # 同一 thread 被几个进程打开（含非终端进程）：多于一个时消费者不唯一。在过滤非交互进程之前统计，
-    # 并随端点按 thread 保留，解析出身份后按该 thread 重算（DESIGN §45.48 R1、Codex F03）
-    consumers = Counter(thread for _, threads in processes.values() for thread in threads)
+    processes = scan_codex_holdings(sources.proc_root, sources.codex_home)
+    # 同一 thread 被几个进程打开 rollout（含非终端进程）：多于一个时消费者不唯一。在过滤非交互进程之前统计，
+    # 并随端点按 thread 保留，解析出身份后按该 thread 重算（DESIGN §45.48 R1、Codex F03）；lock 只认候选、不计消费者
+    # （别的进程扫 stale 锁会瞬时打开锁文件，DESIGN §53.3.6）
+    consumers = Counter(thread for process in processes.values() for thread in process.rollouts)
     # 终端分组只用于本次发现（丢掉同一终端里的启动包装进程），不进会话身份；键带类型，pane 与 tty 不互相混组
-    by_terminal: dict[tuple[object, ...], list[tuple[procfs.ProcessInfo, set[str], PaneInfo | None]]] = {}
-    for pid, (info, threads) in processes.items():
-        if _codex_non_interactive(procfs.launch_tokens(pid, sources.proc_root)):
+    by_terminal: dict[tuple[object, ...], list[tuple[CodexProcess, PaneInfo | None]]] = {}
+    for pid, process in processes.items():
+        if not process.interactive:
             continue
         pane = _pane_for(pid, panes, sources.proc_root)
         if pane is not None:
             group: tuple[object, ...] = ("pane", pane.server_pid, pane.pane_id)
-        elif info.tty_nr:
-            group = ("tty", info.tty_nr)  # 不经 tmux 的终端会话：控制终端是候选门槛，不证明是 TUI
+        elif process.info.tty_nr:
+            group = ("tty", process.info.tty_nr)  # 不经 tmux 的终端会话：控制终端是候选门槛，不证明是 TUI
         else:
             continue  # 既无 pane 又无控制终端：app-server、SDK、Desktop 等
-        by_terminal.setdefault(group, []).append((info, threads, pane))
-    for group_key, candidates in list(by_terminal.items()):
-        # 同一 pane 里的启动包装进程没有 rollout，只保留真正持有 thread 的进程
-        if any(threads for _, threads, _ in candidates):
-            by_terminal[group_key] = [candidate for candidate in candidates if candidate[1]]
-    # 所有交互进程的持有集合合并成一次查询（包括只有一个 thread 的，Codex §45.48 第二轮 R01）
-    kinds = _classify_codex_threads(
-        sources, {thread for candidates in by_terminal.values() for _, threads, _ in candidates for thread in threads}
-    )
+        by_terminal.setdefault(group, []).append((process, pane))
+    daemon_mode = codex_daemon_mode(processes)
+    legacy: list[list[tuple[CodexProcess, PaneInfo | None]]] = []
+    titled: dict[tuple[object, ...], list[tuple[CodexProcess, PaneInfo | None]]] = {}
+    for group_key, members in by_terminal.items():
+        if any(process.rollouts for process, _ in members):
+            # 交互进程自己持有 rollout（`--no-daemon` 或 ≤0.156）：旧路径，只保留真正持有 thread 的进程
+            legacy.append([member for member in members if member[0].rollouts])
+        elif daemon_mode:
+            titled[group_key] = members  # 托管 daemon 承载：按标题认领（DESIGN §53.3.5）
+        else:
+            legacy.append(members)  # 没有 daemon 持有任何 thread：照旧 no_thread_yet
+    legacy_threads = {thread for members in legacy for process, _ in members for thread in process.rollouts}
+    bindable_pool: set[str] = set()
+    if titled:
+        bindable_pool = {
+            thread for process in processes.values() if process.app_server for thread in process.holdings
+        } | {thread for members in titled.values() for process, _ in members for thread in process.holdings}
+    # 所有需要分类的 thread 合并成一次查询（包括只有一个 thread 的，Codex §45.48 第二轮 R01）
+    classes = _classify_codex_threads(sources, legacy_threads | bindable_pool)
     endpoints: list[Endpoint] = []
-    for candidates in by_terminal.values():
-        for info, threads, pane in candidates:
-            state = runtime.get(pane.pane_id) if pane is not None else None
-            base = Endpoint(
-                ref=EndpointRef(
-                    provider=Provider.CODEX,
-                    native_id=UNRESOLVED_NATIVE_ID,
-                    pid=info.pid,
-                    start_ticks=info.start_ticks,
-                    pane=pane.pane_id if pane is not None else None,
-                    label=pane.session_name if pane is not None else None,
-                    server_pid=pane.server_pid if pane is not None else None,
-                ),
-                runtime=state if state is not None else Runtime.UNKNOWN,
-                runtime_source="agentstatus" if state is not None else "none",
-                consumers=0,
-                threads=tuple(sorted(threads)),
-                thread_consumers=tuple((thread, consumers[thread]) for thread in sorted(threads)),
-            )
-            endpoints.extend(_codex_endpoints_for(base, threads, kinds))
+    for members in legacy:
+        for process, pane in members:
+            base = _codex_base(process, pane, runtime, process.rollouts, consumers)
+            endpoints.extend(_codex_endpoints_for(base, set(process.rollouts), classes.kinds))
+    for members in titled.values():
+        endpoints.append(
+            _codex_titled_endpoint(sources.proc_root, members, processes, classes, consumers, runtime)
+        )
     return endpoints
+
+
+def _codex_base(
+    process: CodexProcess,
+    pane: PaneInfo | None,
+    runtime: ObserverView,
+    threads: Collection[str],
+    consumers: Mapping[str, int],
+) -> Endpoint:
+    state = runtime.get(pane.pane_id) if pane is not None else None
+    return Endpoint(
+        ref=EndpointRef(
+            provider=Provider.CODEX,
+            native_id=UNRESOLVED_NATIVE_ID,
+            pid=process.info.pid,
+            start_ticks=process.info.start_ticks,
+            pane=pane.pane_id if pane is not None else None,
+            label=pane.session_name if pane is not None else None,
+            server_pid=pane.server_pid if pane is not None else None,
+        ),
+        runtime=state if state is not None else Runtime.UNKNOWN,
+        runtime_source="agentstatus" if state is not None else "none",
+        consumers=0,
+        threads=tuple(sorted(threads)),
+        thread_consumers=tuple((thread, consumers.get(thread, 0)) for thread in sorted(threads)),
+    )
+
+
+def _outermost(
+    members: Sequence[tuple[CodexProcess, PaneInfo | None]], proc_root: Path
+) -> tuple[CodexProcess, PaneInfo | None] | None:
+    """组里「是其余全部进程祖先」的那个进程；没有唯一的就返回 None（与 observer `_find_unique_agent_process` 同规则）。"""
+    ancestors = {process.info.pid: {info.pid for info in procfs.ancestry(process.info.pid, proc_root)} for process, _ in members}
+    found = [
+        member
+        for member in members
+        if all(member[0].info.pid in ancestors[other.info.pid] for other, _ in members)
+    ]
+    return found[0] if len(found) == 1 else None
+
+
+def _codex_title_root(thread: str, bindable: Collection[str], classes: CodexThreadClasses) -> str | None:
+    """标题显示的 thread 对应的根：根或未知就是它自己；thread_spawn 子代理沿父 id 上溯，最多 8 层、每层都要可绑定。
+
+    未知按根（DESIGN §53.3.6，与 §45.48 R2 同一个功能优先口径）；父不可绑定、超层、成环或没有父 id 的子代理返回 None。
+    """
+    current = thread
+    seen: set[str] = set()
+    for _ in range(9):  # 自身加最多 8 层父
+        if classes.kinds.get(current) != "subagent":
+            return current
+        parent = classes.parents.get(current)
+        if parent is None or parent not in bindable or parent in seen or parent == current:
+            return None
+        seen.add(current)
+        current = parent
+    return None
+
+
+def _codex_titled_endpoint(
+    proc_root: Path,
+    members: Sequence[tuple[CodexProcess, PaneInfo | None]],
+    processes: Mapping[int, CodexProcess],
+    classes: CodexThreadClasses,
+    consumers: Mapping[str, int],
+    runtime: ObserverView,
+) -> Endpoint:
+    """新路径：每组一个最外层端点，按标题 thread-id 在可绑定集合里唯一前缀认领（DESIGN §53.3.6）。
+
+    可绑定集合 =（app-server 持有 ∪ 本组持有）− 别组交互进程持有：残留标题不能把窗口绑到别的窗口的 thread 上。
+    未绑定的端点 `threads=()`，不挂可绑定集合，否则任何 thread 都会命中所有未绑定端点（代码地图陷阱 d）。
+    """
+    outer = _outermost(members, proc_root)
+    process, pane = outer if outer is not None else min(members, key=lambda member: member[0].info.pid)
+    if outer is None:
+        return replace(_codex_base(process, pane, runtime, (), consumers), issues=("pane_process_ambiguous",))
+    in_group = {member.info.pid for member, _ in members}
+    others = {
+        thread
+        for pid, other in processes.items()
+        if other.interactive and pid not in in_group
+        for thread in other.holdings
+    }
+    bindable = (
+        {thread for other in processes.values() if other.app_server for thread in other.holdings}
+        | {thread for member, _ in members for thread in member.holdings}
+    ) - others
+    prefix = pane.thread_prefix if pane is not None else None
+    if prefix is None:
+        return replace(_codex_base(process, pane, runtime, (), consumers), issues=("title_thread_missing",))
+    matches = [thread for thread in bindable if thread.startswith(prefix)]
+    if len(matches) != 1:
+        return replace(_codex_base(process, pane, runtime, (), consumers), issues=("title_thread_unmatched",))
+    root = _codex_title_root(matches[0], bindable, classes)
+    if root is None:
+        return replace(_codex_base(process, pane, runtime, (), consumers), issues=("title_shows_subagent",))
+    return _codex_base(process, pane, runtime, (root,), consumers).for_thread(root)
 
 
 def _codex_endpoints_for(base: Endpoint, threads: set[str], kinds: Mapping[str, str]) -> list[Endpoint]:
@@ -614,7 +862,8 @@ _AGENT_ENV_MARKERS = tuple(marker for adapter in ADAPTERS.values() for marker in
 def discover(sources: DiscoverySources | None = None) -> list[Endpoint]:
     """发现当前可交接的端点，按 provider 与 tmux 会话名排序。"""
     config = sources or DiscoverySources()
-    panes = dict(config.panes())
+    titles = config.titles()
+    panes = {pid: _with_title(pane, titles.get(pane.pane_id)) for pid, pane in config.panes().items()}
     runtime = config.runtime()
     endpoints: list[Endpoint] = []
     for adapter in ADAPTERS.values():
@@ -625,6 +874,37 @@ def discover(sources: DiscoverySources | None = None) -> list[Endpoint]:
         endpoints.extend(found)
     endpoints.sort(key=lambda item: (item.ref.provider.value, item.ref.label or "", item.ref.pane or ""))
     return endpoints
+
+
+def codex_title_report(sources: DiscoverySources | None = None) -> dict[str, object]:
+    """doctor 用：daemon 模式与 Codex 窗口标题里会话 id 的三类计数（DESIGN §53.5）。
+
+    只给计数与布尔，不给标题、thread id 或 pane 标签。三类：末段认出 thread-id；认不出但标题里有 UUID 形状
+    （没放在末尾，或末段与 spinner 粘连）；都没有。认出的里面另数前缀被尾截短的（observer 不认，hook 结局
+    不公开；Opus 实现复核第 2 轮 P3-3）。状态库不可用另报一项；不是 daemon 模式时只报这一点。
+    """
+    config = sources or DiscoverySources()
+    processes = scan_codex_holdings(config.proc_root, config.codex_home)
+    if not codex_daemon_mode(processes):
+        return {"daemonMode": False}
+    titles = config.titles()
+    panes = {pid: _with_title(pane, titles.get(pane.pane_id)) for pid, pane in config.panes().items()}
+    seen: dict[str, PaneInfo] = {}
+    for pid, process in processes.items():
+        if process.interactive and (pane := _pane_for(pid, panes, config.proc_root)) is not None:
+            seen[pane.pane_id] = pane
+    with_id = sum(1 for pane in seen.values() if pane.thread_prefix is not None)
+    short = sum(1 for pane in seen.values() if pane.thread_prefix is not None and len(pane.thread_prefix) < OBSERVER_HOOK_PREFIX_MIN)
+    not_parsed = sum(1 for pane in seen.values() if pane.thread_prefix is None and pane.title_has_uuid)
+    held = {thread for process in processes.values() if process.app_server for thread in process.holdings}
+    return {
+        "daemonMode": True,
+        "withThreadId": with_id,
+        "shortThreadId": short,
+        "uuidNotParsed": not_parsed,
+        "withoutThreadId": len(seen) - with_id - not_parsed,
+        "stateDbUnavailable": _classify_codex_threads(config, held).unavailable,
+    }
 
 
 class ResolveError(Exception):
@@ -712,6 +992,7 @@ def identify_caller(
     pid: int | None = None,
     proc_root: Path = procfs.DEFAULT_PROC,
     environ: Mapping[str, str] | None = None,
+    codex_home: Path | None = None,
 ) -> Caller:
     """找出调用者所在的 agent 会话；用于报告归属，防止串任务。
 
@@ -725,6 +1006,8 @@ def identify_caller(
 
     只有完全看不到 agent 祖先进程时（例如沙箱 PID 命名空间）才退回按环境变量正向匹配全部端点；此时多个
     provider 的变量都能匹配则按注册表顺序取第一个，这是启发式而非身份证明，作为既有限制记在 DESIGN §45.34。
+
+    最近的 codex 祖先是 app-server（Codex 托管 daemon）时另走 `_codex_daemon_caller`（DESIGN §53.4）。
     """
     env = os.environ if environ is None else environ
     chain = procfs.ancestry(pid if pid is not None else os.getpid(), proc_root)
@@ -733,9 +1016,18 @@ def identify_caller(
     for item in endpoints:
         by_pid.setdefault(item.ref.pid, []).append(item)
     codex_identity = _codex_env_identity(env)
-    for info in chain:
+    for index, info in enumerate(chain):
         candidates = [item for item in by_pid.get(info.pid, ()) if item.ref.start_ticks == info.start_ticks]
         if info.comm == "codex" and codex_identity is not None:
+            if codex_app_server(procfs.launch_tokens(info.pid, proc_root)):
+                # daemon 是第一个 TUI 的子进程：既不在这里按 pid 找候选，也不往上走到那个 TUI（DESIGN §53.4.1）
+                return _codex_daemon_caller(
+                    codex_identity, info, endpoints, agent_env, proc_root, codex_home or default_codex_home()
+                )
+            if not candidates and not _codex_non_interactive(procfs.launch_tokens(info.pid, proc_root)):
+                candidates = _codex_wrapper_candidates(
+                    chain[index + 1 :], by_pid, proc_root, codex_identity[1], codex_home or default_codex_home()
+                )
             # 在唯一候选快路径之前统一判定 Codex 调用者，不以本轮看到几个 fd 为前提（DESIGN §45.48 R3）
             return _codex_caller(codex_identity, info, candidates, agent_env)
         if len(candidates) == 1:
@@ -754,6 +1046,38 @@ def identify_caller(
         visible = info if info is not None and info.start_ticks == found.ref.start_ticks else None
         return Caller(found, visible, "environment", agent_env)
     return Caller(None, None, None, agent_env)
+
+
+def _codex_wrapper_candidates(
+    outer: list[procfs.ProcessInfo], by_pid: dict[int, list[Endpoint]], proc_root: Path, thread: str, home: Path
+) -> list[Endpoint]:
+    """标题路径每组只出最外层端点（包装进程）：内层 TUI 自己执行工具时按它的 pid 找不到候选，沿紧邻的
+    连续 codex 祖先补找（Opus 实现复核 P3-1：包装进程 + `--no-daemon` TUI，TUI 暂时没有 rollout 时）。
+
+    不借外层会话的身份（Codex 复审 R01）：
+    - 只走同一条包装链，遇到非 codex 进程（shell 等）或 app-server 就停；
+    - shell 对单条 `-c` 命令做 exec 优化，旧路径 TUI 用工具起的 `codex exec`、嵌套 codex 会是它的直接子进程，
+      所以调用方只限交互进程（`codex exec` 保持认不出），借来的端点还要身份相容：已绑定的必须就是调用者的
+      thread `T`；未绑定的（标题路径里没认出 thread）还要证明它是包装层——纯包装进程自己不持有别的 thread，
+      真 TUI 至少持有自己 thread 的 lock（Opus 实现复核第 2 轮 P2-1、Codex 第 2 轮 R01）；
+    - 每往外走一层都核对：中间隔着一个持有别的 thread 的 codex，那就是另一个会话，不再往外借（Opus 第 3 轮 P3-1）。
+    """
+    for info in outer:
+        if info.comm != "codex" or codex_app_server(procfs.launch_tokens(info.pid, proc_root)):
+            return []
+        rollouts, locks = codex_holdings(info.pid, proc_root, home)
+        wrapper_only = (rollouts | locks) <= {thread}
+        found = [item for item in by_pid.get(info.pid, ()) if item.ref.start_ticks == info.start_ticks]
+        if found:
+            return [
+                item
+                for item in found
+                if item.ref.native_id.lower() == thread
+                or (item.ref.native_id == UNRESOLVED_NATIVE_ID and not item.threads and wrapper_only)
+            ]
+        if not wrapper_only:
+            return []
+    return []
 
 
 def _codex_caller(
@@ -776,6 +1100,42 @@ def _codex_caller(
         holding = [item for item in candidates if item.holds(thread)]
         return Caller((holding or candidates)[0].for_thread(thread), info, "environment", agent_env)
     return Caller(None, info, None, agent_env)
+
+
+def _codex_daemon_caller(
+    identity: tuple[str, str],
+    daemon: procfs.ProcessInfo,
+    endpoints: list[Endpoint],
+    agent_env: bool,
+    proc_root: Path,
+    home: Path,
+) -> Caller:
+    """最近的 codex 祖先是 app-server 时的调用者（DESIGN §53.4.1）。
+
+    身份取上游注入的根 thread T，并要求这个 app-server 确实持有 T（直接读它的 fd，lock 或 rollout）：
+    T 恰好显示在一个窗口就是那个窗口的端点，进程信息取 TUI；没有窗口或多个窗口显示时，用 app-server
+    自身作调用者端点，没有 pane。子代理照旧拒绝。
+    """
+    kind, thread = identity
+    if kind == "subagent":
+        return Caller(None, daemon, None, agent_env, rejection="subagent")
+    rollouts, locks = codex_holdings(daemon.pid, proc_root, home)
+    if thread not in rollouts and thread not in locks:
+        return Caller(None, daemon, None, agent_env)
+    bound = [
+        item for item in endpoints if item.ref.provider is Provider.CODEX and item.ref.native_id.lower() == thread
+    ]
+    if len(bound) == 1:
+        tui = procfs.read_process(bound[0].ref.pid, proc_root)
+        visible = tui if tui is not None and tui.start_ticks == bound[0].ref.start_ticks else None
+        return Caller(bound[0], visible, "daemon", agent_env)
+    own = Endpoint(
+        ref=EndpointRef(
+            provider=Provider.CODEX, native_id=thread, pid=daemon.pid, start_ticks=daemon.start_ticks, pane=None
+        ),
+        threads=(thread,),
+    )
+    return Caller(own, daemon, "daemon", agent_env)
 
 
 def _caller_from_env(
@@ -814,6 +1174,8 @@ def permission_class(
     - Claude：只认启动参数中的明确模式；运行中切换无法从外部确认，未声明即未知。
     - Codex：按启动参数、-c 覆盖、profile 与 config.toml 的优先级判断；无法确定即未知。
     - 有 agent 迹象但看不到其进程：未知，不冒称 bypass。
+    - Codex app-server（托管 daemon 等）：固定未知。它的 argv 没有权限参数，按 config.toml 推会在全局 yolo 配置下
+      冒称 bypass；thread 的实际权限由当初加载它的一方决定（DESIGN §53.4.4，Opus 第 2 轮 P2-1）。
     """
     agent = caller.agent_process
     if agent is None and caller.endpoint is not None:
@@ -834,5 +1196,7 @@ def permission_class(
             return "bypass" if mode == "bypassPermissions" else "prompting"
         return None
     if agent.comm == "codex":
-        return _codex_class(tokens, codex_config or (codex_home() / "config.toml"))
+        if codex_app_server(tokens):
+            return None
+        return _codex_class(tokens, codex_config or (default_codex_home() / "config.toml"))
     return None

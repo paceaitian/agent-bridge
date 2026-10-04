@@ -50,6 +50,8 @@ class DiscoveryTests(unittest.TestCase):
         self.codex_home = self.root / "codex"
         self.grok_home = self.root / "grok"
         self.panes: dict[int, PaneInfo] = {}
+        # pane_id → 原始标题；给定才有，默认不读真实 tmux（DESIGN §53.3.2）
+        self.titles: dict[str, str] = {}
         self.runtime: dict[str, Runtime] = {}
         self.evidence: dict[str, float] = {}
         self.observer_pane: dict[str, str | None] = {}
@@ -69,6 +71,7 @@ class DiscoveryTests(unittest.TestCase):
             codex_sqlite_home=None,
             grok_home=self.grok_home,
             panes=lambda: self.panes,
+            titles=lambda: self.titles,
             runtime=lambda: self._view(),
         )
 

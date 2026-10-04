@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import textwrap
+import time
 import unittest
 from unittest.mock import patch
 import uuid
@@ -416,6 +417,46 @@ class PatchTargetGuardTests(unittest.TestCase):
             with self.subTest(case=label):
                 self.assertRed(body, "patch-target", imports="from PKG import cli, endpoints\n")
 
+    def test_import_name_rebound_in_the_same_scope_keeps_both_candidates(self) -> None:
+        # Codex 补审② F01 反例 A：import 别名又被重新赋值，实际 patch 的是重新赋的那个模块（回导出），函数内与模块层都要红
+        rebind = "from PKG import observer as target, endpoints\ntarget = endpoints\n"
+        self.assertRed(rebind + "with patch.object(target, '_observer_rows'):\n    pass\n", "patch-target")
+        self.assertRed("with patch.object(target, '_observer_rows'):\n    pass\n", "patch-target", imports=rebind)
+        # 对照：直接 patch 定义方照常是绿
+        self.assertGreen("with patch.object(observer, '_observer_rows'):\n    pass\n", imports="from PKG import observer\n")
+
+    def test_same_name_imported_from_two_sources_keeps_both(self) -> None:
+        # Codex 补审② 复验 R01：两个分支各 import 一个模块到同一本地名，后一条不能覆盖前一条；
+        # 实际命中回导出方 endpoints 时 patch 无效，必须红；再经一次赋值转手也一样
+        branches = "if sys.argv:\n    from PKG import endpoints as target\nelse:\n    from PKG import observer as target\n"
+        reversed_branches = "if sys.argv:\n    from PKG import observer as target\nelse:\n    from PKG import endpoints as target\n"
+        patched = "with patch.object({}, '_observer_rows'):\n    pass\n"
+        cases = {
+            "函数内": dict(body=branches + patched.format("target")),
+            "函数内反序": dict(body=reversed_branches + patched.format("target")),
+            "模块层": dict(body=patched.format("target"), imports=branches),
+            "赋值转手": dict(body=branches + "chosen = target\n" + patched.format("chosen")),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(case=label):
+                self.assertRed(rule="patch-target", **kwargs)  # type: ignore[arg-type]
+        # 对照：两支来自同一定义方（含同源重复 import）照常是绿
+        same = "if sys.argv:\n    from PKG import observer as target\nelse:\n    from PKG import observer as target\n"
+        self.assertGreen(same + patched.format("target"), judged=1)
+
+    def test_nonliteral_candidate_is_not_hidden_by_a_resolvable_one(self) -> None:
+        # 反例 B：条件表达式一支可解析、另一支是非字面量，仍然要求放行说明
+        forms = {
+            "import_module": "name = 'PKG.endpoints'\n"
+                             "target = observer if sys.argv else importlib.import_module(name)\n"
+                             "with patch.object(target, '_observer_rows'):\n    pass\n",
+            "__import__": "target = observer if sys.argv else __import__('PKG.endpoints', fromlist=['_observer_rows'])\n"
+                          "with patch.object(target, '_observer_rows'):\n    pass\n",
+        }
+        for label, body in forms.items():
+            with self.subTest(form=label):
+                self.assertRed(body, "patch-nonliteral", imports="from PKG import observer\n")
+
     def test_dunder_import_is_nonliteral(self) -> None:
         body = "m = __import__('PKG.endpoints')\nwith patch.object(m, '_observer_rows'):\n    pass\n"
         self.assertRed(body, "patch-nonliteral")
@@ -638,6 +679,103 @@ class MovedRegistryGuardTests(unittest.TestCase):
             "user.py": "from .new import f\n\nTABLE = [f]\n\n\nclass D:\n    runtime = f\n",
         }
         self.assertRule(files, None)
+
+    def test_pure_hold_through_a_renaming_transit_module(self) -> None:
+        # Codex 补审② F02：第一层改名 import 并真的读取，第二层按改名后的名字转手却一次不读，也要红
+        files = {
+            "new.py": "def f():\n    return 1\n",
+            "transit.py": "from .new import f as moved\n\n\ndef use():\n    return moved()\n",
+            "holder.py": "from .transit import moved\n",
+        }
+        self.assertRule(files, "moved-pure-hold")
+        # 对照：转手的是同一模块里没有搬移的别的名字，不算
+        files = {
+            "new.py": "def f():\n    return 1\n\n\ndef g():\n    return 2\n",
+            "transit.py": "from .new import f as moved, g as other\n\n\ndef use():\n    return moved(), other()\n",
+            "holder.py": "from .transit import other\n",
+        }
+        self.assertRule(files, None)
+
+    def test_same_local_name_with_several_sources_in_the_transit_module(self) -> None:
+        # Codex 补审② 复验 R02：中间模块同一本地名有多个 import 来源，不能只认首条
+        transit = "{}\n\n\ndef use():\n    return item\n"
+        holder = {"holder.py": "from .transit import item\n"}
+        base = {"new.py": "def f():\n    return 1\n\n\ndef g():\n    return 2\n", "other.py": "def h():\n    return 3\n"}
+        ambiguous = {
+            "先别的后搬移": "from .other import h as item\nfrom .new import f as item",
+            "先搬移后别的": "from .new import f as item\nfrom .new import g as item",
+            "分支": "import sys\n\nif sys.argv:\n    from .new import f as item\nelse:\n    from .other import h as item",
+            # 第 3 轮见证：中间模块自己又定义了同名对象，定义也是一个来源
+            "本模块又定义同名": "from .new import f as item\nORIGINAL = item\n\n\ndef item():\n    return ORIGINAL()",
+        }
+        for label, imports in ambiguous.items():
+            with self.subTest(case=label):
+                rules = {finding.rule for finding in self._findings({**base, "transit.py": transit.format(imports), **holder})}
+                # 来源混杂时给歧义诊断，不冒充确定的纯持有
+                self.assertEqual({"moved-ambiguous-hold"}, rules)
+        # 对照：同源重复 import 仍是确定的纯持有
+        self.assertRule({**base, "transit.py": transit.format("from .new import f as item\nfrom .new import f as item"), **holder}, "moved-pure-hold")
+        # 对照：多个来源都不是搬移符号；或持有方真的读了它
+        self.assertRule({**base, "transit.py": transit.format("from .new import g as item\nfrom .other import h as item"), **holder}, None)
+        reading = {"holder.py": "from .transit import item\n\n\ndef run():\n    return item()\n"}
+        self.assertRule({**base, "transit.py": transit.format("from .other import h as item\nfrom .new import f as item"), **reading}, None)
+
+    def test_transit_chain_has_no_depth_cap_and_cycles_terminate(self) -> None:
+        # 复验 N02：旧实现超过 10 层就当作「不是搬移符号」；改为不设层数上限，只按路径断环
+        files = {"new.py": "def f():\n    return 1\n", "t0.py": "from .new import f as x0\n\n\ndef use():\n    return x0\n"}
+        for level in range(1, 12):
+            files[f"t{level}.py"] = f"from .t{level - 1} import x{level - 1} as x{level}\n\n\ndef use():\n    return x{level}\n"
+        files["holder.py"] = "from .t11 import x11\n"
+        self.assertRule(files, "moved-pure-hold")
+        # 互相转手成环：能结束，环外的纯持有照样认得出
+        cycle = {
+            "new.py": "def f():\n    return 1\n",
+            "a.py": "from .new import f as x\nfrom .b import x\n\n\ndef use():\n    return x\n",
+            "b.py": "from .a import x\n\n\ndef use():\n    return x\n",
+            "holder.py": "from .b import x\n",
+        }
+        self.assertRule(cycle, "moved-pure-hold")
+
+    def test_several_registrations_are_all_tracked(self) -> None:
+        # Codex 补审② 第 3 轮 C03：纯持有检查先汇总全部登记身份，任何顺序、重复登记都不能丢掉前面的
+        files = {
+            "new.py": "def f():\n    return 1\n\n\ndef g():\n    return 2\n",
+            "holder_f.py": "from .new import f\n",
+            "holder_g.py": "from .new import g\n",
+        }
+        entries = ["old:f → new:f", "old:g → new:g"]
+        for moves in (entries, entries[::-1], entries + entries):
+            with self.subTest(moves=moves):
+                self.assertEqual(["moved-pure-hold"] * 2, [finding.rule for finding in self._findings(files, moves)])
+        # 两个来源都是登记身份、经同一名字转手：确定的纯持有，只报一次
+        transit = {
+            "new.py": files["new.py"],
+            "transit.py": "from .new import f as x\nfrom .new import g as x\nUSED = x\n",
+            "holder.py": "from .transit import x\n",
+        }
+        self.assertEqual(["moved-pure-hold"], [finding.rule for finding in self._findings(transit, entries)])
+
+    def test_outside_source_is_an_opaque_identity(self) -> None:
+        # 第 3 轮 C02：中间模块同名的另一个来源在包外，不当作空集合；与登记身份混在一起时归歧义，正反两种顺序
+        base = {"new.py": "def f():\n    return 1\n", "holder.py": "from .transit import f\n"}
+        for imports in ("from .new import f\nfrom math import sqrt as f\n", "from math import sqrt as f\nfrom .new import f\n"):
+            with self.subTest(imports=imports):
+                rules = {finding.rule for finding in self._findings({**base, "transit.py": imports + "USED = f\n"})}
+                self.assertEqual({"moved-ambiguous-hold"}, rules)
+        # 对照：持有方直接从包外 import，不是搬移符号
+        self.assertRule({"new.py": base["new.py"], "holder.py": "from math import sqrt as f\n"}, None)
+
+    def test_converging_sources_are_walked_once(self) -> None:
+        # 第 3 轮 C01：每层两个模块、都从上一层两个模块转手的菱形图；按路径展开是指数级，按可达遍历是线性
+        files = {"new.py": "def f():\n    return 1\n", "a0.py": "from .new import f\nUSED = f\n", "b0.py": "from .new import f\nUSED = f\n"}
+        # 24 层：按路径展开要一分钟左右、以断言失败变红，而不是让门禁卡死
+        for level in range(1, 24):
+            for side in "ab":
+                files[f"{side}{level}.py"] = f"from .a{level - 1} import f\nfrom .b{level - 1} import f\nUSED = f\n"
+        files["holder.py"] = "from .a23 import f\n"
+        started = time.monotonic()
+        self.assertRule(files, "moved-pure-hold")
+        self.assertLess(time.monotonic() - started, 10.0)
 
     def test_import_as_alias_is_checked_by_local_name(self) -> None:
         # 照 §49 M6：`from .new import ORDER as _ORDER`，登记 _ORDER 与它的公开别名 ORDER

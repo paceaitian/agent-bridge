@@ -50,6 +50,8 @@ class CodexThreadsBase(unittest.TestCase):
         self.codex_home.mkdir()
         self.sqlite_home: Path | None = None
         self.panes: dict[int, PaneInfo] = {}
+        # pane_id → 原始标题；给定才有，默认不读真实 tmux（DESIGN §53.3.2）
+        self.titles: dict[str, str] = {}
 
     def sources(self) -> DiscoverySources:
         return DiscoverySources(
@@ -59,6 +61,7 @@ class CodexThreadsBase(unittest.TestCase):
             codex_sqlite_home=self.sqlite_home,
             grok_home=self.root / "none",
             panes=lambda: self.panes,
+            titles=lambda: self.titles,
             runtime=lambda: ObserverView({}),
         )
 

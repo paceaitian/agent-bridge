@@ -27,7 +27,8 @@ from agentstatus_bridge.reports import ReportError, ReportInput, apply_report
 from agentstatus_bridge.store import Store, StoreError
 from bridge_support import FakeProc, endpoint, ref
 
-IMPLEMENTER = ref(Provider.CODEX, "impl-thread", pid=1000, pane="%1", label="impl")
+# Codex thread id 用 UUID 形状：代际核对要按 rollout/lock 文件名认持有（DESIGN §53.4.2）
+IMPLEMENTER = ref(Provider.CODEX, "019a0000-1111-7111-8111-111111111111", pid=1000, pane="%1", label="impl")
 REVIEWER = ref(Provider.CLAUDE, "review-session", pid=2000, pane="%2", label="review")
 ORIGIN = ref(Provider.CLAUDE, "origin-session", pid=3000, pane="%3", label="lead")
 
@@ -47,14 +48,14 @@ class ReportTests(unittest.TestCase):
         self.store.close()
         self._tmp.cleanup()
 
-    def _task(self, *, flow: Flow = Flow.REVIEW, origin: EndpointRef | None = ORIGIN):
+    def _task(self, *, flow: Flow = Flow.REVIEW, origin: EndpointRef | None = ORIGIN, target: EndpointRef = IMPLEMENTER):
         task, attempt = self.store.create_task(
             title="实现 X",
             flow=flow,
             origin=origin,
             origin_class="bypass",
             reviewer=REVIEWER if flow is Flow.REVIEW else None,
-            target=IMPLEMENTER,
+            target=target,
             body="原始要求：实现 X",
             refs=[],
             now=self.now,
@@ -282,7 +283,8 @@ class ReportTests(unittest.TestCase):
 
     def test_other_live_generation_of_same_session_cannot_report(self) -> None:
         proc = FakeProc(self.root / "proc")
-        proc.add(1500, comm="codex", start="55")
+        # 实际收件进程仍持有目标 thread 的 rollout：它才是执行者（DESIGN §53.4.2）
+        proc.add(1500, comm="codex", start="55", fds=[self._rollout(IMPLEMENTER.native_id)])
         task, attempt = self._task(flow=Flow.HANDOFF)
         self.store.transition_delivery(
             attempt.id,
@@ -303,6 +305,7 @@ class ReportTests(unittest.TestCase):
                     now=self.now,
                     cwd=self.root,
                     proc_root=proc.root,
+                    codex_home=self.root / "codex",
                 )
             except ReportError as error:
                 return error.code
@@ -331,6 +334,69 @@ class ReportTests(unittest.TestCase):
             proc_root=proc.root,
         )
         self.assertEqual(outcome.attempt.work, Work.ACKNOWLEDGED)
+
+    def _rollout(self, thread: str, home: str = "codex") -> str:
+        return str(self.root / home / "sessions/2026/10/03" / f"rollout-2026-10-03T08-00-00-{thread}.jsonl")
+
+    def _lock(self, thread: str, home: str = "codex") -> str:
+        return str(self.root / home / "thread-writer-locks" / f"{thread}.lock")
+
+    def _delivered_to_1500(self, target: EndpointRef, fds: list[str], *, readable: bool = True) -> str:
+        """投递记下 1500 号进程（仍是同一代），换一个同会话进程（1000）汇报，返回结果码。"""
+        root = self.root / f"proc-{len(list(self.root.glob('proc-*')))}"
+        proc = FakeProc(root)
+        proc.add(1500, comm=target.provider.value, start="55", fds=fds)
+        if not readable:
+            # fd 目录读不到：按不持有算，接受汇报（DESIGN §53.4.2）
+            for entry in (root / "1500" / "fd").iterdir():
+                entry.unlink()
+            (root / "1500" / "fd").rmdir()
+        task, attempt = self._task(flow=Flow.HANDOFF, target=target)
+        self.store.transition_delivery(
+            attempt.id,
+            expected=(Delivery.QUEUED,),
+            new=Delivery.QUEUED,
+            reason="test",
+            now=self.now,
+            detail={"deliveredPid": 1500, "deliveredStart": "55"},
+        )
+        try:
+            apply_report(
+                self.store,
+                ReportInput(task_ref=task.id, kind=ReportKind.ACK),
+                caller=agent_caller(target),
+                caller_class="bypass",
+                now=self.now,
+                cwd=self.root,
+                proc_root=root,
+                codex_home=self.root / "codex",
+            )
+        except ReportError as error:
+            return error.code
+        return "ok"
+
+    def test_codex_generation_check_requires_the_delivered_process_to_hold_the_thread(self) -> None:
+        # Codex 的实际执行者是持有 thread 的进程；托管 daemon 下投递记下的 TUI 只是视图（DESIGN §53.4.2）
+        thread = IMPLEMENTER.native_id
+        other = "019a0000-2222-7222-8222-222222222222"
+        cases = {
+            "仍持有 rollout": ([self._rollout(thread)], "reporter_generation_mismatch"),
+            "只持有 lock（rollout 恰好缺席）": ([self._lock(thread)], "reporter_generation_mismatch"),
+            "不持有（daemon 视图）": ([], "ok"),
+            "lock 已删": ([self._lock(thread) + " (deleted)"], "ok"),
+            "别的 thread 的 rollout": ([self._rollout(other)], "ok"),
+            "别的 CODEX_HOME 下同名 lock": ([self._lock(thread, home="elsewhere")], "ok"),
+        }
+        for label, (fds, expected) in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(self._delivered_to_1500(IMPLEMENTER, fds), expected)
+        with self.subTest(case="fd 读不到"):
+            self.assertEqual(self._delivered_to_1500(IMPLEMENTER, [self._rollout(thread)], readable=False), "ok")
+
+    def test_claude_generation_check_is_unchanged(self) -> None:
+        # Claude 进程不持有任何会话文件：实际收件进程仍在就拒，不套用 Codex 的「仍持有」（§53 第 3 轮两方 P2）
+        claude = ref(Provider.CLAUDE, "claude-target", pid=1000, pane="%4", label="peer")
+        self.assertEqual(self._delivered_to_1500(claude, []), "reporter_generation_mismatch")
 
     def test_review_request_inherits_shared_thread_opt_in(self) -> None:
         task, attempt = self.store.create_task(

@@ -436,6 +436,7 @@ class WorkerSpawnInventoryTests(unittest.TestCase):
         "os.fork", "os.forkpty", "os.posix_spawn", "os.posix_spawnp",
     })
     EXPECTED = [
+        ("endpoints.py", ("tmux_pane_titles",), "subprocess.run"),              # tmux 只读标题（DESIGN §53.3.2）
         ("endpoints.py", ("tmux_panes",), "subprocess.run"),                    # tmux 只读发现
         ("reports.py", ("_git_resolve_commit",), "subprocess.run"),             # git rev-parse
         ("transports/codex_queue.py", ("_default_runner",), "subprocess.run"),  # codex CLI

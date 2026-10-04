@@ -89,8 +89,8 @@ _CODEX_MULTI_VALUE_OPTIONS = frozenset({"-i", "--image"})
 _CODEX_TUI_SUBCOMMANDS = frozenset({"agents", "fork", "resume"})
 
 
-def _codex_non_interactive(tokens: Sequence[str]) -> bool:
-    """按有界 argv 判断 Codex 是否以明确的非交互子命令启动（DESIGN §45.33.2、§45.33.6）。
+def _codex_subcommand(tokens: Sequence[str]) -> str | None:
+    """按有界 argv 找出 Codex 的子命令：第一个落在子命令表（非交互或交互）里的 token；没有就返回 None。
 
     跟随上游 0.154 的解析（0.156.0 已按源码逐项核对取值型全局选项，2026-09-22）：跳过已知全局选项及其取值（多值选项的空格写法吞掉后续非选项 token，内联写法只带一个），
     `--` 之后是字面参数；**位置参数之后仍可能出现子命令**（`codex hello exec` 实际进入 exec），所以未知 token 不终止扫描，
@@ -100,7 +100,7 @@ def _codex_non_interactive(tokens: Sequence[str]) -> bool:
     while index < len(tokens):
         token = tokens[index]
         if token == "--":
-            return False
+            return None
         if token.startswith("-"):
             name, inline, _ = token.partition("=")
             if not inline and name in _CODEX_MULTI_VALUE_OPTIONS:
@@ -110,12 +110,25 @@ def _codex_non_interactive(tokens: Sequence[str]) -> bool:
                 continue
             index += 2 if not inline and name in _CODEX_VALUE_OPTIONS else 1
             continue
-        if token in _CODEX_NON_TUI:
-            return True
-        if token in _CODEX_TUI_SUBCOMMANDS:
-            return False
+        if token in _CODEX_NON_TUI or token in _CODEX_TUI_SUBCOMMANDS:
+            return token
         index += 1
-    return False
+    return None
+
+
+def _codex_non_interactive(tokens: Sequence[str]) -> bool:
+    """按有界 argv 判断 Codex 是否以明确的非交互子命令启动（DESIGN §45.33.2、§45.33.6）。"""
+    return _codex_subcommand(tokens) in _CODEX_NON_TUI
+
+
+def codex_app_server(tokens: Sequence[str]) -> bool:
+    """argv 的子命令是不是 `app-server`（DESIGN §53.3.0）。
+
+    托管 daemon、桌面版与插件起的 app-server 都算；`exec`、`review`、`mcp-server` 等别的非交互子命令不算——
+    只有 app-server 会承载别的窗口的 thread。daemon 模式判定、pane 归组停止点、调用者 `D`、hook 模式判定与
+    权限类别五处共用这一个判据。
+    """
+    return _codex_subcommand(tokens) == "app-server"
 
 
 def _toml_string(raw: str) -> str:

@@ -243,14 +243,19 @@ class EndpointRef:
 
 # 这些问题使端点不能作为投递目标；shared_thread 可由调用方显式放行。
 # subagent_only：进程可见的 thread 全是 Codex 子代理，不可作收件人（DESIGN §45.48 R2）
+# title_*：Codex 托管 daemon 下按标题 thread-id 认领失败；pane_process_ambiguous：同一终端组里有多个互不包含的 codex（DESIGN §53.3.8）
 BLOCKING_ISSUES = frozenset(
     {"no_thread_yet", "ambiguous_thread", "subagent_only", "socket_unavailable", "peer_protocol_unsupported",
-     "no_inbox"}
+     "no_inbox", "title_thread_missing", "title_thread_unmatched", "title_shows_subagent", "pane_process_ambiguous"}
 )
 # 认不出是哪个 thread 时的占位 native_id（不是身份，见 EndpointRef.same_session）
 UNRESOLVED_NATIVE_ID = "-"
 # 端点身份未定的问题：按某个 thread 解析出身份后，这些问题对该身份不再成立
-_IDENTITY_ISSUES = frozenset({"no_thread_yet", "ambiguous_thread", "subagent_only", "multiple_roots"})
+# pane_process_ambiguous 说的是进程不是身份，不在此列（DESIGN §53.3.8）
+_IDENTITY_ISSUES = frozenset(
+    {"no_thread_yet", "ambiguous_thread", "subagent_only", "multiple_roots",
+     "title_thread_missing", "title_thread_unmatched", "title_shows_subagent"}
+)
 
 
 @dataclass(frozen=True)

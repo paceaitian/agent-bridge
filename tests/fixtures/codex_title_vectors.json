@@ -1,0 +1,159 @@
+{
+  "_comment": "Codex 标题末段 thread-id 的固定向量：桥与 observer 共用，两边都调用各自的生产解析函数（DESIGN §53.7）。display 是 observer 剔除 thread-id 段后的显示标题（None 表示没有显示标题，走既有兜底；麦克风前缀的 None 是既有的状态解析行为，与 thread-id 无关；Opus 实现复核 P3-5）。",
+  "vectors": [
+    {
+      "case": "上游 32 字符截断（29 位加 ...）",
+      "title": "Ready | vm日常 | Context 12% used | 019b0001-1111-7111-8111-11111...",
+      "prefix": "019b0001-1111-7111-8111-11111",
+      "uuidShape": true,
+      "display": "vm日常"
+    },
+    {
+      "case": "完整 36 字符",
+      "title": "Ready | vm日常 | 019b0001-1111-7111-8111-111111111111",
+      "prefix": "019b0001-1111-7111-8111-111111111111",
+      "uuidShape": true,
+      "display": "vm日常"
+    },
+    {
+      "case": "8-4-4-4（23 字符，下限）",
+      "title": "Ready | proj | 019b0001-1111-7111-8111",
+      "prefix": "019b0001-1111-7111-8111",
+      "uuidShape": true,
+      "display": "proj"
+    },
+    {
+      "case": "8-4-4-4-3（尾截后不带点）",
+      "title": "Ready | proj | 019b0001-1111-7111-8111-111",
+      "prefix": "019b0001-1111-7111-8111-111",
+      "uuidShape": true,
+      "display": "proj"
+    },
+    {
+      "case": "spinner 动画帧",
+      "title": "Working | 019b0001-1111-7111-8111-111111111111 | 019b0001-1111-7111-8111-11111... ⠙",
+      "prefix": "019b0001-1111-7111-8111-11111",
+      "uuidShape": true,
+      "display": "019b0001-1111-7111-8111-111111111111"
+    },
+    {
+      "case": "spinner 固定帧（已命名重新生成）",
+      "title": "Working | 已命名 | 019b0001-1111-7111-8111-11111... ⠋",
+      "prefix": "019b0001-1111-7111-8111-11111",
+      "uuidShape": true,
+      "display": "已命名"
+    },
+    {
+      "case": "大写 hex",
+      "title": "Ready | proj | 019B0001-1111-7111-8111-11111...",
+      "prefix": "019b0001-1111-7111-8111-11111",
+      "uuidShape": true,
+      "display": "proj"
+    },
+    {
+      "case": "action-required",
+      "title": "[ ! ] Action Required | proj | 019b0001-1111-7111-8111-11111...",
+      "prefix": "019b0001-1111-7111-8111-11111",
+      "uuidShape": true,
+      "display": "proj"
+    },
+    {
+      "case": "麦克风收音前缀",
+      "title": "● Ready | proj | 019b0001-1111-7111-8111-11111...",
+      "prefix": "019b0001-1111-7111-8111-11111",
+      "uuidShape": true,
+      "display": null
+    },
+    {
+      "case": "thread-title 回退的完整 UUID 与末段前缀并存",
+      "title": "Ready | 019b0001-1111-7111-8111-111111111111 | 019b0001-1111-7111-8111-11111...",
+      "prefix": "019b0001-1111-7111-8111-11111",
+      "uuidShape": true,
+      "display": "019b0001-1111-7111-8111-111111111111"
+    },
+    {
+      "case": "8-4-4-3（第 4 组不足）",
+      "title": "Ready | proj | 019b0001-1111-7111-811",
+      "prefix": null,
+      "uuidShape": false,
+      "display": "proj | 019b0001-1111-7111-811"
+    },
+    {
+      "case": "8-4-4-4-13（第 5 组超长）",
+      "title": "Ready | proj | 019b0001-1111-7111-8111-1111111111111",
+      "prefix": null,
+      "uuidShape": true,
+      "display": "proj | 019b0001-1111-7111-8111-1111111111111"
+    },
+    {
+      "case": "用户的 thread 名像 hex",
+      "title": "Ready | deadbeef",
+      "prefix": null,
+      "uuidShape": false,
+      "display": "deadbeef"
+    },
+    {
+      "case": "末段为空",
+      "title": "Ready | proj | ",
+      "prefix": null,
+      "uuidShape": false,
+      "display": "proj |"
+    },
+    {
+      "case": "只有 spinner",
+      "title": "Working | proj | ⠙",
+      "prefix": null,
+      "uuidShape": false,
+      "display": "proj | ⠙"
+    },
+    {
+      "case": "截到连字符",
+      "title": "Ready | proj | 019b0001-1111-7111-8111-",
+      "prefix": null,
+      "uuidShape": true,
+      "display": "proj | 019b0001-1111-7111-8111-"
+    },
+    {
+      "case": "截到两点",
+      "title": "Ready | proj | 019b0001-1111-7111-8111-11111..",
+      "prefix": null,
+      "uuidShape": true,
+      "display": "proj | 019b0001-1111-7111-8111-11111.."
+    },
+    {
+      "case": "thread-id 不在末段",
+      "title": "Ready | 019b0001-1111-7111-8111-11111... | Context 12% used",
+      "prefix": null,
+      "uuidShape": true,
+      "display": "019b0001-1111-7111-8111-11111..."
+    },
+    {
+      "case": "末段与 spinner 粘连（紧挨 activity）",
+      "title": "Working ⠙ 019b0001-1111-7111-8111-11111...",
+      "prefix": null,
+      "uuidShape": true,
+      "display": "019b0001-1111-7111-8111-11111..."
+    },
+    {
+      "case": "没有标题",
+      "title": "",
+      "prefix": null,
+      "uuidShape": false,
+      "display": null
+    },
+    {
+      "case": "只有 thread-id 一段（terminal_title 只配 thread-id）",
+      "title": "019b0001-1111-7111-8111-11111...",
+      "prefix": "019b0001-1111-7111-8111-11111",
+      "uuidShape": true,
+      "display": null
+    },
+    {
+      "case": "只有 thread-id 与 spinner",
+      "title": "019b0001-1111-7111-8111-11111... ⠙",
+      "prefix": "019b0001-1111-7111-8111-11111",
+      "uuidShape": true,
+      "display": null
+    }
+  ]
+}
