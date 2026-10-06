@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 import json
 import sqlite3
 from pathlib import Path
@@ -18,6 +18,7 @@ import time
 from . import __version__, procfs, summary
 from .endpoints import (
     Caller,
+    DiscoverySources,
     ResolveError,
     discover,
     identify_caller,
@@ -58,7 +59,7 @@ from .model import (
     work_attempts,
 )
 from .naming import command_name
-from .observer_dbus import agentstatus_panes
+from .observer_dbus import ObserverView, agentstatus_view
 from .paths import device_name, state_dir
 from .reports import ReportError, ReportInput, apply_report, file_reference
 from .store import DB_NAME, MAX_BODY_BYTES, Store, StoreError
@@ -214,7 +215,7 @@ def _hold_hint(target: Endpoint, sender_class: str | None) -> str | None:
 
 
 def _target_hint(
-    attempts: list[Attempt], endpoints: list[Endpoint], panes: Mapping[str, PaneState], now: float
+    attempts: list[Attempt], endpoints: list[Endpoint], view: ObserverView, now: float
 ) -> _TargetHint:
     """当前工作尝试的接收方是否已停下却未汇报，或当前未发现其会话。"""
     working = work_attempts(attempts)
@@ -224,13 +225,35 @@ def _target_hint(
     live, problem = select_generation(current.target, endpoints)
     if target_session_missing(current, live, problem, discovered=bool(endpoints)):
         return _TargetHint(missing=True)
-    pane = panes.get(live.ref.pane) if live is not None and live.ref.pane else None
+    pane = _target_state(view, live) if live is not None and live.ref.pane else None
     return _TargetHint(stopped_at=stopped_without_report(current, live, pane, now=now))
 
 
-def _observations() -> tuple[list[Endpoint], dict[str, PaneState]]:
-    """查询命令用的只读观察：活端点与 AgentStatus pane 快照；任一不可用时提示自然缺席。"""
-    return discover(), agentstatus_panes()
+def _target_state(view: ObserverView, live: Endpoint) -> PaneState | None:
+    """停下提示只认目标自己的行（DESIGN §62 ⑤，候选 C）。
+
+    按活端点算出的 observer 键取行，与摘要的 `endpoint_binding` 同一套键：Codex 按进程代际键；Claude 代际键优先，
+    没有代际行时兼容回退到同 pane 的同一逻辑会话行（与 `endpoints._claude_background_row` 同口径，回退不证明
+    pid/start 相同）。算不出键或键上没有行就不提示：同 pane 上被保持的旧代际、别的会话，它们的结束时刻都不能替目标作证。
+    """
+    for item in summary.endpoint_binding(live.ref)["observerKeys"]:
+        row = view.row(item["key"])
+        if row is None:
+            continue
+        if item["match"] == "session" and row.pane != live.ref.pane:
+            return None
+        return row.pane_state()
+    return None
+
+
+def _observations() -> tuple[list[Endpoint], ObserverView]:
+    """查询命令用的只读观察：活端点与 AgentStatus 快照，只读一次 ListSessions（DESIGN §55）。
+
+    端点状态与提示证据出自同一份快照（端点忙闲按 pane 与 provider 取行，提示证据按目标的 observer 键取行，
+    DESIGN §62 ④⑤）；任一来源不可用时提示自然缺席。
+    """
+    view = agentstatus_view()
+    return discover(DiscoverySources(runtime=lambda: view)), view
 
 
 # ---- 命令 ----
@@ -463,9 +486,9 @@ def cmd_tasks(args: argparse.Namespace) -> int:
     with _open_store() as store:
         # 待办而 worker 不在时的补拉由 main 结束时统一做（DESIGN §45.28.3），这里不重复拉起
         tasks = store.list_tasks(include_finished=args.all)
-        endpoints, panes = _observations() if any(not task.finished for task in tasks) else ([], {})
+        endpoints, observed = _observations() if any(not task.finished for task in tasks) else ([], ObserverView())
         hints = {
-            task.id: _target_hint(store.attempts(task.id), endpoints, panes, now)
+            task.id: _target_hint(store.attempts(task.id), endpoints, observed, now)
             for task in tasks
             if not task.finished
         }
@@ -502,8 +525,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         task = _task(store, args.task)
         hint = _NO_HINT
         if not task.finished:
-            endpoints, panes = _observations()
-            hint = _target_hint(store.attempts(task.id), endpoints, panes, now)
+            endpoints, observed = _observations()
+            hint = _target_hint(store.attempts(task.id), endpoints, observed, now)
         if args.json:
             _print_json(_task_document(store, task, include_body=args.body, events=True, hint=hint))
         else:

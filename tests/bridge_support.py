@@ -19,9 +19,69 @@ from typing import Any
 import unittest
 
 from agentstatus_bridge import summary
+from agentstatus_bridge.endpoints import DiscoverySources
 from agentstatus_bridge.model import Attempt, Delivery, Endpoint, EndpointRef, Flow, Provider, Runtime, Task
+from agentstatus_bridge.observer_dbus import ObserverView
 from agentstatus_bridge.store import Store
 from agentstatus_bridge.transports import DeliveryContext, DeliveryOutcome
+
+
+def _production_codex_socket_roots() -> tuple[str, ...]:
+    """生产 Codex daemon 可能所在的目录：真实用户的 `~/.codex/`（取 passwd，测试改了 HOME 也不变）与
+    `/tmp/codex-daemon-<uid>/`。"""
+    import pwd
+    real_home = pwd.getpwuid(os.getuid()).pw_dir
+    return tuple(os.path.realpath(path) + os.sep for path in (
+        os.path.join(real_home, ".codex"), f"/tmp/codex-daemon-{os.getuid()}",
+    ))
+
+
+class ProductionSocketUse(BaseException):
+    """测试试图连接生产 Codex daemon。
+
+    是 BaseException 而不是 AssertionError：`codex_rpc.queue_add` 为了不让意外异常冒泡给 dispatch 而接住所有
+    Exception，会把 AssertionError 当成「连接失败」静默回退 CLI，用例照样通过（§61 第 1 轮 Fable P2-1）。
+    生产代码不为测试夹具开口子；BaseException 越过它，unittest 记 ERROR，`finally` 照常关 socket。
+    """
+
+
+def _install_production_socket_guard() -> None:
+    """任何测试经 AF_UNIX 连到生产 Codex daemon 都直接失败（DESIGN §61.2 第 9 条）。
+
+    2026-10-05 §61 开发时，一组用例经默认参数走到真实的 `queue_add`、连上了本机 daemon（假 thread id 被拒，
+    没有入队，但 initialize 以假版本改写了 daemon 的 UA 后缀）。守卫装在每个桥测试都 import 的这里，
+    直接跑单个模块也生效；只拦生产目录，临时目录里的假 server 不受影响。
+    """
+    import socket
+
+    if getattr(socket.socket, "_agentstatus_guarded", False):
+        return
+    roots = _production_codex_socket_roots()
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+
+    def check(sock: socket.socket, address: object) -> None:
+        if sock.family != socket.AF_UNIX or not isinstance(address, (str, bytes, os.PathLike)):
+            return
+        path = os.fsdecode(address)  # pyright: ignore[reportArgumentType]
+        resolved = os.path.realpath(path) if path and not path.startswith("\0") else path
+        if any((resolved + os.sep).startswith(root) or resolved.startswith(root) for root in roots):
+            raise ProductionSocketUse(f"测试不得连接生产 Codex daemon：{path}")
+
+    def connect(self: socket.socket, address: Any) -> None:
+        check(self, address)
+        original_connect(self, address)
+
+    def connect_ex(self: socket.socket, address: Any) -> int:
+        check(self, address)
+        return original_connect_ex(self, address)
+
+    socket.socket.connect = connect  # type: ignore[method-assign]
+    socket.socket.connect_ex = connect_ex  # type: ignore[method-assign]
+    socket.socket._agentstatus_guarded = True  # type: ignore[attr-defined]
+
+
+_install_production_socket_guard()
 
 
 class FakeProc:
@@ -63,8 +123,11 @@ def ref(
     start: str = "100",
     pane: str | None = "%1",
     label: str | None = "work",
+    server: int | None = None,
 ) -> EndpointRef:
-    return EndpointRef(provider=provider, native_id=native, pid=pid, start_ticks=start, pane=pane, label=label)
+    return EndpointRef(
+        provider=provider, native_id=native, pid=pid, start_ticks=start, pane=pane, label=label, server_pid=server
+    )
 
 
 def endpoint(
@@ -83,6 +146,26 @@ def endpoint(
         name=name,
         issues=tuple(issues),
     )
+
+
+def discovering(
+    endpoints: Callable[[], list[Endpoint]],
+    seen: list[tuple[DiscoverySources | None, ObserverView]] | None = None,
+) -> Callable[..., list[Endpoint]]:
+    """`discover` 的替身：照真实 discover 的取数方式调一次 `config.runtime()`，再返回给定端点（DESIGN §55.4）。
+
+    这样「每条命令读几次 D-Bus」能在最底层的 `_observer_rows` 上数出来；`seen` 记下收到的
+    `sources` 与这次读到的快照。在 `setUp` 里生成：借用 `CliTests.setUp` 的测试类拿不到别的方法。
+    """
+
+    def fake(sources: DiscoverySources | None = None) -> list[Endpoint]:
+        config = sources or DiscoverySources()
+        observed = config.runtime()
+        if seen is not None:
+            seen.append((sources, observed))
+        return endpoints()
+
+    return fake
 
 
 OutcomeFactory = Callable[[Endpoint, str, DeliveryContext], DeliveryOutcome]

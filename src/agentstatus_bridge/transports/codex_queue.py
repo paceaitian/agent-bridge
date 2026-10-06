@@ -1,14 +1,20 @@
-"""Codex 原生 thread 队列：调用 `codex queue`，按已知文案给出可读失败原因，并为每次外调留下版本与输出证据。
+"""Codex 原生 thread 队列：先经托管 daemon 的 `thread/queue/add`（`codex_rpc`，DESIGN §61），add 帧发出之前失败时
+回退 `codex queue` CLI；按已知文案给出可读失败原因，并为每次外调留下通道、版本与输出证据。
 
-分类规则的依据是源码审查（最近一次：0.156.0 / `fe74a774`，DESIGN §45.44 第三节）：成功时 stdout 为
+两个通道的边界：RPC 在 add 帧开始发送之前的失败可证明未入队，原样回退 CLI，证据记 `rpcFallback`；之后只按 RPC
+结果记，绝不换通道重投。下面关于 CLI 输出分类的说明只适用于 CLI 通道。
+
+CLI 通道分类规则的依据是源码审查（DESIGN §45.44 第三节初版为 0.156.0 / `fe74a774`，§53.1 按 0.160.0 复核；RPC 通道的
+错误表依据 0.160.0 / `a956835d`，见 `codex_rpc`）：成功时 stdout 为
 `Queued message <queue item id> for thread <thread id>.`；运行期错误一律 exit 1，stderr 为 `Error: ...`
 错误链。只有在插入队列之前就失败的已知文案才判为 FAILED（可证明未入队）；存储/传输错误、超时、
 无法解析的输出都判为 UNKNOWN，不自动重发。分类是「已知子串优先」：一条新错误若恰好包含已知拒收子串
 仍会命中 FAILED，所以这里不宣称对未来的错误 fail-safe。
 
-`ab doctor` 只统计已见样本（`codexVersion` / `queueOutput` 两个键），不替代源码审查。这两个键是本模块
-与 doctor 的仓内约定（DESIGN §45.44 四）：写方是 `CodexQueueTransport.deliver`，读方是
-`summarize_queue_evidence`，改名或删除须两处同改。
+`ab doctor` 只统计已见样本（`codexVersion` / `queueOutput` / `queueChannel` / `rpcFallback` 四个键），不替代源码
+审查。这些键是本模块与 doctor 的仓内约定（DESIGN §45.44 四、§61.2 第 7 条）：写方是 `CodexQueueTransport.deliver`，
+读方是 `summarize_queue_evidence` 与 `summarize_rpc_evidence`，改名或删除须两处同改。没有 `queueChannel` 的旧样本
+都是 CLI 通道的。
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ import subprocess
 
 from ..model import Consumption, Delivery, Endpoint, Provider
 from ..paths import codex_home
-from . import DeliveryContext, DeliveryOutcome
+from . import DeliveryContext, DeliveryOutcome, codex_rpc
 
 QUEUE_TIMEOUT_SECONDS = 60.0
 # 投递后查版本的超时：它在 finish_send 之前，缓存未命中时本条落账与 worker 发下一条最多因此晚这么久
@@ -39,13 +45,19 @@ _QUEUED = re.compile(
 # 投递证据（DESIGN §45.44 二.2）：本模块写、summarize_queue_evidence 读
 VERSION_KEY = "codexVersion"
 OUTPUT_KEY = "queueOutput"
+# 通道与回退原因（DESIGN §61.2 第 7 条）：RPC 通道的 codexVersion 是服务端版本，CLI 通道的是 CLI 版本
+CHANNEL_KEY = "queueChannel"
+FALLBACK_KEY = "rpcFallback"
+CHANNEL_RPC = "rpc"
+CHANNEL_CLI = "cli"
+FALLBACK_VERSION_UNAVAILABLE = "version_unavailable"
 UNKNOWN_VERSION = "unknown"
 OUTPUT_RECOGNIZED = "recognized"
 OUTPUT_UNRECOGNIZED = "unrecognized"
 EVIDENCE_WINDOW = 200
 
 # `codex --version` 的整行形状：Clap package version，允许预发布与构建后缀；不截断、不从别的输出里抠
-_VERSION_LINE = re.compile(r"codex-cli (?P<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)")
+_VERSION_LINE = re.compile(rf"codex-cli (?P<version>{codex_rpc.VERSION_PATTERN})")
 _MAX_VERSION_LENGTH = 64
 _UNRECOGNIZED_ERROR = "codex_queue_unrecognized_error"
 
@@ -102,6 +114,10 @@ READABLE_REASONS: dict[str, str] = {
     "codex_queue_timeout": "Codex 排队命令超时，是否已入队不明",
     "codex_queue_unrecognized_error": "Codex 返回未识别的错误，是否已入队不明",
     "codex_queue_unparsed_output": "Codex 输出无法识别，是否已入队不明",
+    # RPC 通道新增的写前原因（DESIGN §61.2 第 6 条）
+    "codex_server_overloaded": "Codex 服务繁忙，未入队，可以直接重发",
+    "codex_thread_unreadable": "Codex 读不到这个会话，未入队",
+    "codex_rpc_protocol_error": "协作桥发给 Codex 的请求形状或顺序有误，未入队",
 }
 
 
@@ -139,14 +155,20 @@ def classify_failure(stderr: str) -> tuple[Delivery, str]:
     return Delivery.UNKNOWN, _UNRECOGNIZED_ERROR
 
 
+RpcCall = Callable[..., "codex_rpc.RpcFallback | codex_rpc.RpcResult"]
+
+
 class CodexQueueTransport:
-    """经 `codex queue --thread UUID --message TEXT` 投递。"""
+    """先经 daemon 的 `thread/queue/add` 投递，add 帧发出之前失败时经 `codex queue --thread UUID --message TEXT`。"""
 
     provider = Provider.CODEX
 
-    def __init__(self, *, executable: str | None = None, runner: Runner | None = None) -> None:
+    def __init__(
+        self, *, executable: str | None = None, runner: Runner | None = None, rpc: RpcCall | None = None
+    ) -> None:
         self._executable = executable
         self._runner = runner or _default_runner
+        self._rpc: RpcCall = rpc or codex_rpc.queue_add
         # 只缓存成功值；键是（release 真实路径, mtime）。worker 单进程单线程，挂在实例上即可
         self._version_cache: tuple[tuple[str, int], str] | None = None
 
@@ -154,7 +176,38 @@ class CodexQueueTransport:
         return self._executable or shutil.which("codex")
 
     def deliver(self, endpoint: Endpoint, text: str, context: DeliveryContext) -> DeliveryOutcome:
-        del context  # Codex 队列不携带发送方元数据
+        attempt = self._deliver_rpc(endpoint.ref.native_id, text, context.message_uuid)
+        if isinstance(attempt, DeliveryOutcome):
+            return attempt
+        outcome = self._deliver_cli(endpoint, text)
+        return replace(outcome, detail={**outcome.detail, CHANNEL_KEY: CHANNEL_CLI, FALLBACK_KEY: attempt})
+
+    def _deliver_rpc(self, thread: str, text: str, client_message_id: str) -> DeliveryOutcome | str:
+        """RPC 通道；返回最终结果，或 add 帧发出之前的回退原因（这时可证明未入队）。
+
+        initialize 用本机 CLI 的版本（身份与 `codex queue` 相同）；取不到就不连 socket，不拿假版本去覆盖
+        daemon 的 UA 后缀。准备步骤的异常就地按回退处理；`queue_add` 自己不冒泡（见 `codex_rpc` 说明）。
+        """
+        try:
+            executable = self._resolve_executable()
+            release = _realpath(executable) if executable is not None else None
+            version = self._release_version(release) if release is not None else None
+            if version is None:
+                return FALLBACK_VERSION_UNAVAILABLE
+            link = codex_rpc.control_socket_path(codex_home())
+        except Exception:
+            return FALLBACK_VERSION_UNAVAILABLE
+        result = self._rpc(link, thread_id=thread, text=text, client_message_id=client_message_id,
+                           client_version=version)
+        if isinstance(result, codex_rpc.RpcFallback):
+            return result.reason
+        detail: dict[str, object] = {CHANNEL_KEY: CHANNEL_RPC, VERSION_KEY: result.server_version}
+        if result.output is not None:
+            detail[OUTPUT_KEY] = result.output
+        return DeliveryOutcome(result.delivery, result.reason, provider_ref=result.provider_ref, detail=detail)
+
+    def _deliver_cli(self, endpoint: Endpoint, text: str) -> DeliveryOutcome:
+        """CLI 通道：与 §61 之前的投递完全相同。"""
         if len(text.encode("utf-8")) > MAX_ARGV_MESSAGE_BYTES:
             return DeliveryOutcome(Delivery.FAILED, "message_too_large_for_argv")
         executable = self._resolve_executable()
@@ -194,18 +247,22 @@ class CodexQueueTransport:
             if before is None or after != before:
                 # 投递期间入口被切换：不把这次的结果归到任何一个版本
                 return UNKNOWN_VERSION
-            # 用外调前解析出的 release 路径查版本；mtime 是归档时间，只防同一路径被原地覆盖
-            key = (before, os.stat(before).st_mtime_ns)
-            if self._version_cache is not None and self._version_cache[0] == key:
-                return self._version_cache[1]
-            version = cli_version(executable=before, runner=self._runner, timeout=VERSION_TIMEOUT_SECONDS)
-            if version is None:
-                # 失败不缓存：否则首次超时一次，整个 worker 生命周期都会因「程序没变」而永远记 unknown
-                return UNKNOWN_VERSION
-            self._version_cache = (key, version)
-            return version
+            return self._release_version(before) or UNKNOWN_VERSION
         except Exception:
             return UNKNOWN_VERSION
+
+    def _release_version(self, release: str) -> str | None:
+        """这个 release 路径上的 codex 版本，按（路径, mtime）缓存；取不到为 None。"""
+        # 用外调前解析出的 release 路径查版本；mtime 是归档时间，只防同一路径被原地覆盖
+        key = (release, os.stat(release).st_mtime_ns)
+        if self._version_cache is not None and self._version_cache[0] == key:
+            return self._version_cache[1]
+        version = cli_version(executable=release, runner=self._runner, timeout=VERSION_TIMEOUT_SECONDS)
+        if version is None:
+            # 失败不缓存：否则首次超时一次，整个 worker 生命周期都会因「程序没变」而永远记 unknown
+            return None
+        self._version_cache = (key, version)
+        return version
 
 
 def _realpath(path: str) -> str | None:
@@ -315,6 +372,9 @@ def summarize_queue_evidence(
         return {**evidence, "state": "ledger_unreadable"}
     recognized = unrecognized = unknown_version = other_version = 0
     for detail in details:
+        if detail.get(CHANNEL_KEY, CHANNEL_CLI) != CHANNEL_CLI:
+            # 只数 CLI 通道：RPC 样本记的是服务端版本，与当前 CLI 版本比对没有意义（DESIGN §61.2 第 7 条）
+            continue
         output = detail.get(OUTPUT_KEY)
         seen = detail.get(VERSION_KEY)
         if output not in (OUTPUT_RECOGNIZED, OUTPUT_UNRECOGNIZED) or not isinstance(seen, str):
@@ -325,6 +385,54 @@ def summarize_queue_evidence(
             # 记在别的版本下：自动升级后的常态，窗口里多半全是升级前的样本（Fable 实现复核 P3-1）
             other_version += 1
         elif output == OUTPUT_RECOGNIZED:
+            recognized += 1
+        else:
+            unrecognized += 1
+    return {
+        **evidence,
+        "state": "ok" if recognized or unrecognized else "no_samples",
+        "recognized": recognized,
+        "unrecognized": unrecognized,
+        "unknownVersion": unknown_version,
+        "otherVersion": other_version,
+    }
+
+
+def summarize_rpc_evidence(details: Sequence[Mapping[str, object]] | None) -> dict[str, object]:
+    """doctor 用：RPC 通道样本与回退次数（DESIGN §61.2 第 7 条）。
+
+    参照版本取窗口内**最近一条能解析出服务端版本**的 RPC 样本（`unknown` 跳过、单独计数）——这是诊断，不证明
+    daemon 此刻的版本。回退按
+    `rpcFallback` 计次并给出最常见的原因；`details` 为 None 表示账本读取失败，不伪装成零样本。
+    """
+    evidence: dict[str, object] = {"window": EVIDENCE_WINDOW}
+    if details is None:
+        return {**evidence, "state": "ledger_unreadable"}
+    samples = [
+        detail for detail in details
+        if detail.get(CHANNEL_KEY) == CHANNEL_RPC
+        and detail.get(OUTPUT_KEY) in (OUTPUT_RECOGNIZED, OUTPUT_UNRECOGNIZED)
+        and isinstance(detail.get(VERSION_KEY), str)
+    ]
+    fallbacks: dict[str, int] = {}
+    for detail in details:
+        reason = detail.get(FALLBACK_KEY)
+        if detail.get(CHANNEL_KEY) == CHANNEL_CLI and isinstance(reason, str):
+            fallbacks[reason] = fallbacks.get(reason, 0) + 1
+    evidence["fallbacks"] = sum(fallbacks.values())
+    if fallbacks:
+        # 次数相同时按原因码排序取第一个，输出稳定
+        evidence["topFallback"] = min(fallbacks, key=lambda reason: (-fallbacks[reason], reason))
+    reference = next((str(detail[VERSION_KEY]) for detail in samples if detail[VERSION_KEY] != UNKNOWN_VERSION), None)
+    evidence["version"] = reference
+    recognized = unrecognized = unknown_version = other_version = 0
+    for detail in samples:
+        seen = detail[VERSION_KEY]
+        if seen == UNKNOWN_VERSION:
+            unknown_version += 1
+        elif seen != reference:
+            other_version += 1
+        elif detail[OUTPUT_KEY] == OUTPUT_RECOGNIZED:
             recognized += 1
         else:
             unrecognized += 1

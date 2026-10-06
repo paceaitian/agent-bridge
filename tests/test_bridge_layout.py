@@ -71,13 +71,13 @@ MOVED: tuple[str, ...] = (
     "endpoints:_positive_count → observer_dbus:_positive_count",
     "endpoints:_has_background_work → observer_dbus:_has_background_work",
     "endpoints:_map_agentstatus_runtime → observer_dbus:_map_agentstatus_runtime",
-    "endpoints:_pane_state → observer_dbus:_pane_state",
     "endpoints:ObserverRow → observer_dbus:ObserverRow",
     "endpoints:ObserverView → observer_dbus:ObserverView",
     "endpoints:agentstatus_view → observer_dbus:agentstatus_view",
     "endpoints:agentstatus_runtime → observer_dbus:agentstatus_runtime",
-    "endpoints:agentstatus_panes → observer_dbus:agentstatus_panes",
     "endpoints:_observer_rows → observer_dbus:_observer_rows",
+    # §55（H6）让 `_pane_state` 与 `agentstatus_panes` 退役（pane 状态改由 `ObserverView.pane_state` 从同一快照派生），
+    # 所以这里删去两条登记——它们是被删掉的，不是搬走（规则 2 要求新模块恰好定义一次）
     # R5：Codex 启动参数识别从 endpoints 搬进 codex_argv（只依赖标准库）
     "endpoints:_CODEX_NON_TUI → codex_argv:_CODEX_NON_TUI",
     "endpoints:_CODEX_VALUE_OPTIONS → codex_argv:_CODEX_VALUE_OPTIONS",

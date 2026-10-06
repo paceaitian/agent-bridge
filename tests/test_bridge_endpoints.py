@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 import json
+import os
 import shutil
 import socket
 from tempfile import TemporaryDirectory
 import unittest
 import unittest.mock
 
-from agentstatus_bridge import observer_dbus
+from agentstatus_bridge import endpoints as endpoints_module, observer_dbus
 from agentstatus_bridge.endpoints import (
     ADAPTERS,
     DiscoverySources,
@@ -26,13 +29,14 @@ from agentstatus_bridge.observer_dbus import (
     ObserverRow,
     ObserverView,
     _map_agentstatus_runtime,  # pyright: ignore[reportPrivateUsage]
-    _pane_state,  # pyright: ignore[reportPrivateUsage]
     agentstatus_view,
 )
-from agentstatus_bridge.hints import PaneState
 from agentstatus_bridge.ids import opaque_id
 from agentstatus_bridge.model import Provider, Runtime
 from agentstatus_bridge import procfs
+from agentstatus_bridge.codex_argv import _codex_non_interactive  # pyright: ignore[reportPrivateUsage]
+from agentstatus_bridge.transports import DeliveryContext
+from agentstatus_bridge.transports.claude_peer import build_frame
 from bridge_support import FakeProc, endpoint, ref
 
 UUID_A = "019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa"
@@ -76,17 +80,19 @@ class DiscoveryTests(unittest.TestCase):
         )
 
     def _view(self) -> ObserverView:
-        """把测试里写的「键 → 状态」摊成 observer 行；pane 键默认属于自己，会话键默认没有 pane。"""
-        return ObserverView(
-            {
-                key: ObserverRow(
-                    state,
-                    self.evidence.get(key),
-                    self.observer_pane.get(key, key if key.startswith("%") else None),
-                )
-                for key, state in self.runtime.items()
-            }
-        )
+        """把测试里写的「键 → 状态」摊成 observer 行；pane 键默认属于自己，会话键默认没有 pane。
+
+        pane 键的行不带 `agent`，按 pane 匹配任意 provider（与不发 `agent` 的写方同口径，DESIGN §62 ④）。
+        """
+        rows = {
+            key: ObserverRow(
+                state,
+                self.evidence.get(key),
+                self.observer_pane.get(key, key if key.startswith("%") else None),
+            )
+            for key, state in self.runtime.items()
+        }
+        return ObserverView(rows, {(key, None): row for key, row in rows.items() if key.startswith("%")})
 
     def _socket(self, name: str) -> str:
         path = str(self.root / name)
@@ -375,6 +381,70 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual((found.issues, found.consumers), (("shared_thread",), 2))
         self.assertEqual(found.blocking_issues, ())
 
+    def test_discover_consumes_the_injected_snapshot_once(self) -> None:
+        """注入的快照恰好被读一次、不另读 D-Bus；Codex、Grok 端点状态就是该 pane 选中的那一行（DESIGN §55.4 用例 3）。"""
+        self.proc.add(401, comm="zsh")
+        self.proc.add(600, comm="codex", ppid=401, argv=["codex"], fds=[self._rollout(UUID_A)])
+        self.panes[401] = PaneInfo("%4", 401, "proj")
+        self._grok(900, [UUID_B])
+        # 两个 pane 各有冲突的两行：按行序取末行会得到 UNKNOWN 与 IDLE，按 view 的规则是 BUSY 与 WAITING
+        rows: list[dict[str, object]] = [
+            {"paneId": "%4", "runtimeState": "working", "freshness": "fresh", "lastTurnEndedAt": 41.0},
+            {"paneId": "%4", "runtimeState": "ready", "freshness": "stale", "lastTurnEndedAt": 42.0},
+            {"paneId": "%9", "runtimeState": "working", "attentionState": "action_required", "freshness": "aging", "lastTurnEndedAt": 91.0},
+            {"paneId": "%9", "runtimeState": "ready", "freshness": "fresh", "lastTurnEndedAt": 92.0},
+        ]
+        with unittest.mock.patch.object(observer_dbus, "_observer_rows", return_value=rows):
+            view = agentstatus_view()
+        served: list[ObserverView] = []
+
+        def runtime() -> ObserverView:
+            served.append(view)
+            return view
+
+        with unittest.mock.patch.object(observer_dbus, "_observer_rows", return_value=[]) as reads:
+            found = {item.ref.provider: item for item in discover(replace(self._sources(), runtime=runtime))}
+        self.assertEqual(len(served), 1)
+        reads.assert_not_called()
+        # 只断言对象相同不能证明被消费：逐个核对端点状态取自该 pane 选中的那一行
+        for provider, pane, expected in ((Provider.CODEX, "%4", Runtime.BUSY), (Provider.GROK, "%9", Runtime.WAITING)):
+            with self.subTest(provider=provider.value):
+                state = view.pane_state(pane, provider)
+                self.assertIsNotNone(state)
+                assert state is not None
+                self.assertEqual((found[provider].runtime, state.runtime), (expected, expected))
+
+    def test_rows_of_another_provider_on_the_pane_are_not_borrowed(self) -> None:
+        """pane 上只有别家的行时不借（DESIGN §62 ④）：Codex、Grok 端点状态未知，Claude 不被别家的等待覆盖。"""
+        self.proc.add(401, comm="zsh")
+        self.proc.add(600, comm="codex", ppid=401, argv=["codex"], fds=[self._rollout(UUID_A)])
+        self.panes[401] = PaneInfo("%4", 401, "proj")
+        self._grok(900, [UUID_B])
+        self._claude(500)
+        borrowed: list[dict[str, object]] = [
+            {"paneId": "%4", "agent": "claude", "runtimeState": "working", "freshness": "fresh"},
+            {"paneId": "%9", "agent": "codex", "runtimeState": "ready", "freshness": "fresh"},
+            {"paneId": "%500", "agent": "codex", "runtimeState": "working", "attentionState": "action_required",
+             "freshness": "fresh"},
+        ]
+        own: list[dict[str, object]] = [
+            {"paneId": "%4", "agent": "codex", "runtimeState": "working", "freshness": "fresh"},
+            {"paneId": "%9", "agent": "grok", "runtimeState": "working", "attentionState": "action_required",
+             "freshness": "fresh"},
+            {"paneId": "%500", "agent": "claude", "runtimeState": "working", "attentionState": "action_required",
+             "freshness": "fresh"},
+        ]
+        expected = {
+            "别家的行": {Provider.CODEX: Runtime.UNKNOWN, Provider.GROK: Runtime.UNKNOWN, Provider.CLAUDE: Runtime.IDLE},
+            "自己的行": {Provider.CODEX: Runtime.BUSY, Provider.GROK: Runtime.WAITING, Provider.CLAUDE: Runtime.WAITING},
+        }
+        for name, rows in (("别家的行", borrowed), ("自己的行", own)):
+            with self.subTest(rows=name):
+                with unittest.mock.patch.object(observer_dbus, "_observer_rows", return_value=rows):
+                    view = agentstatus_view()
+                found = {item.ref.provider: item.runtime for item in discover(replace(self._sources(), runtime=lambda: view))}
+                self.assertEqual(found, expected[name])
+
     def test_codex_ambiguity_missing_thread_wrapper_and_non_tui(self) -> None:
         self.proc.add(401, comm="zsh")
         self.proc.add(600, comm="codex", ppid=401, fds=[self._rollout(UUID_A), self._rollout(UUID_B)])
@@ -505,18 +575,6 @@ class AdapterRegistryTests(unittest.TestCase):
 
 
 class AgentStatusMappingTests(unittest.TestCase):
-    def test_pane_state_from_public_snapshot(self) -> None:
-        fresh = _pane_state({"runtimeState": "ready", "freshness": "fresh", "lastTurnEndedAt": 1700000000.5})
-        self.assertEqual(fresh, PaneState(Runtime.IDLE, 1700000000.5, True))
-        stale = _pane_state({"runtimeState": "ready", "freshness": "stale", "lastTurnEndedAt": True})
-        self.assertEqual(stale, PaneState(Runtime.UNKNOWN, None, False))
-        asking = _pane_state({"runtimeState": "working", "attentionState": "action_required", "freshness": "aging"})
-        self.assertEqual(asking, PaneState(Runtime.WAITING, None, True))
-        background = _pane_state(
-            {"runtimeState": "ready", "freshness": "fresh", "activeChildren": 1, "lastTurnEndedAt": 1700000000.5}
-        )
-        self.assertEqual(background, PaneState(Runtime.BACKGROUND, 1700000000.5, True))
-
     def test_runtime_view_indexes_panes_and_session_identities(self) -> None:
         """一次快照建两套键：pane 供收紧判定，会话键供放开判定；键不合法的行只进 pane（Codex 审计 F02）。"""
         rows: list[dict[str, object]] = [
@@ -818,6 +876,283 @@ class CallerTests(unittest.TestCase):
         # 只有一个会话时祖先链照旧够用
         alone = identify_caller([first], pid=950, proc_root=self.proc.root, environ={})
         self.assertEqual((alone.endpoint, alone.via), (first, "ancestry"))
+
+    def _codex_class_for(self, argv: list[str], toml: str | None, pid: int) -> str | None:
+        """在合成 /proc 上按给定 argv 与 config.toml 走真实的 identify_caller → permission_class。"""
+        config = self.root / "codex-layers.toml"
+        if toml is None:
+            config.unlink(missing_ok=True)
+        else:
+            config.write_text(toml, encoding="utf-8")
+        self.proc.add(pid, comm="codex", argv=argv)
+        self.proc.add(pid + 1000, comm="python3", ppid=pid)
+        caller = identify_caller([], pid=pid + 1000, proc_root=self.proc.root, environ={})
+        return permission_class(caller, proc_root=self.proc.root, codex_config=config)
+
+    def test_codex_permission_layers_follow_upstream_merge(self) -> None:
+        """DESIGN §58：根层与子命令层分开解析后按上游 0.160.0 的顺序合并，不冒称 bypass。
+
+        YOLO 是本机全局配置的形态；ALT 用来区分「根层 -c 是否被整组替换」；None 为没有 config.toml。
+        """
+        yolo = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n'
+        alt = 'approval_policy = "on-request"\nsandbox_mode = "workspace-write"\n'
+        never_dfa = ["-c", 'approval_policy="never"', "-c", "sandbox_mode=danger-full-access"]
+        cases: list[tuple[str, list[str], str | None, str | None]] = [
+            # 1 单层
+            ("1a", ["--approve-for-me"], yolo, "prompting"),
+            ("1b", ["--not-so-yolo"], yolo, "prompting"),
+            ("1c", ["--approve-for-me"], None, "prompting"),
+            # 2 单层与 -c：覆盖追加在全部 -c 之后
+            ("2a", [*never_dfa, "--approve-for-me"], yolo, "prompting"),
+            ("2b", ["--approve-for-me", *never_dfa], yolo, "prompting"),
+            ("2c", ["resume", "-c", 'approval_policy="never"', "--approve-for-me"], yolo, "prompting"),
+            # 3 profile：任一层选了就不采用 config.toml
+            ("3a", ["-p", "work", "--approve-for-me"], yolo, "prompting"),
+            ("3b", ["resume", "-p", "work"], yolo, None),
+            # 4 子命令层
+            ("4a", ["resume", "--approve-for-me"], yolo, "prompting"),
+            ("4b", ["fork", "--not-so-yolo"], yolo, "prompting"),
+            # 5 跨层：子命令层选了沙箱组就整组替换根层，resume/fork 层的 --approve-for-me 清根层 -a
+            ("5a", ["--yolo", "resume", "--approve-for-me"], yolo, "prompting"),
+            ("5b", ["--dangerously-bypass-approvals-and-sandbox", "fork", "--not-so-yolo"], yolo, "prompting"),
+            ("5c", ["-a", "never", "-s", "danger-full-access", "resume", "--approve-for-me"], yolo, "prompting"),
+            ("5d", ["-a", "never", "resume", "--approve-for-me"], yolo, "prompting"),
+            # 6 反向跨层
+            ("6a", ["--approve-for-me", "resume", "-a", "never"], yolo, None),
+            ("6b", ["--approve-for-me", "resume", "--yolo"], yolo, "bypass"),
+            ("6c", ["--approve-for-me", "resume", *never_dfa], yolo, "prompting"),
+            ("6d", ["--approve-for-me", "fork", *never_dfa], yolo, "prompting"),
+            # 7 既有的跨层缺口
+            ("7a", ["--yolo", "resume", "-s", "workspace-write"], yolo, None),
+            ("7b", ["--yolo", "resume", "-a", "on-request"], yolo, "bypass"),
+            ("7c", ["-a", "never", "resume", "-a", "on-request"], yolo, "prompting"),
+            ("7d", ["-s", "danger-full-access", "resume", "-s", "workspace-write"], yolo, None),
+            # 8 -c 是 clap 全局参数：子命令层出现任何键的 -c 就整组替换根层
+            ("8a", [*never_dfa, "resume", "-c", 'model="x"'], None, None),
+            ("8b", [*never_dfa, "resume", "-c", "tui.fullscreen_transcript=true"], alt, "prompting"),
+            ("8c", ["-c", "approval_policy=on-request", "resume", *never_dfa], yolo, "bypass"),
+            # 9 -- 之后是字面参数
+            ("9a", ["--", "--approve-for-me"], yolo, "bypass"),
+            ("9b", ["--", "--not-so-yolo"], yolo, "bypass"),
+            ("9c", ["--", "--yolo"], None, None),
+            ("9d", ["resume", "--", "--yolo"], None, None),
+            ("9e", ["--approve-for-me", "--", "文本"], yolo, "prompting"),
+            # 10 非交互子命令：只固定与上游一致的结果
+            ("10b", ["exec", "--yolo", "x"], yolo, "bypass"),
+            ("10c", ["--yolo", "exec", "--approve-for-me", "x"], yolo, "prompting"),
+            ("10d", ["exec", "x"], yolo, "bypass"),
+            # 12 第 3 轮补充：位置参数在前、根层覆盖不随组替换消失、内联与粘连写法
+            ("12a", ["写个脚本", "--approve-for-me"], yolo, "prompting"),
+            ("12b", ["resume", "0199aaaa-uuid", "--approve-for-me"], yolo, "prompting"),
+            ("12c", ["--approve-for-me", "resume", "-s", "danger-full-access"], yolo, "prompting"),
+            ("12d", ["--not-so-yolo", "fork", "--sandbox=danger-full-access"], yolo, "prompting"),
+            ("12e", ["--yolo", "resume", "--sandbox=workspace-write"], yolo, None),
+            ("12f", [*never_dfa, "resume", '--config=model="x"'], None, None),
+            ("12g", ["--yolo", "resume", "-sworkspace-write"], yolo, None),
+            ("12h", ["-a", "never", "resume", "-aon-request"], yolo, "prompting"),
+            ("12i", [*never_dfa, "resume", "-cmodel=x"], None, None),
+            ("12j", ["-capproval_policy=never", "-csandbox_mode=danger-full-access"], None, "bypass"),
+            # 13 实现复核补充：profile 的两种写法、--enable/--disable 不算 -c、fork 层也清根层 -a、粘连写法的边界
+            ("13a", ["-c", 'profile="work"'], yolo, None),
+            ("13b", ["resume", "-c", "profile=work"], yolo, None),
+            ("13c", ["resume", '--config=profile="work"'], yolo, None),
+            ("13d", ["-pwork"], yolo, None),
+            ("13e", ["resume", "-pwork"], yolo, None),
+            ("13f", ["fork", "-p=work"], yolo, None),
+            ("13g", ["-c", "approval_policy=on-request", "resume", "--enable=shell_snapshot"], yolo, "prompting"),
+            ("13h", ["-c", "approval_policy=on-request", "fork", "--disable", "shell_snapshot"], yolo, "prompting"),
+            ("13i", ["-a", "never", "fork", "--approve-for-me"], yolo, "prompting"),
+            ("13j", ["resume", "-cmodel=x", "--approve-for-me"], yolo, "prompting"),
+            ("13k", ["-c", "sandbox_mode=danger-full-access", "resume", "-c=sandbox_mode=workspace-write"], yolo, None),
+        ]
+        for index, (label, arguments, toml, expected) in enumerate(cases):
+            with self.subTest(label=label, argv=arguments):
+                self.assertEqual(self._codex_class_for(["codex", *arguments], toml, 3000 + index * 2), expected)
+        # 11 对照：去掉这个参数、其余相同，结果回到原来（锁住「是这个参数改变了结果」）
+        for index, (arguments, expected) in enumerate(((["resume"], "bypass"), (["--yolo", "resume"], "bypass"), ([], "bypass"))):
+            with self.subTest(control=arguments):
+                self.assertEqual(self._codex_class_for(["codex", *arguments], yolo, 3200 + index * 2), expected)
+
+    def test_a_truncated_codex_command_line_declares_nothing(self) -> None:
+        """命令行超过读取上限时，被截掉的尾部可能有改判的参数：不声明类别（DESIGN §58.8，Opus 实现复核 P3-2）。"""
+        yolo = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n'
+        long_prompt = "x" * (70 * 1024)
+        self.assertIsNone(self._codex_class_for(["codex", long_prompt, "--approve-for-me"], yolo, 3500))
+        self.assertIsNone(self._codex_class_for(["codex", "--yolo", long_prompt], yolo, 3502))
+        # 远在上限内（约 1 KiB 提示词）的照常判类
+        self.assertEqual(self._codex_class_for(["codex", "x" * 1024, "--approve-for-me"], yolo, 3504), "prompting")
+        # 按字节而不是解码后的字符数判断：25000 个汉字约 75 KB，字符数在上限内、字节数超过
+        self.assertIsNone(self._codex_class_for(["codex", "中" * 25000, "--approve-for-me"], yolo, 3516))
+        # 总字节数恰好等于上限算读全、多一个字节算没读全：cmdline 是 "\0" 连接的 argv 再加结尾 "\0"，三项共 24 字节加提示词长度
+        self.assertEqual(self._codex_class_for(["codex", "x" * (65536 - 24), "--approve-for-me"], yolo, 3506), "prompting")
+        self.assertIsNone(self._codex_class_for(["codex", "x" * (65537 - 24), "--approve-for-me"], yolo, 3508))
+        # 读不到也不声明：空 cmdline 与读失败（进程正在退出）
+        self.assertIsNone(self._codex_class_for([], yolo, 3510))
+        self.assertIsNone(self._codex_class_after_cmdline_vanishes(yolo, 3512))
+        # 截断判未知只对 Codex：Claude 照旧按读到的明确模式判类
+        self.proc.add(3514, comm="claude", argv=["claude", "--dangerously-skip-permissions", long_prompt])
+        self.proc.add(4514, comm="python3", ppid=3514)
+        caller = identify_caller([], pid=4514, proc_root=self.proc.root, environ={})
+        self.assertEqual(permission_class(caller, proc_root=self.proc.root), "bypass")
+
+    def _codex_class_after_cmdline_vanishes(self, toml: str, pid: int) -> str | None:
+        """先按正常 argv 建进程、认出调用者，再删掉 cmdline，模拟判类时读失败。"""
+        config = self.root / "codex-layers.toml"
+        config.write_text(toml, encoding="utf-8")
+        self.proc.add(pid, comm="codex", argv=["codex", "--yolo"])
+        self.proc.add(pid + 1000, comm="python3", ppid=pid)
+        caller = identify_caller([], pid=pid + 1000, proc_root=self.proc.root, environ={})
+        (self.proc.root / str(pid) / "cmdline").unlink()
+        return permission_class(caller, proc_root=self.proc.root, codex_config=config)
+
+    def test_a_codex_argument_after_the_subcommand_is_still_recognised(self) -> None:
+        # --approve-for-me 是无值布尔，不能吞掉后面的子命令（DESIGN §58.2 第 1 条）
+        self.assertTrue(_codex_non_interactive(["--approve-for-me", "exec", "x"]))
+        self.assertFalse(_codex_non_interactive(["--approve-for-me", "resume"]))
+
+    def _grok_class_for(
+        self,
+        argv: list[str],
+        config: str | None,
+        pid: int,
+        *,
+        requirements: tuple[str, ...] = (),
+        managed: tuple[str, ...] = (),
+    ) -> str | None:
+        """在合成 /proc 与临时 grok 目录上走真实的 identify_caller → permission_class（DESIGN §60 ③）。
+
+        `requirements`/`managed` 列出放这两种文件的位置：`home` 是 `~/.grok`，`system` 是系统目录（补丁指到临时目录）。
+        """
+        home = self.root / f"grok-home-{pid}"
+        system = self.root / f"grok-system-{pid}"
+        home.mkdir()
+        system.mkdir()
+        if config is not None:
+            (home / "config.toml").write_text(config, encoding="utf-8")
+        for name, places in (("requirements.toml", requirements), ("managed_config.toml", managed)):
+            for place in places:
+                ((home if place == "home" else system) / name).write_text("", encoding="utf-8")
+        self.proc.add(pid, comm="grok", argv=argv)
+        self.proc.add(pid + 1000, comm="python3", ppid=pid)
+        caller = identify_caller([], pid=pid + 1000, proc_root=self.proc.root, environ={})
+        with unittest.mock.patch.object(endpoints_module, "GROK_SYSTEM_DIR", system):
+            try:
+                return permission_class(caller, proc_root=self.proc.root, grok_dir=home)
+            except TypeError as error:  # 让缺陷以 FAIL 出现，而不是 ERROR
+                self.fail(f"配置取值的类型让判定抛出 {error!r}")
+
+    def test_grok_permission_class_follows_flags_then_user_config(self) -> None:
+        """DESIGN §60 ③：启动参数 > 用户 config.toml 的 [ui] permission_mode；只在有正面证据时声明 bypass。
+
+        期望值按上游公开源码（xai-org/grok-build 1.0.45 `util/config/permissions.rs`、`pager/src/app/cli.rs`），
+        与随装文档有出入的组合判未知（第 3 版，Codex F01、Opus P1-2）。
+        """
+        approve = '[ui]\npermission_mode = "always-approve"\n'
+        ask = '[ui]\npermission_mode = "ask"\n'
+        cases: list[tuple[str, list[str], str | None, str | None]] = [
+            # 启动参数
+            ("flag-always", ["grok", "--always-approve"], None, "bypass"),
+            ("flag-yolo", ["grok", "--yolo"], None, "bypass"),
+            ("flag-skip", ["grok", "--dangerously-skip-permissions"], None, "bypass"),
+            ("mode-bypass", ["grok", "--permission-mode", "bypassPermissions"], None, "bypass"),
+            ("mode-inline", ["grok", "--permission-mode=bypassPermissions"], None, "bypass"),
+            *((f"mode-{mode}", ["grok", "--permission-mode", mode], None, "prompting")
+              for mode in ("default", "auto", "acceptEdits", "dontAsk", "plan")),
+            # 上游 clap 不收的取值（产品名也不是合法的启动参数值）：认不出
+            ("mode-product-name", ["grok", "--permission-mode", "always-approve"], None, None),
+            ("mode-ask", ["grok", "--permission-mode", "ask"], None, None),
+            ("mode-unknown", ["grok", "--permission-mode", "weird"], approve, None),
+            ("mode-missing-value", ["grok", "--permission-mode"], approve, None),
+            # 上游只看 --permission-mode，随装文档说 always-approve 优先：说不准
+            ("yolo-with-auto", ["grok", "--yolo", "--permission-mode", "auto"], None, None),
+            ("yolo-with-default", ["grok", "--yolo", "--permission-mode", "default"], None, None),
+            ("yolo-with-bypass", ["grok", "--yolo", "--permission-mode", "bypassPermissions"], None, "bypass"),
+            ("two-modes", ["grok", "--permission-mode", "auto", "--permission-mode", "default"], None, None),
+            ("after-dashdash", ["grok", "--", "--yolo"], None, "prompting"),
+            # grok agent（ACP 服务）的权限由客户端决定，顶层参数对它不起作用
+            ("agent-subcommand", ["grok", "agent", "--yolo"], approve, None),
+            ("agent-after-top-flag", ["grok", "--yolo", "agent"], None, None),
+            ("agent-plain", ["grok", "agent"], approve, None),
+            ("flag-over-config", ["grok", "--permission-mode", "default"], approve, "prompting"),
+            ("yolo-over-config", ["grok", "--yolo"], ask, "bypass"),
+            # 用户配置
+            ("owner-shape", ["grok", "继续"], approve, "bypass"),
+            # 原生配置只认 always-approve；bypassPermissions 上游按询问处理，这里当认不出
+            ("config-bypass-name", ["grok"], '[ui]\npermission_mode = "bypassPermissions"\n', None),
+            *((f"config-{mode}", ["grok"], f'[ui]\npermission_mode = "{mode}"\n', "prompting")
+              for mode in ("default", "ask", "auto")),
+            ("config-unknown", ["grok"], '[ui]\npermission_mode = "weird"\n', None),
+            ("config-not-string", ["grok"], "[ui]\npermission_mode = 1\n", None),
+            ("config-list", ["grok"], '[ui]\npermission_mode = ["always-approve"]\n', None),
+            ("ui-not-table", ["grok"], "ui = 3\n", None),
+            ("no-config", ["grok"], None, "prompting"),
+            ("no-ui", ["grok"], 'theme = "dark"\n', "prompting"),
+            ("deprecated-key", ["grok"], '[ui]\napproval_mode = "yolo"\n', None),
+            ("legacy-yolo-key", ["grok"], "[ui]\nyolo = true\n", None),
+            ("bad-toml", ["grok"], "[ui\n", None),
+        ]
+        for index, (name, argv, config, expected) in enumerate(cases):
+            with self.subTest(case=name):
+                self.assertEqual(expected, self._grok_class_for(argv, config, 4000 + index * 2))
+
+    def test_grok_bypass_needs_no_possible_lock_and_managed_config_only_fills_a_missing_key(self) -> None:
+        approve = '[ui]\npermission_mode = "always-approve"\n'
+        ask = '[ui]\npermission_mode = "ask"\n'
+        self.assertEqual("bypass", self._grok_class_for(["grok"], approve, 4200))
+        for place in ("home", "system"):
+            with self.subTest(lock=place):
+                self.assertIsNone(self._grok_class_for(["grok"], approve, 4202 + (place == "system") * 2,
+                                                       requirements=(place,)))
+                self.assertIsNone(self._grok_class_for(["grok", "--yolo"], None, 4206 + (place == "system") * 2,
+                                                       requirements=(place,)))
+                # 锁只挡 bypass：本来就会询问的仍如实声明
+                self.assertEqual("prompting", self._grok_class_for(["grok"], ask, 4210 + (place == "system") * 2,
+                                                                   requirements=(place,)))
+            with self.subTest(managed=place):
+                self.assertIsNone(self._grok_class_for(["grok"], None, 4214 + (place == "system") * 2,
+                                                       managed=(place,)))
+                # 用户配置写了这个键时 managed 在它之下，不起作用
+                self.assertEqual("bypass", self._grok_class_for(["grok"], approve, 4218 + (place == "system") * 2,
+                                                                managed=(place,)))
+
+    def test_a_lock_location_that_cannot_be_checked_counts_as_locked(self) -> None:
+        # 系统目录拿不准（没有执行权限、lstat 失败）时按有锁处理，不声明 bypass（Opus 第 1 轮 Y3）
+        approve = '[ui]\npermission_mode = "always-approve"\n'
+        system = self.root / "grok-system-4250"
+        with unittest.mock.patch.object(Path, "lstat", autospec=True, side_effect=self._lstat_denied_under(system)):
+            self.assertIsNone(self._grok_class_for(["grok"], approve, 4250))
+        self.assertEqual("bypass", self._grok_class_for(["grok"], approve, 4252))
+
+    @staticmethod
+    def _lstat_denied_under(directory: Path) -> Callable[[Path], os.stat_result]:
+        real = os.lstat
+
+        def fake(path: Path) -> os.stat_result:
+            if Path(path).parent == directory:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path)
+
+        return fake
+
+    def test_a_truncated_grok_command_line_declares_nothing(self) -> None:
+        approve = '[ui]\npermission_mode = "always-approve"\n'
+        self.assertIsNone(self._grok_class_for(["grok", "x" * (70 * 1024), "--permission-mode", "default"], approve, 4300))
+        self.assertEqual("bypass", self._grok_class_for(["grok", "x" * 1024], approve, 4302))
+
+    def test_grok_permission_class_reaches_the_frame(self) -> None:
+        """Grok 发起方的类别原样进 Claude 消息帧的 from-mode：owner 的形状不再是「未知」（DESIGN §60 ③）。"""
+        sender_class = self._grok_class_for(["grok"], '[ui]\npermission_mode = "always-approve"\n', 4400)
+        content = json.loads(build_frame("正文", DeliveryContext(message_uuid="m", sender_name="x", sender_class=sender_class)))
+        self.assertIn('from-mode="bypass"', content["message"]["content"])
+
+    def test_codex_permission_class_reaches_the_frame(self) -> None:
+        """分类结果原样进 Claude 消息帧的 from-mode：跨层的 --approve-for-me 不再写出 bypass（DESIGN §58.4 接线断言）。"""
+        yolo = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n'
+        sender_class = self._codex_class_for(["codex", "--yolo", "resume", "--approve-for-me"], yolo, 3400)
+        content = json.loads(build_frame("正文", DeliveryContext(message_uuid="m", sender_name="x", sender_class=sender_class)))
+        self.assertIn('from-mode="prompting"', content["message"]["content"])
+        # app-server 仍固定未知，不按全局 yolo 配置推（DESIGN §53.4.4）
+        self.assertIsNone(self._codex_class_for(["codex", "app-server", "--approve-for-me"], yolo, 3402))
 
     def test_codex_command_line_overrides_take_precedence(self) -> None:
         config = self.root / "codex.toml"

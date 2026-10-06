@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 import fcntl
 import threading
 import time
@@ -18,18 +19,24 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from agentstatus_bridge import cli, doctor, naming, paths, views
+from agentstatus_bridge import cli, doctor, naming, observer_dbus, paths, summary, views
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
-from agentstatus_bridge.endpoints import Caller
-from agentstatus_bridge.hints import PaneState
+from agentstatus_bridge.endpoints import Caller, DiscoverySources
+from agentstatus_bridge.observer_dbus import ObserverView
 from agentstatus_bridge.model import Consumption, Delivery, Endpoint, EndpointRef, Flow, Provider, Role, Runtime, Verdict, Work
 from agentstatus_bridge.procfs import ProcessInfo
 from agentstatus_bridge.store import Store, StoreError
-from bridge_support import endpoint, ref
+from bridge_support import discovering, endpoint, ref
 
-IMPL = endpoint(ref(Provider.CODEX, "impl-thread", pid=1000, pane="%1", label="impl"))
+IMPL = endpoint(ref(Provider.CODEX, "impl-thread", pid=1000, pane="%1", label="impl", server=100))
 REVIEW = endpoint(ref(Provider.CLAUDE, "review-session", pid=2000, pane="%2", label="review"))
-LEAD = endpoint(ref(Provider.CODEX, "lead-thread", pid=3000, pane="%3", label="lead"))
+LEAD = endpoint(ref(Provider.CODEX, "lead-thread", pid=3000, pane="%3", label="lead", server=100))
+
+
+def own_row(live: Endpoint, match: str = "generation", **fields: object) -> dict[str, object]:
+    """目标自己的 observer 行，`match` 选代际键或（Claude）会话键：键与摘要的 `endpoint_binding` 同算法（该算法另由 observer 对照用例锁定）。"""
+    [key] = [item["key"] for item in summary.endpoint_binding(live.ref)["observerKeys"] if item["match"] == match]
+    return {"key": key, "paneId": live.ref.pane, "agent": live.ref.provider.value, **fields}
 # 只读 provider：发现阶段就带 no_inbox，所有投递入口都要拒（DESIGN §45.34）
 GROK = endpoint(ref(Provider.GROK, "019a0000-cccc-7ccc-8ccc-cccccccccccc", pid=4000, pane="%9", label="grok"))
 
@@ -48,9 +55,21 @@ class CliTests(unittest.TestCase):
         self.endpoints: list[Endpoint] = [IMPL, REVIEW, LEAD]
         self.caller = USER
         self.worker_up = True
-        self.panes: dict[str, PaneState] = {}
+        # AgentStatus 快照在最底层替换：给原始 ListSessions 行并计数，选行与解析都走真实代码（DESIGN §55.4）。
+        # rows 是每次读取都给的行；replies 非空时按读取次序逐份给（读多了就重复最后一份，不抛 StopIteration）
+        self.rows: list[dict[str, object]] = []
+        self.replies: list[list[dict[str, object]]] = []
+        self.observer_reads = 0
+        self.discovered: list[tuple[DiscoverySources | None, ObserverView]] = []
+
+        def read_rows() -> list[dict[str, object]]:
+            self.observer_reads += 1
+            if self.replies:
+                return [dict(item) for item in self.replies[min(self.observer_reads, len(self.replies)) - 1]]
+            return [dict(item) for item in self.rows]
+
         patches = [
-            patch.object(cli, "agentstatus_panes", side_effect=lambda: dict(self.panes)),
+            patch.object(observer_dbus, "_observer_rows", side_effect=read_rows),
             # doctor 会 `shutil.which("codex")` 并**真的执行**它（strace 实证：还会在真实 ~/.codex 下
             # 建目录与锁），也会探测真实 `~/.claude/sessions`。测试不该碰 PATH 上任意同名程序与真实
             # agent 目录，两处都在这里注入（独立 Fable 审计 P3-4）
@@ -66,7 +85,7 @@ class CliTests(unittest.TestCase):
             patch.object(doctor, "agentstatus_runtime", return_value={}),
             # doctor 的标题检查会扫真实 /proc 与 tmux（DESIGN §53.5）
             patch.object(doctor, "codex_title_report", return_value={"daemonMode": False}),
-            patch.object(cli, "discover", side_effect=lambda: list(self.endpoints)),
+            patch.object(cli, "discover", side_effect=discovering(lambda: list(self.endpoints), self.discovered)),
             patch.object(cli, "identify_caller", side_effect=lambda _endpoints: self.caller),
             patch.object(cli, "ensure_worker", return_value=False),
             patch.object(cli, "worker_running", side_effect=lambda _root: self.worker_up),
@@ -135,6 +154,45 @@ class CliTests(unittest.TestCase):
         self.assertTrue(value.endswith("/agentstatus_bridge"), value)
         code, out, _err = self.run_cli("doctor")
         self.assertIn(f"包路径：{value}\n", out)
+
+    def test_doctor_counts_a_readable_observer_with_zero_sessions_as_readable(self) -> None:
+        """「忙闲状态可读」只看 observer 能不能读，零可见会话也算可读（DESIGN §59）。
+
+        换回真实的 `agentstatus_runtime`，在最底层的 `_observer_rows` 上给三种回复。
+        """
+        row: dict[str, object] = {"key": "claude:abc", "paneId": "%5", "freshness": "fresh", "runtimeState": "ready"}
+        cases: list[tuple[list[dict[str, object]] | None, bool]] = [([], True), ([row], True), (None, False)]
+        for reply, expected in cases:
+            with self.subTest(reply=reply), \
+                    patch.object(doctor, "agentstatus_runtime", observer_dbus.agentstatus_runtime), \
+                    patch.object(observer_dbus, "_observer_rows", return_value=reply):
+                code, out, err = self.run_cli("doctor", "--json")
+                self.assertEqual(code, cli.EXIT_OK, err)
+                self.assertIs(json.loads(out)["agentstatusRuntimeAvailable"], expected)
+
+    def test_peers_works_when_the_observer_cannot_be_read(self) -> None:
+        """observer 不在线（读不到）是最常见的情形：`ab peers` 照常退出 0（Opus P3-5）。"""
+        with patch.object(observer_dbus, "_observer_rows", return_value=None):
+            try:
+                code, _out, err = self.run_cli("peers")
+            except TypeError as error:
+                self.fail(f"observer 读不到时 ab peers 抛出 {error!r}")
+        self.assertEqual(code, cli.EXIT_OK, err)
+        self.assertNotIn("Traceback", err)
+
+    def test_peers_survives_observer_rows_whose_enums_are_not_strings(self) -> None:
+        """observer 行的 `freshness`、`runtimeState` 是数组或对象时，`ab peers` 不打出堆栈（DESIGN §59）。"""
+        self.rows = [
+            {"key": "claude:aaa", "paneId": "%1", "freshness": [], "runtimeState": "ready"},
+            {"key": "codex:bbb", "paneId": "%2", "freshness": "fresh", "runtimeState": {}},
+        ]
+        try:
+            code, _out, err = self.run_cli("peers")
+        except TypeError as error:  # 让缺陷以 FAIL 出现，而不是 ERROR
+            self.fail(f"ab peers 抛出 {error!r}")
+        self.assertEqual(code, cli.EXIT_OK, err)
+        self.assertNotIn("Traceback", err)
+        self.assertGreater(self.observer_reads, 0)  # 前提：这些行真的被读过
 
     def test_read_only_target_is_refused_at_every_entry(self) -> None:
         self.endpoints = [IMPL, REVIEW, LEAD, endpoint(GROK.ref, issues=("no_inbox",))]
@@ -360,7 +418,7 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("codexVersionVerified", document)
         evidence = document["codexQueueEvidence"]
         assert isinstance(evidence, dict)
-        line = next(item for item in text.splitlines() if item.startswith("Codex 输出证据"))
+        line = next(item for item in text.splitlines() if item.startswith("Codex CLI 输出证据"))
         return evidence, line
 
     SAMPLE = {"codexVersion": "0.156.0", "queueOutput": "recognized"}
@@ -368,7 +426,7 @@ class CliTests(unittest.TestCase):
     def test_doctor_codex_evidence_texts(self) -> None:
         """四种文字各一例（DESIGN §45.44 二.6）；写死版本前缀的 codexVersionVerified 已删。"""
         evidence, line = self.doctor(None)
-        self.assertEqual((evidence["state"], line), ("version_unavailable", "Codex 输出证据：当前 codex 版本不可用，无法关联样本"))
+        self.assertEqual((evidence["state"], line), ("version_unavailable", "Codex CLI 输出证据：当前 codex 版本不可用，无法关联样本"))
         evidence, line = self.doctor()
         self.assertEqual(evidence["state"], "no_samples")
         self.assertIn("0.156.0 在本次查询窗口内没有可用样本（旧记录可能未记这两个字段）", line)
@@ -381,7 +439,7 @@ class CliTests(unittest.TestCase):
         with patch.object(Store, "recent_codex_details", side_effect=sqlite3.OperationalError("synthetic")):
             evidence, line = self.doctor()
         # 读失败不能显示成零样本
-        self.assertEqual((evidence["state"], line), ("ledger_unreadable", "Codex 输出证据：账本读取失败，无法统计"))
+        self.assertEqual((evidence["state"], line), ("ledger_unreadable", "Codex CLI 输出证据：账本读取失败，无法统计"))
 
     def test_doctor_window_follows_creation_time_not_insertion_order(self) -> None:
         # 先插入、但创建时间最新的那条仍在窗口里：排序按 created_at，不按 rowid
@@ -906,7 +964,7 @@ class CliTests(unittest.TestCase):
         # worker 已观察到 Codex 队列项离开队列；未观察到时不应提示（DESIGN §45.12）
         with self.store() as store:
             store.set_consumption(store.attempts(task_id)[0].id, Consumption.LEFT_QUEUE, now=3.0)
-        self.panes = {"%1": PaneState(Runtime.IDLE, time.time() - 120, True)}
+        self.rows = [own_row(IMPL, runtimeState="ready", freshness="fresh", lastTurnEndedAt=time.time() - 120)]
         code, out, _ = self.run_cli("status", task_id)
         self.assertEqual(code, 0)
         self.assertIn("还没有汇报", out)
@@ -922,6 +980,153 @@ class CliTests(unittest.TestCase):
         self.caller = as_agent(IMPL)
         self.assertEqual(self.run_cli("report", task_id, "--result", "--note", "完成")[0], 0)
         self.caller = USER
+        self.assertFalse(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+
+    def test_stopped_hint_takes_the_fresh_row_when_the_pane_also_has_a_stale_one(self) -> None:
+        """S1：同一 pane 上新鲜的 ready 行后面还有一条 stale 行时，按新鲜那行提示，与面板一致（DESIGN §55.1、§55.4 用例 5）。"""
+        code, out, err = self.run_cli("send", "--to", "claude@review", "-m", "复核 X", "--no-wait", "--json")
+        self.assertEqual(code, cli.EXIT_OK, err)
+        task_id = json.loads(out)["id"]
+        self.mark_sent(task_id, Delivery.DELIVERED)
+        ended = time.time() - 120
+        claude = own_row(REVIEW, "session", runtimeState="ready", freshness="fresh", lastTurnEndedAt=ended)
+        codex = {"key": "codex:" + "b" * 24, "paneId": "%2", "runtimeState": "ready", "freshness": "stale", "lastTurnEndedAt": ended + 30}
+        # observer 的真实行序就是这样（新鲜的 Claude 行在前）：旧实现取末行，提示被 stale 行压住
+        self.rows = [claude, codex]
+        document = json.loads(self.run_cli("status", task_id, "--json")[1])
+        self.assertTrue(document["targetStoppedWithoutReport"])
+        self.assertEqual(document["targetTurnEndedAt"], ended)
+        self.assertIn("对方已停下未汇报", self.run_cli("tasks")[1])
+        # 对照：pane 上只有那条 stale 行时不提示
+        self.rows = [codex]
+        self.assertFalse(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+
+    def test_stopped_hint_does_not_borrow_another_providers_row(self) -> None:
+        """Codex 目标的 pane 上只有别家的行时不提示；同 provider 的行照常提示（DESIGN §62 ④）。"""
+        task_id = self.send()
+        self.mark_sent(task_id)
+        with self.store() as store:
+            store.set_consumption(store.attempts(task_id)[0].id, Consumption.LEFT_QUEUE, now=3.0)
+        ended = time.time() - 120
+        self.rows = [{"paneId": "%1", "agent": "claude", "runtimeState": "ready", "freshness": "fresh", "lastTurnEndedAt": ended}]
+        self.assertFalse(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+        self.rows = [own_row(IMPL, runtimeState="ready", freshness="fresh", lastTurnEndedAt=ended)]
+        self.assertTrue(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+
+    def test_stopped_hint_only_trusts_the_targets_own_generation(self) -> None:
+        """Codex 目标的停下提示按它的进程代际键取行（DESIGN §62 ⑤，Codex 第 1 轮 F03）。
+
+        legacy Codex：任务交给 B 时它在别的 pane；A 在 %1 结束一轮后挂起，B 在 %1 恢复。%1 有两个根进程、解析失败，
+        observer 只保持着 A 的行（宽限内 aging），B 不可见——A 的结束时刻不能替 B 作证。
+        """
+        task_id = self.send()
+        self.mark_sent(task_id)
+        with self.store() as store:
+            store.set_consumption(store.attempts(task_id)[0].id, Consumption.LEFT_QUEUE, now=3.0)
+        older = endpoint(ref(Provider.CODEX, "other-thread", pid=990, start="90", pane="%1", label="impl", server=100))
+        ended = time.time() - 120
+        self.rows = [own_row(older, runtimeState="ready", freshness="aging", lastTurnEndedAt=ended)]
+        self.assertFalse(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+        # 对照：B 自己的行
+        self.rows = [own_row(IMPL, runtimeState="ready", freshness="aging", lastTurnEndedAt=ended)]
+        self.assertTrue(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+        # 算不出代际键（端点没有 tmux server）：不替目标作证
+        self.endpoints = [endpoint(replace(IMPL.ref, server_pid=None)), REVIEW, LEAD]
+        self.assertFalse(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+
+    def test_stopped_hint_for_claude_takes_the_generation_row_then_the_session_row_on_the_pane(self) -> None:
+        """Claude 目标：代际行优先；没有代际行时会话行必须在活端点的 pane 上（DESIGN §62 ⑤）。"""
+        code, out, err = self.run_cli("send", "--to", "claude@review", "-m", "复核 X", "--no-wait", "--json")
+        self.assertEqual(code, cli.EXIT_OK, err)
+        task_id = json.loads(out)["id"]
+        self.mark_sent(task_id, Delivery.DELIVERED)
+        ended = time.time() - 120
+        session = own_row(REVIEW, "session", runtimeState="ready", freshness="fresh", lastTurnEndedAt=ended)
+        self.rows = [session]
+        self.assertTrue(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+        # 会话行在别的 pane（这条会话的另一代）：不提示
+        self.rows = [{**session, "paneId": "%9"}]
+        self.assertFalse(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+        # 代际行说了算：它还在忙时，同 pane 会话行里旧的结束时刻不算
+        generation = own_row(REVIEW, runtimeState="working", freshness="fresh", lastTurnEndedAt=ended)
+        self.rows = [session, generation]
+        self.assertFalse(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+        self.rows = [session, {**generation, "runtimeState": "ready"}]
+        self.assertTrue(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
+
+    def test_query_commands_read_the_observer_snapshot_once(self) -> None:
+        """有未结束任务时 tasks/status 只读一次 ListSessions，发现与提示用同一份快照（DESIGN §55.4 用例 4）。"""
+        # 没有任务：tasks 不读
+        self.observer_reads = 0
+        self.assertEqual(self.run_cli("tasks")[0], 0)
+        self.assertEqual(self.observer_reads, 0)
+        task_id = self.send()
+        self.mark_sent(task_id)
+        with self.store() as store:
+            store.set_consumption(store.attempts(task_id)[0].id, Consumption.LEFT_QUEUE, now=3.0)
+        # _observations 本身：读一次，discover 收到的 runtime 就是返回的那份快照
+        self.observer_reads = 0
+        self.discovered.clear()
+        _, observed = cli._observations()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.observer_reads, 1)
+        [(sources, served)] = self.discovered
+        assert sources is not None
+        self.assertIs(served, observed)
+        # 只换 runtime：其他发现来源仍是默认值（Opus 实现复核 P3-1）
+        self.assertEqual(replace(sources, runtime=DiscoverySources().runtime), DiscoverySources())
+        # 两次读取会读到不同内容时，提示按唯一那次读取判（旧实现的第二次读取会读到 working、不提示）
+        ended = time.time() - 120
+        self.replies = [
+            [own_row(IMPL, runtimeState="ready", freshness="fresh", lastTurnEndedAt=ended)],
+            [own_row(IMPL, runtimeState="working", freshness="fresh", lastTurnEndedAt=ended)],
+        ]
+        for command in (("status", task_id, "--json"), ("tasks", "--json")):
+            with self.subTest(command=command[0]):
+                self.observer_reads = 0
+                code, out, _ = self.run_cli(*command)
+                self.assertEqual(code, 0)
+                self.assertEqual(self.observer_reads, 1)
+                document = json.loads(out)
+                item = document if command[0] == "status" else document["tasks"][0]
+                self.assertTrue(item["targetStoppedWithoutReport"])
+        # 任务结束后：status 与 tasks 都不再读
+        self.replies = []
+        self.caller = as_agent(IMPL)
+        self.assertEqual(self.run_cli("report", task_id, "--result", "--note", "完成")[0], 0)
+        self.caller = USER
+        self.assertEqual(self.run_cli("accept", task_id)[0], 0)
+        # `tasks --all` 列出的全是已结束任务：列表非空也不读（Codex 实现复核 N01）
+        for command in (("status", task_id), ("tasks",), ("tasks", "--all")):
+            with self.subTest(finished=" ".join(command[:2])):
+                self.observer_reads = 0
+                self.assertEqual(self.run_cli(*command)[0], 0)
+                self.assertEqual(self.observer_reads, 0)
+
+    def test_tasks_reads_once_for_many_open_tasks(self) -> None:
+        """多个未结束任务共用一份快照，不按任务各读一次（Opus 实现复核 P3-2）。"""
+        for _ in range(3):
+            self.mark_sent(self.send())
+        self.observer_reads = 0
+        code, out, _ = self.run_cli("tasks", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(json.loads(out)["tasks"]), 3)
+        self.assertEqual(self.observer_reads, 1)
+
+    def test_stopped_hint_follows_the_live_generation_pane(self) -> None:
+        """对方在另一个 pane 恢复了同一 thread：按活端点当前的 pane 取行，不按账本里送达时的 pane（Fable 实现复核 P3-1）。"""
+        task_id = self.send()
+        self.mark_sent(task_id)
+        with self.store() as store:
+            store.set_consumption(store.attempts(task_id)[0].id, Consumption.LEFT_QUEUE, now=3.0)
+        resumed = endpoint(ref(Provider.CODEX, "impl-thread", pid=1007, pane="%7", label="impl", server=100))
+        self.endpoints = [resumed, REVIEW, LEAD]
+        ended = time.time() - 120
+        self.rows = [own_row(resumed, runtimeState="ready", freshness="fresh", lastTurnEndedAt=ended)]
+        document = json.loads(self.run_cli("status", task_id, "--json")[1])
+        self.assertTrue(document["targetStoppedWithoutReport"])
+        self.assertEqual(document["targetTurnEndedAt"], ended)
+        # 对照：账本里的旧 pane %1 上的行不算数
+        self.rows = [own_row(IMPL, runtimeState="ready", freshness="fresh", lastTurnEndedAt=ended)]
         self.assertFalse(json.loads(self.run_cli("status", task_id, "--json")[1])["targetStoppedWithoutReport"])
 
     def test_status_flags_target_session_that_is_not_found(self) -> None:

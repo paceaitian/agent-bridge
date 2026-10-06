@@ -31,6 +31,8 @@ from agentstatus_bridge.transports.claude_peer import (
     parse_receipt,
 )
 from agentstatus_bridge.transports.codex_queue import (
+    CHANNEL_KEY,
+    FALLBACK_KEY,
     MAX_ARGV_MESSAGE_BYTES,
     OUTPUT_KEY,
     UNKNOWN_VERSION,
@@ -44,13 +46,32 @@ from agentstatus_bridge.transports.codex_queue import (
     queue_item_state,
     summarize_queue_evidence,
 )
+from agentstatus_bridge.transports.codex_rpc import RpcFallback
 from bridge_support import endpoint, ref
 
 THREAD = "019a0000-1111-7222-8333-444455556666"
 ITEM = "019A9999-AAAA-7BBB-8CCC-DDDDEEEEFFFF"
+# CLI 通道的用例：daemon 不在线，RPC 在连接之前就回退（DESIGN §61.2 第 1 条）
+CLI_FALLBACK = {CHANNEL_KEY: "cli", FALLBACK_KEY: "socket_missing"}
+
+
+def no_daemon(*_args: object, **_kwargs: object) -> RpcFallback:
+    return RpcFallback("socket_missing")
+
+
+def _isolate_codex_home(case: unittest.TestCase) -> None:
+    """`CODEX_HOME` 指向临时目录（DESIGN §61.2 第 9 条）：用例自己隔离，守卫只是最后一道防线（§61 第 2 轮 Opus P3-2）。"""
+    home = TemporaryDirectory(dir="/var/tmp" if os.path.isdir("/var/tmp") else None)
+    case.addCleanup(home.cleanup)
+    patcher = patch.dict(os.environ, {"CODEX_HOME": home.name})
+    patcher.start()
+    case.addCleanup(patcher.stop)
 
 
 class CodexQueueTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _isolate_codex_home(self)
+
     def _transport(self, result: RunResult | Exception) -> tuple[CodexQueueTransport, list[Sequence[str]]]:
         calls: list[Sequence[str]] = []
 
@@ -60,7 +81,7 @@ class CodexQueueTests(unittest.TestCase):
                 raise result
             return result
 
-        return CodexQueueTransport(executable="/usr/bin/codex", runner=runner), calls
+        return CodexQueueTransport(executable="/usr/bin/codex", runner=runner, rpc=no_daemon), calls
 
     def _deliver(self, transport: CodexQueueTransport, text: str = "hello"):
         context = DeliveryContext(message_uuid="u", sender_name="user")
@@ -130,6 +151,8 @@ class CodexQueueTests(unittest.TestCase):
                 endpoint(ref(native=THREAD)), "x", DeliveryContext(message_uuid="u", sender_name="user")
             )
         self.assertEqual((outcome.delivery, outcome.reason), (Delivery.FAILED, "codex_cli_missing"))
+        # 找不到 codex 就取不到 initialize 要用的版本：不连 socket
+        self.assertEqual(outcome.detail, {CHANNEL_KEY: "cli", FALLBACK_KEY: "version_unavailable"})
 
     def test_outcome_detail_never_carries_command_output(self) -> None:
         """stdout/stderr 只用来分类、不进 detail（DESIGN §45.43 2.3 的负例）。
@@ -178,6 +201,7 @@ class CodexQueueEvidenceTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
+        _isolate_codex_home(self)
         self._tmp = TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         base = Path(self._tmp.name)
@@ -219,7 +243,7 @@ class CodexQueueEvidenceTests(unittest.TestCase):
         raise AssertionError(argv)
 
     def transport(self) -> CodexQueueTransport:
-        return CodexQueueTransport(executable=str(self.entry), runner=self.runner)
+        return CodexQueueTransport(executable=str(self.entry), runner=self.runner, rpc=no_daemon)
 
     def deliver(self, transport: CodexQueueTransport | None = None, text: str = "hello"):
         context = DeliveryContext(message_uuid="u", sender_name="user")
@@ -257,32 +281,38 @@ class CodexQueueEvidenceTests(unittest.TestCase):
         self.queue_result = subprocess.TimeoutExpired(["codex"], 60)
         outcome = self.deliver()
         self.assertEqual(outcome.reason, "codex_queue_timeout")
-        self.assertEqual(outcome.detail, {VERSION_KEY: "0.155.1"})
+        self.assertEqual(outcome.detail, {VERSION_KEY: "0.155.1", **CLI_FALLBACK})
 
     def test_no_external_call_leaves_no_evidence(self) -> None:
-        self.assertEqual(self.deliver(text="x" * (MAX_ARGV_MESSAGE_BYTES + 1)).detail, {})
+        # 没有外调 CLI 就没有版本与输出证据；通道与回退原因照记
+        self.assertEqual(self.deliver(text="x" * (MAX_ARGV_MESSAGE_BYTES + 1)).detail, CLI_FALLBACK)
         self.queue_result = FileNotFoundError("codex")
-        self.assertEqual(self.deliver().detail, {})
+        self.assertEqual(self.deliver().detail, CLI_FALLBACK)
         with patch("agentstatus_bridge.transports.codex_queue.shutil.which", return_value=None):
             outcome = CodexQueueTransport(runner=self.runner).deliver(
                 endpoint(ref(native=THREAD)), "x", DeliveryContext(message_uuid="u", sender_name="user")
             )
-        self.assertEqual((outcome.reason, outcome.detail), ("codex_cli_missing", {}))
-        self.assertEqual(self.version_calls(), [])
+        self.assertEqual((outcome.reason, outcome.detail),
+                         ("codex_cli_missing", {CHANNEL_KEY: "cli", FALLBACK_KEY: "version_unavailable"}))
+        # 前两次投递前各为 RPC 身份查过一次（各自新建 transport、无缓存）；没有外调 CLI 时不再为事后取证另查
+        self.assertEqual(len(self.version_calls()), 2)
 
     def test_version_comes_from_the_release_resolved_before_the_call(self) -> None:
         outcome = self.deliver()
         self.assertEqual(outcome.detail[VERSION_KEY], "0.155.1")
-        # 查版本用的是不可变的 release 路径，而 queue 本身仍经原入口调用（不改 argv[0]）
-        self.assertEqual(self.calls[0][0][0], str(self.entry))
-        self.assertEqual(self.calls[1], ([os.path.realpath(self.releases["0.155.1"]), "--version"], VERSION_TIMEOUT_SECONDS))
+        # 查版本用的是不可变的 release 路径，而 queue 本身仍经原入口调用（不改 argv[0]）；版本在投递前为 RPC
+        # 身份查过一次，事后取证命中缓存
+        self.assertEqual([argv[0] for argv, _ in self.calls if argv[1] == "queue"], [str(self.entry)])
+        self.assertEqual(self.calls[0], ([os.path.realpath(self.releases["0.155.1"]), "--version"], VERSION_TIMEOUT_SECONDS))
+        self.assertEqual(len(self.version_calls()), 1)
 
     def test_entry_switched_during_the_call_is_unknown(self) -> None:
         """Codex V01：投后再解析入口会把旧程序的结果记到新版本头上。"""
         self.switch_during_queue = "0.156.0"
         outcome = self.deliver()
         self.assertEqual((outcome.delivery, outcome.detail[VERSION_KEY]), (Delivery.QUEUED, UNKNOWN_VERSION))
-        self.assertEqual(self.version_calls(), [])
+        # 只有投前为 RPC 身份查的那一次（0.155.1）；投后入口已切换，不再查、不归到任何版本
+        self.assertEqual(self.version_calls(), [[os.path.realpath(self.releases["0.155.1"]), "--version"]])
 
     def test_diagnostic_failures_never_rewrite_the_outcome(self) -> None:
         module = "agentstatus_bridge.transports.codex_queue"
@@ -293,7 +323,9 @@ class CodexQueueEvidenceTests(unittest.TestCase):
                     outcome = self.deliver(transport)
                 self.assertTrue(failing.called)
                 self.assertEqual((outcome.delivery, outcome.provider_ref), (Delivery.QUEUED, ITEM.lower()))
-                self.assertEqual(outcome.detail, {VERSION_KEY: UNKNOWN_VERSION, OUTPUT_KEY: "recognized"})
+                self.assertEqual(outcome.detail[VERSION_KEY], UNKNOWN_VERSION)
+                self.assertEqual(outcome.detail[OUTPUT_KEY], "recognized")
+                self.assertEqual(outcome.detail[CHANNEL_KEY], "cli")
 
     def test_version_is_cached_per_release_and_failures_are_not(self) -> None:
         transport = self.transport()
@@ -328,16 +360,17 @@ class CodexQueueEvidenceTests(unittest.TestCase):
         real = os.path.realpath
         calls = 0
 
-        def fail_second(path: str) -> str:
+        def fail_after_the_call(path: str) -> str:
+            # 第 1 次是 RPC 准备、第 2 次是 CLI 外调前，第 3 次才是外调之后
             nonlocal calls
             calls += 1
-            if calls == 2:
+            if calls == 3:
                 raise OSError("SYNTHETIC")
             return real(path)
 
-        with patch("agentstatus_bridge.transports.codex_queue.os.path.realpath", side_effect=fail_second):
+        with patch("agentstatus_bridge.transports.codex_queue.os.path.realpath", side_effect=fail_after_the_call):
             outcome = self.deliver()
-        self.assertEqual(calls, 2)
+        self.assertEqual(calls, 3)
         self.assertEqual((outcome.delivery, outcome.provider_ref), (Delivery.QUEUED, ITEM.lower()))
         self.assertEqual(outcome.detail[VERSION_KEY], UNKNOWN_VERSION)
 

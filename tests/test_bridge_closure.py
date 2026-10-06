@@ -12,7 +12,7 @@ from typing import Any
 import unittest
 from unittest.mock import patch
 
-from agentstatus_bridge import cli, summary
+from agentstatus_bridge import cli, observer_dbus, summary
 from agentstatus_bridge import store as store_module
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
 from agentstatus_bridge.closure import (
@@ -29,7 +29,7 @@ from agentstatus_bridge.envelope import parse_header
 from agentstatus_bridge.model import Attempt, Consumption, Delivery, EndpointRef, Flow, Provider, Role, Runtime, Task, Work
 from agentstatus_bridge.store import Store, StoreError
 from agentstatus_bridge.transports import DeliveryOutcome, codex_queue
-from bridge_support import FakeProc, RecordingTransport, endpoint, ref
+from bridge_support import FakeProc, RecordingTransport, discovering, endpoint, ref
 from test_bridge_cli import IMPL, LEAD, REVIEW, USER, as_agent
 
 DAY = 86400.0
@@ -44,9 +44,10 @@ class ClosureCliTests(unittest.TestCase):
         self.caller = USER
         self.worker_up = True
         patches = [
-            patch.object(cli, "agentstatus_panes", side_effect=lambda: {}),
+            # AgentStatus 快照在最底层替换为空（DESIGN §55.4）：查询命令照真实代码读一次、什么也读不到
+            patch.object(observer_dbus, "_observer_rows", return_value=[]),
             patch.dict(os.environ, {"AB_STATE_DIR": str(self.state)}),
-            patch.object(cli, "discover", side_effect=lambda: [IMPL, REVIEW, LEAD]),
+            patch.object(cli, "discover", side_effect=discovering(lambda: [IMPL, REVIEW, LEAD])),
             patch.object(cli, "identify_caller", side_effect=lambda _endpoints: self.caller),
             patch.object(cli, "ensure_worker", return_value=False),
             patch.object(cli, "worker_running", side_effect=lambda _root: self.worker_up),

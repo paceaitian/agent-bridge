@@ -26,6 +26,7 @@ import re
 import sqlite3
 import stat
 import subprocess
+import tomllib
 from typing import Any
 
 from . import procfs
@@ -289,7 +290,7 @@ def _discover_claude(
         state = _CLAUDE_STATUS.get(status, Runtime.UNKNOWN) if isinstance(status, str) else Runtime.UNKNOWN
         source = "claude_registry"
         released = _claude_background_row(runtime, session_id, pane, pid, proc_start)
-        if pane is not None and runtime.get(pane.pane_id) is Runtime.WAITING:
+        if pane is not None and runtime.pane_runtime(pane.pane_id, Provider.CLAUDE) is Runtime.WAITING:
             state = Runtime.WAITING  # 原生审批/提问对话框打开；只用于显示与提示，§45.42 起不再影响投递
         elif (
             state is not Runtime.WAITING
@@ -549,7 +550,7 @@ def _codex_base(
     threads: Collection[str],
     consumers: Mapping[str, int],
 ) -> Endpoint:
-    state = runtime.get(pane.pane_id) if pane is not None else None
+    state = runtime.pane_runtime(pane.pane_id, Provider.CODEX) if pane is not None else None
     return Endpoint(
         ref=EndpointRef(
             provider=Provider.CODEX,
@@ -722,7 +723,7 @@ def _discover_grok(
                 held.add(match.group("uuid").lower())
         live = [session for session in sessions if session in held]  # 两边都已归一小写
         pane = _pane_for(pid, panes, sources.proc_root)
-        state = runtime.get(pane.pane_id) if pane is not None else None
+        state = runtime.pane_runtime(pane.pane_id, Provider.GROK) if pane is not None else None
         for session_id in live:
             endpoints.append(
                 Endpoint(
@@ -1156,26 +1157,160 @@ def _caller_from_env(
     return None
 
 
-def _argv_tokens(pid: int, proc_root: Path) -> list[str]:
+# 判权限类别时读命令行的上限；超过就是没读全（DESIGN §58.8）
+_PERMISSION_ARGV_BYTES = 64 * 1024
+
+
+def _argv_tokens(pid: int, proc_root: Path) -> tuple[list[str], bool]:
+    """读进程命令行用于识别启动标志：(token 列表, 是否读全)；只在内存里比较，不保存也不输出。
+
+    读失败或为空（进程正在退出等）也算没读全：读不到就不声明（DESIGN §58.8 第 2 轮）。
+    """
     try:
-        raw = (proc_root / str(pid) / "cmdline").read_bytes()[: 64 * 1024]
+        # 有界读取：多读一个字节用来判断是否超过上限，与 procfs.launch_tokens 一致不整份读入
+        with (proc_root / str(pid) / "cmdline").open("rb") as stream:
+            raw = stream.read(_PERMISSION_ARGV_BYTES + 1)
     except OSError:
-        return []
-    # 只用于识别启动标志，不保存也不输出
-    return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+        return [], False
+    complete = 0 < len(raw) <= _PERMISSION_ARGV_BYTES
+    raw = raw[:_PERMISSION_ARGV_BYTES]
+    return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part], complete
+
+
+# Grok 的权限模式（DESIGN §60 ③）。以上游公开源码为准（xai-org/grok-build 1.0.45：`pager/src/app/cli.rs`、
+# `xai-grok-shell/src/util/config/permissions.rs`、`xai-grok-agent/src/config.rs`），随装文档与它有出入的地方见 DESIGN 60.1
+_GROK_BYPASS_FLAGS = frozenset({"--always-approve", "--yolo", "--dangerously-skip-permissions"})
+# `--permission-mode` 的合法取值（clap 校验，其他值启动不了）；只有 bypassPermissions 产生 always-approve
+_GROK_PROMPTING_CLI_MODES = frozenset({"default", "acceptEdits", "auto", "dontAsk", "plan"})
+# `[ui] permission_mode` 的取值：只有 always-approve 是 bypass（上游别的字符串都按询问处理，这里当认不出）
+_GROK_PROMPTING_CONFIG_MODES = frozenset({"default", "ask", "auto"})
+# 系统级 managed_config.toml 与 requirements.toml 的位置（`22-permissions-and-safety.md:106`）
+GROK_SYSTEM_DIR = Path("/etc/grok")
+
+
+def _present(path: Path) -> bool:
+    """文件在不在；拿不准（权限不足等）按在处理，免得把可能存在的锁当成没有。"""
+    try:
+        path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _grok_cli_mode(tokens: list[str]) -> str | None:
+    """启动参数里的权限请求：`bypass` / `prompting` / None（没写）/ `unknown`（认不出或互相冲突）。`--` 之后的不看。
+
+    上游只要给了 `--permission-mode` 就只看它（`resolve_effective_yolo`），随装文档却说与 always-approve 同时请求时
+    取 always-approve（22-permissions-and-safety.md:42）：两者都给、取值又不是 bypassPermissions 时说不准，判未知。
+    `grok agent`（ACP 服务）的权限由连上来的客户端决定，写在 `agent` 之前的顶层参数对它不起作用：命令行里有
+    `agent` 这个词就判未知（它也可能只是一段提示词，判未知是少报方向）。
+    """
+    bypass_flag = False
+    modes: set[str] = set()
+    arguments = tokens[1:]
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == "--":
+            break
+        if token == "agent":
+            return "unknown"
+        if token in _GROK_BYPASS_FLAGS:
+            bypass_flag = True
+        else:
+            name, separator, inline = token.partition("=")
+            if name == "--permission-mode":
+                if separator:
+                    modes.add(inline)
+                elif index + 1 < len(arguments):
+                    index += 1
+                    modes.add(arguments[index])
+                else:
+                    return "unknown"
+        index += 1
+    if len(modes) > 1 or any(mode not in _GROK_PROMPTING_CLI_MODES | {"bypassPermissions"} for mode in modes):
+        return "unknown"
+    mode = next(iter(modes), None)
+    if mode == "bypassPermissions":
+        return "bypass"
+    if mode is not None:
+        return "unknown" if bypass_flag else "prompting"
+    return "bypass" if bypass_flag else None
+
+
+def _grok_config_mode(home: Path) -> str | None:
+    """用户 `config.toml` 的 `[ui] permission_mode`：`bypass` / `prompting` / `unset`（没写）/ None（不知道）。只取这一个键。
+
+    项目级 `.grok/config.toml` 不能设 `ui`，`GROK_CONFIG` 覆盖层的白名单里也没有它（05-configuration.md:30、:324）。
+    旧键 `approval_mode`、`yolo` 不复刻上游的换算，有就判未知。
+    """
+    try:
+        with (home / "config.toml").open("rb") as handle:
+            config: dict[str, Any] = tomllib.load(handle)
+    except FileNotFoundError:
+        config = {}
+    except (OSError, ValueError):
+        return None
+    ui = config.get("ui", {})
+    if not isinstance(ui, dict):
+        return None
+    if "permission_mode" in ui:
+        mode = ui["permission_mode"]
+        if not isinstance(mode, str):
+            return None
+        if mode == "always-approve":
+            return "bypass"
+        return "prompting" if mode in _GROK_PROMPTING_CONFIG_MODES else None
+    return None if "approval_mode" in ui or "yolo" in ui else "unset"
+
+
+def _grok_class(tokens: list[str], home: Path, system_dir: Path) -> str | None:
+    """Grok 发起方的权限类别（DESIGN §60 ③）：启动参数 > 用户配置；只在有正面证据、且没有可能的锁时声明 bypass。
+
+    Claude 兼容的 `defaultMode` 不看：上游 always-approve 与它无关、且优先于 dontAsk（`permission-rules/src/resolution.rs`），
+    `bypassPermissions` 在那里只是一条兜底的允许规则，deny/ask 规则仍会拦，不等于 always-approve。用户配置没写时
+    账号侧的 remote 设置可能起作用，这里看不到，按会询问处理（少报）；`managed_config.toml` 可能补上这个键，存在就判未知。
+    读的是当前文件：能反映最近一次写盘的 TUI 切换（Shift+Tab 等会写回 `config.toml`），但不保证代表当前这个进程或
+    会话——另一个进程的切换也会写进来，Plan 与 headless 的 `/yolo` 不写盘、看不到（与 Claude、Codex 同口径）。
+    `requirements.toml`（`~/.grok/` 或系统目录）可以禁止 always-approve，这里不解析它：存在就不声明 bypass。
+    """
+    requested = _grok_cli_mode(tokens)
+    if requested == "unknown":
+        return None
+    if requested is None:
+        native = _grok_config_mode(home)
+        if native == "unset":
+            if any(_present(directory / "managed_config.toml") for directory in (home, system_dir)):
+                return None
+            native = "prompting"  # 内置默认会询问
+        requested = native
+    if requested != "bypass":
+        return requested
+    if any(_present(directory / "requirements.toml") for directory in (home, system_dir)):
+        return None
+    return "bypass"
 
 
 def permission_class(
-    caller: Caller, *, proc_root: Path = procfs.DEFAULT_PROC, codex_config: Path | None = None
+    caller: Caller,
+    *,
+    proc_root: Path = procfs.DEFAULT_PROC,
+    codex_config: Path | None = None,
+    grok_dir: Path | None = None,
 ) -> str | None:
     """如实判断发送方权限类别：bypass / prompting / None（不知道）。
 
     - 用户 shell（无 agent 迹象）：本人不受 agent 权限提示约束，等同 bypass。
     - Claude：只认启动参数中的明确模式；运行中切换无法从外部确认，未声明即未知。
-    - Codex：按启动参数、-c 覆盖、profile 与 config.toml 的优先级判断；无法确定即未知。
+    - Codex：根层与子命令层分开解析、按上游顺序合并启动参数（DESIGN §58），再按 profile 与 config.toml 补缺；
+      无法确定即未知；命令行超过读取上限、没读全时也判未知。非交互子命令的结果是近似，今天没有消费方（其调用者在入口被拒）。
     - 有 agent 迹象但看不到其进程：未知，不冒称 bypass。
     - Codex app-server（托管 daemon 等）：固定未知。它的 argv 没有权限参数，按 config.toml 推会在全局 yolo 配置下
       冒称 bypass；thread 的实际权限由当初加载它的一方决定（DESIGN §53.4.4，Opus 第 2 轮 P2-1）。
+    - Grok：启动参数，没写时看用户 config.toml 的 `[ui] permission_mode`；有 requirements.toml 时不声明 bypass，
+      命令行没读全判未知（DESIGN §60 ③）。
     """
     agent = caller.agent_process
     if agent is None and caller.endpoint is not None:
@@ -1184,7 +1319,7 @@ def permission_class(
             agent = info
     if agent is None:
         return None if caller.agent_env or caller.endpoint is not None else "bypass"
-    tokens = _argv_tokens(agent.pid, proc_root)
+    tokens, complete = _argv_tokens(agent.pid, proc_root)
     if agent.comm == "claude":
         if "--dangerously-skip-permissions" in tokens:
             return "bypass"
@@ -1196,7 +1331,12 @@ def permission_class(
             return "bypass" if mode == "bypassPermissions" else "prompting"
         return None
     if agent.comm == "codex":
-        if codex_app_server(tokens):
+        if codex_app_server(tokens) or not complete:
+            # 命令行没读全时被截掉的部分可能有改判的参数（如提示词后的 --approve-for-me），不声明（DESIGN §58.8）
             return None
         return _codex_class(tokens, codex_config or (default_codex_home() / "config.toml"))
+    if agent.comm == "grok":
+        if not complete:
+            return None
+        return _grok_class(tokens, grok_dir or grok_home(), GROK_SYSTEM_DIR)
     return None

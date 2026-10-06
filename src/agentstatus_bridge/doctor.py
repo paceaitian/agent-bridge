@@ -18,7 +18,7 @@ from .observer_dbus import agentstatus_runtime
 from .paths import claude_sessions_dir, device_name, state_dir, state_dir_source
 from .store import Store, StoreError
 from .transports.claude_peer import inbox_directory
-from .transports.codex_queue import EVIDENCE_WINDOW, cli_version, summarize_queue_evidence
+from .transports.codex_queue import EVIDENCE_WINDOW, cli_version, summarize_queue_evidence, summarize_rpc_evidence
 from .worker import read_log_tail, worker_running
 
 
@@ -71,9 +71,11 @@ def collect_checks() -> dict[str, object]:
         "codexThreadTitle": codex_title_report(),
         # 占位保住显示顺序，读完账本后填入
         "codexQueueEvidence": summarize_queue_evidence(None, version),
+        "codexRpcEvidence": summarize_rpc_evidence(None),
         "claudeRegistryReadable": os.access(claude_sessions_dir(), os.R_OK),
         "claudeInboxDirectory": inbox_directory().is_dir(),
-        "agentstatusRuntimeAvailable": bool(agentstatus_runtime()),
+        # 可读≠有会话：observer 在线、零可见会话时也算可读（DESIGN §59）
+        "agentstatusRuntimeAvailable": agentstatus_runtime() is not None,
         "workerLog": read_log_tail(root, lines=5),
     })
     try:
@@ -86,6 +88,7 @@ def collect_checks() -> dict[str, object]:
             except sqlite3.Error:
                 details = None  # 读失败就说读失败，不伪装成零样本
             checks["codexQueueEvidence"] = summarize_queue_evidence(details, version)
+            checks["codexRpcEvidence"] = summarize_rpc_evidence(details)
     except StoreError as error:
         checks["ledgerOk"] = False
         checks["ledgerError"] = error.code
@@ -117,6 +120,9 @@ def print_checks(checks: dict[str, object]) -> None:
     for key, value in checks.items():
         if key == "codexQueueEvidence" and isinstance(value, dict):
             print(queue_evidence_text(value))
+            continue
+        if key == "codexRpcEvidence" and isinstance(value, dict):
+            print(rpc_evidence_text(value))
             continue
         if key == "codexThreadTitle" and isinstance(value, dict):
             for line in thread_title_lines(value):
@@ -159,15 +165,46 @@ def thread_title_lines(report: Mapping[str, object]) -> list[str]:
     return lines
 
 
+def rpc_evidence_text(evidence: Mapping[str, object]) -> str:
+    """doctor 的「Codex RPC 证据」一行（DESIGN §61.2 第 7 条）。计数只说明响应落没落在已知分支，不说投递成败。"""
+    if evidence.get("state") == "ledger_unreadable":
+        return "Codex RPC 证据：账本读取失败，无法统计"
+    head = f"Codex RPC 证据（最近最多 {evidence.get('window')} 条 Codex 尝试）："
+    version = evidence.get("version")
+    unknown = evidence.get("unknownVersion")
+    has_unknown = isinstance(unknown, int) and unknown > 0
+    if evidence.get("state") == "ok":
+        text = (
+            f"{head}服务端 {version}（取最近一条能解析出服务端版本的可分类 RPC 响应样本，不证明 daemon 此刻的版本）命中已知分支 "
+            f"{evidence.get('recognized')} 次，未识别 {evidence.get('unrecognized')} 次；此统计不代表投递成功"
+        )
+    elif version is None and has_unknown:
+        # 有可分类的响应样本，只是都没解析出服务端版本：不能说「没有样本」
+        text = f"{head}经 daemon 得到的 {unknown} 条可分类响应样本都未能解析服务端版本，无法按版本关联"
+        has_unknown = False
+    else:
+        # add 之后断线、超时的尝试经过 RPC，但没有可分类的响应，不计入（§61 第 2 轮 Codex C01）
+        text = f"{head}在本次查询窗口内没有可分类的 RPC 响应样本（传输失败的尝试不计入此项）"
+    other = evidence.get("otherVersion")
+    if isinstance(other, int) and other > 0:
+        text += f"；另有 {other} 次记于其他服务端版本"
+    if has_unknown:
+        text += f"；另有 {unknown} 次未能解析服务端版本"
+    fallbacks = evidence.get("fallbacks")
+    if isinstance(fallbacks, int) and fallbacks > 0:
+        text += f"；回退 CLI {fallbacks} 次（最常见：{evidence.get('topFallback')}）"
+    return text
+
+
 def queue_evidence_text(evidence: Mapping[str, object]) -> str:
-    """doctor 的「Codex 输出证据」一行（DESIGN §45.44 二.6）。计数只说明输出落没落在已知分支，不说投递成败。"""
+    """doctor 的「Codex CLI 输出证据」一行（DESIGN §45.44 二.6）。计数只说明输出落没落在已知分支，不说投递成败。"""
     state = evidence.get("state")
     if state == "version_unavailable":
-        return "Codex 输出证据：当前 codex 版本不可用，无法关联样本"
+        return "Codex CLI 输出证据：当前 codex 版本不可用，无法关联样本"
     if state == "ledger_unreadable":
-        return "Codex 输出证据：账本读取失败，无法统计"
+        return "Codex CLI 输出证据：账本读取失败，无法统计"
     version = evidence.get("version")
-    head = f"Codex 输出证据（最近最多 {evidence.get('window')} 条 Codex 尝试）："
+    head = f"Codex CLI 输出证据（最近最多 {evidence.get('window')} 条 Codex 尝试）："
     if state == "ok":
         unrecognized = evidence.get("unrecognized")
         text = (
