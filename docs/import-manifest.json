@@ -33,7 +33,7 @@
     "tests/test_bridge_cli.py": "fcc0d3a83fbff838b7553b8a28b00684c54485b543c680bfbcd48219a43883ad",
     "tests/test_bridge_closure.py": "8408695c176456ab625689f9dc1df460d80ec5c8b751aba39cfcdc09e7f771ef",
     "tests/test_bridge_codex_daemon.py": "5d0a72df23db8789e2451417bdc14b90e4536a8aea180bd0ae7ae20070474947",
-    "tests/test_bridge_codex_rpc.py": "08b5d5172af02b9214bda93c2d467c87f96df104fb4eff3abb2e85717cf80b77",
+    "tests/test_bridge_codex_rpc.py": "bfa96cc395b701d8c2bac397b1eb6830d626fd16a6230060e8bc41b3175e2cf1",
     "tests/test_bridge_codex_threads.py": "10906724ff95952a74aa25b9fd400de3054ea52f7271fdc65ab698f3b9d91afa",
     "tests/test_bridge_dispatch.py": "e3d013bcc88ff7301a92bb159762ab1bffc396ab71707f53bfe8ce682d793a5a",
     "tests/test_bridge_endpoints.py": "6d6033ade104cb541f4cb5361c9fd1d36c96e99e8c00cb352de1d82ce0ddf60e",
@@ -49,7 +49,7 @@
     "tests/test_bridge_worker.py": "ec6842edf5555b612aa0db9f78445d0df272fff7e8042125b98254c3f715ccde"
   },
   "source": {
-    "commit": "a4900a1d650b227818cb4e876b71cbe3c2760417",
+    "commit": "26730e83769b692b6760c88d125923994cfa8bc1",
     "repository": "agentstatus"
   }
 }

@@ -119,6 +119,13 @@ class FakeDaemon:
         if self.thread is not None:
             self.thread.join(timeout=5)
 
+    def wait_connections(self, count: int, timeout: float = 5.0) -> None:
+        # 客户端 connect 返回时连接可能还在 backlog、服务线程尚未 accept；先关监听会让 accept 落空、
+        # 计数停在 0（CI 慢机实测）。等到计数或超时，真没连上时由调用方的断言以 FAIL 报出
+        deadline = time.monotonic() + timeout
+        while self.connections < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+
     def methods(self) -> list[str | None]:
         return [message.get("method") for message in self.received]
 
@@ -360,6 +367,7 @@ class SocketChecksTests(RpcCase):
 
         with patch.object(codex_rpc.struct, "unpack", side_effect=other_uid):
             self.assertEqual(self.add(daemon), RpcFallback("socket_rejected"))
+        daemon.wait_connections(1)
         daemon.close()
         self.assertEqual(daemon.connections, 1)  # 是连上之后被拒的，不是路径校验
         self.assertEqual(daemon.received, [])
