@@ -10,12 +10,14 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 import json
+import os
 import sqlite3
 from pathlib import Path
 import sys
 import time
 
 from . import __version__, procfs, summary
+from .codex_metadata import command_scope
 from .endpoints import (
     Caller,
     DiscoverySources,
@@ -60,7 +62,7 @@ from .model import (
 )
 from .naming import command_name
 from .observer_dbus import ObserverView, agentstatus_view
-from .paths import device_name, state_dir
+from .paths import codex_home, codex_sqlite_home, device_name, state_dir
 from .reports import ReportError, ReportInput, apply_report, file_reference
 from .store import DB_NAME, MAX_BODY_BYTES, Store, StoreError
 from .closure import ACCEPTED, CLOSED, ClosureOutcome, queue_closures
@@ -77,6 +79,9 @@ from .views import (
     _task_document,
 )
 from .worker import ensure_worker, run_worker, wait_for_worker, worker_running
+from .transports import local_codex
+from .transports.codex_queue import cli_version
+from .transports.codex_withdraw import QueueDeleteClient
 
 EXIT_OK = 0
 EXIT_TARGET = 2
@@ -778,9 +783,51 @@ def cmd_close(args: argparse.Namespace) -> int:
             )
         print(f"任务 {short(task.id)} 已停止追踪")
         if at_risk:
-            print("注意：已发出的消息无法撤回，对方仍可能继续执行")
+            print("注意：停止追踪不撤回已交接内容；可显式尝试移除仍在 Codex 队列中的项（withdraw），已开始的工作不能撤销")
         _print_closure(outcome)
     return EXIT_OK
+
+
+def cmd_withdraw(args: argparse.Namespace) -> int:
+    caller = identify_caller(discover())
+    _check_sender(caller)
+    now = time.time()
+    info = procfs.read_process(os.getpid())
+    if info is None:
+        raise CliError("withdraw_owner_unknown", EXIT_UNAVAILABLE)
+    home, sqlite_home = codex_home(), codex_sqlite_home()
+    root_identity = local_codex.platform().root_identity(home, sqlite_home)
+    if root_identity is None:
+        raise CliError("withdraw_root_unproven", EXIT_UNAVAILABLE)
+    with _open_store() as store:
+        store.recover_withdrawals(now=now)
+        with store.transaction():
+            task = _task(store, args.task)
+            if not _may_decide(caller, task):
+                raise CliError("accept_not_allowed")
+            try:
+                operation, created = store.prepare_withdrawal(task.id, args.attempt, root_identity=root_identity,
+                    now=now, pid=info.pid, start=info.start_ticks, again=args.again)
+            except StoreError as error:
+                if error.code in {"withdraw_attempt_missing", "withdraw_ineligible", "withdraw_root_unproven", "withdraw_limit"}:
+                    raise CliError(error.code) from error
+                raise
+        if created:
+            client = QueueDeleteClient(lambda timeout: cli_version(timeout=timeout))
+            outcome = client.delete(home, thread=operation["thread_id"], item=operation["item_id"],
+                root_identity=root_identity, sqlite_home=sqlite_home,
+                before_send=lambda: store.begin_withdrawal(operation["id"], now=time.time(), pid=info.pid, start=info.start_ticks))
+            store.finish_withdrawal(operation["id"], thread=operation["thread_id"], item=operation["item_id"],
+                state=outcome.state, reason=outcome.reason, version=outcome.server_version, now=time.time())
+        current = next(item for item in store.withdrawals(operation["task_id"]) if item["id"] == operation["id"])
+        if args.json:
+            _print_json({"version": 1, "taskId": task.id, "operation": current,
+                         "execution": "not_proven_unexecuted"})
+        else:
+            print(f"任务 {short(task.id)} #{args.attempt} 撤回：{current['state']}（{current['reason']}）")
+            print("仅描述原生队列项；不证明从未执行，不能停止已开始的工作；原投递与重发规则不变")
+        return {"deleted": EXIT_OK, "absent": EXIT_OK, "refused": EXIT_REJECTED,
+                "unknown": EXIT_UNKNOWN}.get(current["state"], EXIT_UNAVAILABLE)
 
 
 def _rework_body(first: Attempt, current: Attempt, task: Task, extra: str | None) -> str:
@@ -1075,6 +1122,13 @@ def build_parser() -> argparse.ArgumentParser:
     close.add_argument("--reason")
     close.set_defaults(handler=cmd_close)
 
+    withdraw = commands.add_parser("withdraw", help="显式移除指定 Codex 原生队列项（不证明未执行）")
+    withdraw.add_argument("task")
+    withdraw.add_argument("--attempt", type=int, required=True, help="明确指定原投递尝试序号")
+    withdraw.add_argument("--again", action="store_true", help="未知/未尝试/拒绝后另建一次显式操作，不自动重试")
+    withdraw.add_argument("--json", action="store_true")
+    withdraw.set_defaults(handler=cmd_withdraw, json_errors=True)
+
     retry = commands.add_parser("retry", help="重发未送达的消息，或把意见交回返工")
     retry.add_argument("task")
     retry.add_argument("--to", help="改派到其他会话")
@@ -1109,7 +1163,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if refresh:
         _refresh_summary()
     try:
-        return int(args.handler(args))
+        with command_scope():
+            return int(args.handler(args))
     except CliError as error:
         _report_error(args, error.code)
         return error.exit_code
@@ -1123,4 +1178,4 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 130
     finally:
         if refresh:
-            _refresh_summary(revive=True)
+            _refresh_summary(revive=args.command != "withdraw")

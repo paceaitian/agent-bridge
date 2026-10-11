@@ -601,7 +601,7 @@ class CliTests(unittest.TestCase):
         self.mark_sent(second)
         code, out, _ = self.run_cli("close", second)
         self.assertEqual(code, 0)
-        self.assertIn("无法撤回", out)
+        self.assertIn("停止追踪不撤回", out)
         with self.store() as store:
             self.assertEqual(store.archived_risk_count(), 1)
         code, out, _ = self.run_cli("tasks", "--json")

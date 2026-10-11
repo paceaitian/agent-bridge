@@ -27,7 +27,7 @@ from unittest.mock import patch
 
 from agentstatus_bridge.doctor import rpc_evidence_text
 from agentstatus_bridge.model import Delivery
-from agentstatus_bridge.transports import DeliveryContext, codex_rpc
+from agentstatus_bridge.transports import DeliveryContext, codex_rpc, local_codex
 from agentstatus_bridge.transports.codex_queue import (
     CHANNEL_KEY,
     FALLBACK_KEY,
@@ -365,7 +365,7 @@ class SocketChecksTests(RpcCase):
             values = real_unpack(fmt, data)
             return (values[0], values[1] + 1, values[2]) if fmt == "3i" else values
 
-        with patch.object(codex_rpc.struct, "unpack", side_effect=other_uid):
+        with patch.object(local_codex.struct, "unpack", side_effect=other_uid):
             self.assertEqual(self.add(daemon), RpcFallback("socket_rejected"))
         daemon.wait_connections(1)
         daemon.close()
@@ -680,7 +680,7 @@ class AddResultTests(RpcCase):
     def test_unexpected_failure_creating_the_socket_falls_back(self) -> None:
         # 还没外调：任何 Exception 都按写前归类，不冒泡给 dispatch 变成 UNKNOWN（§61 第 1 轮 Codex N04）
         daemon = self.daemon(listen=False)
-        with patch.object(codex_rpc.socket, "socket", side_effect=RuntimeError("audit hook")):
+        with patch.object(local_codex.socket, "socket", side_effect=RuntimeError("audit hook")):
             self.assertEqual(self.guarded_add(daemon), RpcFallback("connect_failed"))
 
 
@@ -844,7 +844,7 @@ class SocketCreationInventoryTests(unittest.TestCase):
     EXPECTED = [
         ("transports/claude_peer.py", ("deliver",), "socket.socket"),   # Claude 对端投递
         ("transports/claude_peer.py", ("open",), "socket.socket"),      # Claude 回执收件箱
-        ("transports/codex_rpc.py", ("queue_add",), "socket.socket"),   # Codex daemon（DESIGN §61）
+        ("transports/local_codex.py", ("new_stream",), "socket.socket"),  # §61/69/70 共享平台入口
     ]
 
     def test_every_socket_creation_site_is_accounted_for(self) -> None:

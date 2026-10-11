@@ -44,11 +44,11 @@ import test_bridge_worker as worker_tests
 
 
 class RevisionTests(LedgerCase):
-    def test_each_of_the_nine_triggers_increments_the_revision(self) -> None:
+    def test_base_triggers_and_withdrawal_trigger_inventory(self) -> None:
         task, attempt = self.create()
         conn = self.store._conn
         names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
-        self.assertEqual(len({name for name in names if name.startswith("ab_revision_")}), 9)
+        self.assertEqual(len({name for name in names if name.startswith("ab_revision_")}), 12)
         other_task, _ = self.create(now=101.0)
         extra = self.store.add_attempt(
             task.id, role=Role.NOTICE, target=ref(Provider.CLAUDE, "origin"), body="notice", refs=[], now=102.0,

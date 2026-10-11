@@ -19,7 +19,8 @@ from types import FrameType
 
 from . import summary
 from .dispatch import Dispatcher, LogFn
-from .endpoints import ADAPTERS, discover
+from .codex_metadata import MetadataCache
+from .endpoints import ADAPTERS, DiscoverySources, discover
 from .model import Endpoint, Provider
 from .naming import COMMAND_ENV, command_name
 from .paths import STATE_DIR_ENV, ensure_private_dir, state_dir
@@ -262,9 +263,10 @@ def run_worker(
             # 水位取实际发布的快照：发布之后才提交的修订不能记作已发布（3A-F03）
             summary_seen = None if started is None else (started.ledger_id, started.revision)
             summary_failures = 1 if summary_pending else 0
+            sources = DiscoverySources(native_metadata=MetadataCache())
             dispatcher = Dispatcher(
                 store=store,
-                discover=discover_fn or discover,
+                discover=discover_fn or (lambda: discover(sources)),
                 transports=transports or default_transports(),
                 reply_address=inbox.address if inbox is not None else None,
                 command=command_name(),

@@ -407,6 +407,7 @@ class Dispatcher:
                     provider_ref=outcome.provider_ref,
                     detail=detail,
                     now=self.clock(),
+                    native_root=outcome.native_root,
                 )
             except StoreError as error:
                 self.log("delivery_record_retry_failed", {"code": error.code})
@@ -547,6 +548,7 @@ class Dispatcher:
                 provider_ref=outcome.provider_ref,
                 detail=detail,
                 now=self.clock(),
+                native_root=outcome.native_root,
             )
         except StoreError as error:
             self._unrecorded[attempt.id] = (outcome, detail)

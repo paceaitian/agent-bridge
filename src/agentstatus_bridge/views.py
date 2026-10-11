@@ -171,6 +171,7 @@ def _task_document(
         "targetTurnEndedAt": hint.stopped_at,
         "targetSessionMissing": hint.missing,
         "attempts": [_attempt_document(item, include_body=include_body) for item in attempts],
+        "nativeWithdrawals": {"version": 1, "operations": store.withdrawals(task.id)},
     }
     if events:
         document["events"] = store.events(task.id)
@@ -255,6 +256,9 @@ def _print_task(
             f"先去确认；{action}；不再需要可 {cmd} close {ref}"
         )
     step = _next_step(task, attempts)
+    for operation in store.withdrawals(task.id):
+        print(f"  原生撤回 #{operation['attempt_seq']}：{operation['state']}（{operation['reason']}），"
+              f"{_clock(operation['finished_at'] or operation['created_at'])}；不证明未执行")
     if step:
         print(f"下一步：{step}")
     events = store.events(task.id, limit=20)

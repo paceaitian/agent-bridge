@@ -30,6 +30,7 @@ import tomllib
 from typing import Any
 
 from . import procfs
+from .codex_metadata import MetadataCache, discovery_cache
 from .codex_argv import _codex_class, _codex_non_interactive, codex_app_server
 from .ids import opaque_id
 from .model import UNRESOLVED_NATIVE_ID, Endpoint, EndpointRef, Provider, Runtime
@@ -220,6 +221,8 @@ class DiscoverySources:
     titles: Callable[[], Mapping[str, str]] = tmux_pane_titles
     runtime: Callable[[], ObserverView] = agentstatus_view
     uid: int = field(default_factory=os.getuid)
+    native_metadata: MetadataCache = field(default_factory=discovery_cache, compare=False)
+    native_report: dict[str, object] = field(default_factory=dict, compare=False)
 
 
 def _pane_for(pid: int, panes: Mapping[int, PaneInfo], proc_root: Path) -> PaneInfo | None:
@@ -370,9 +373,10 @@ class CodexThreadClasses:
     parents: dict[str, str] = field(default_factory=dict)
     # 编号最大的库打不开或查询出错，或者一个库都没有（DESIGN §53.3.6）；旧库可读但查不到行不能掩盖它
     unavailable: bool = False
+    sql_checked: bool = False
 
 
-def _classify_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThreadClasses:
+def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThreadClasses:
     """只读 Codex 状态库给 thread 分类；认不出的不在结果里。
 
     只选 `id, source` 两列、只按持有的 thread 查询、`mode=ro` 打开、短超时；按版本号降序逐个探测
@@ -387,12 +391,12 @@ def _classify_codex_threads(sources: DiscoverySources, threads: set[str]) -> Cod
     try:
         names = [entry.name for entry in os.scandir(root) if entry.is_file(follow_symlinks=False)]
     except OSError:
-        return CodexThreadClasses(unavailable=True)
+        return CodexThreadClasses(unavailable=True, sql_checked=True)
     candidates = sorted(
         (int(match.group("version")), name) for name in names if (match := _CODEX_STATE_DB.fullmatch(name))
     )
     if not candidates:
-        return CodexThreadClasses(unavailable=True)
+        return CodexThreadClasses(unavailable=True, sql_checked=True)
     remaining = set(threads)
     kinds: dict[str, str] = {}
     parents: dict[str, str] = {}
@@ -431,7 +435,46 @@ def _classify_codex_threads(sources: DiscoverySources, threads: set[str]) -> Cod
                 parent = _codex_source_parent(source)
                 if parent is not None:
                     parents[thread_id.lower()] = parent
-    return CodexThreadClasses(kinds, parents, newest_failed)
+    return CodexThreadClasses(kinds, parents, newest_failed, sql_checked=True)
+
+
+def _classify_codex_threads(
+    sources: DiscoverySources, threads: set[str], processes: Mapping[int, CodexProcess] | None = None,
+) -> CodexThreadClasses:
+    """§69：只向实际持有者查native；未知回SQL，明确关系冲突不被旧库洗白。"""
+    holders = {
+        thread: tuple(sorted((pid, process.info.start_ticks) for pid, process in (processes or {}).items()
+                             if process.app_server and thread in process.holdings))
+        for thread in threads
+    }
+    holders = {key: value for key, value in holders.items() if value}
+    batch = sources.native_metadata.read(sources.codex_home, holders)
+    kinds: dict[str, str] = {}
+    parents: dict[str, str] = {}
+    conflicts = 0
+    for thread, value in batch.records.items():
+        fresh = bool(holders.get(thread)) and all(
+            (info := procfs.read_process(pid, sources.proc_root)) is not None and info.start_ticks == start
+            and thread in set().union(*codex_holdings(pid, sources.proc_root, sources.codex_home))
+            for pid, start in holders.get(thread, ())
+        )
+        if not fresh:
+            continue
+        if value.kind == "conflict":
+            kinds[thread] = "subagent"  # 无父关系，标题路径阻断，不走单thread未知兼容
+            conflicts += 1
+        elif value.kind in {"root", "subagent"}:
+            kinds[thread] = value.kind
+            if value.parent is not None:
+                parents[thread] = value.parent
+    missing = threads - kinds.keys()
+    sql = _sql_codex_threads(sources, missing)
+    sources.native_report = {
+        "state": batch.reason, "serverVersion": batch.server_version,
+        "confirmed": len(kinds) - conflicts, "conflicts": conflicts, "sqlFallback": len(missing),
+        "sqlState": "unavailable" if sql.unavailable else "available" if sql.sql_checked else "not_queried",
+    }
+    return CodexThreadClasses({**sql.kinds, **kinds}, {**sql.parents, **parents}, sql.unavailable, sql.sql_checked)
 
 
 @dataclass(frozen=True)
@@ -530,7 +573,7 @@ def _discover_codex(
             thread for process in processes.values() if process.app_server for thread in process.holdings
         } | {thread for members in titled.values() for process, _ in members for thread in process.holdings}
     # 所有需要分类的 thread 合并成一次查询（包括只有一个 thread 的，Codex §45.48 第二轮 R01）
-    classes = _classify_codex_threads(sources, legacy_threads | bindable_pool)
+    classes = _classify_codex_threads(sources, legacy_threads | bindable_pool, processes)
     endpoints: list[Endpoint] = []
     for members in legacy:
         for process, pane in members:
@@ -898,13 +941,15 @@ def codex_title_report(sources: DiscoverySources | None = None) -> dict[str, obj
     short = sum(1 for pane in seen.values() if pane.thread_prefix is not None and len(pane.thread_prefix) < OBSERVER_HOOK_PREFIX_MIN)
     not_parsed = sum(1 for pane in seen.values() if pane.thread_prefix is None and pane.title_has_uuid)
     held = {thread for process in processes.values() if process.app_server for thread in process.holdings}
+    classes = _classify_codex_threads(config, held, processes)
     return {
         "daemonMode": True,
         "withThreadId": with_id,
         "shortThreadId": short,
         "uuidNotParsed": not_parsed,
         "withoutThreadId": len(seen) - with_id - not_parsed,
-        "stateDbUnavailable": _classify_codex_threads(config, held).unavailable,
+        "stateDbUnavailable": classes.unavailable if classes.sql_checked else None,
+        "nativeMetadata": dict(config.native_report),
     }
 
 

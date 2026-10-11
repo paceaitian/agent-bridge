@@ -16,6 +16,8 @@ class DeliveryOutcome:
     reason: str
     provider_ref: str | None = None
     detail: dict[str, Any] = field(default_factory=dict)
+    # §70 业务证据，不属于deliveryDetail：成功交接的数据根身份摘要。
+    native_root: str | None = None
 
 
 @dataclass(frozen=True)

@@ -38,6 +38,7 @@ from .model import (
     Work,
 )
 from .paths import ensure_private_dir, state_dir
+from .transports.codex_native import native_id
 
 SCHEMA_VERSION = 2
 DB_NAME = "bridge.sqlite3"
@@ -131,7 +132,7 @@ _REVISION_KEY = "ledger_revision"
 _LEDGER_ID_KEY = "ledger_id"
 _REVISION_TRIGGERS: tuple[tuple[str, str, str], ...] = tuple(
     (f"ab_revision_{table}_{operation.lower()}", table, operation)
-    for table in ("tasks", "attempts", "events")
+    for table in ("tasks", "attempts", "events", "native_withdrawals")
     for operation in ("INSERT", "UPDATE", "DELETE")
 )
 
@@ -257,6 +258,7 @@ class Store:
         try:
             store._configure()
             store._migrate()
+            store._ensure_withdrawals()
             store._ensure_revision_objects()
             store._ensure_indexes()
         except StoreError:
@@ -302,6 +304,25 @@ class Store:
                 for statement in _MIGRATE_V1_TO_V2:
                     conn.execute(statement)
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _ensure_withdrawals(self) -> None:
+        version = self._conn.execute("SELECT value FROM meta WHERE key='native_withdrawals_version'").fetchone()
+        if version is not None:
+            if version[0] != "1":
+                raise StoreError("schema_too_new")
+            return
+        with self._transaction() as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS native_withdrawals (
+                id TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, attempt_seq INTEGER NOT NULL,
+                thread_id TEXT NOT NULL, item_id TEXT NOT NULL, root_identity TEXT NOT NULL,
+                owner_pid INTEGER NOT NULL, owner_start TEXT NOT NULL,
+                created_at REAL NOT NULL, sending_at REAL, finished_at REAL,
+                state TEXT NOT NULL, reason TEXT NOT NULL, server_version TEXT NOT NULL DEFAULT 'unknown'
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS withdrawals_by_task ON native_withdrawals(task_id, created_at)")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS withdrawals_active ON native_withdrawals(root_identity, thread_id, item_id)"
+                         " WHERE state IN ('prepared','sending')")
+            conn.execute("INSERT INTO meta(key,value) VALUES ('native_withdrawals_version','1')")
 
     def _ensure_revision_objects(self) -> None:
         """幂等安装修订号触发器与账本标识：纯增量辅助对象，不提升 user_version，旧版程序照常读写。"""
@@ -786,17 +807,87 @@ class Store:
         provider_ref: str | None,
         detail: dict[str, Any],
         now: float,
+        native_root: str | None = None,
     ) -> bool:
         """sending→原生结果；只接受仍处于 sending 的记录。"""
-        return self.transition_delivery(
-            attempt_id,
-            expected=(Delivery.SENDING,),
-            new=delivery,
-            reason=reason,
-            now=now,
-            provider_ref=provider_ref,
-            detail=detail,
-        )
+        with self._transaction() as conn:
+            changed = self.transition_delivery(
+                attempt_id, expected=(Delivery.SENDING,), new=delivery, reason=reason,
+                now=now, provider_ref=provider_ref, detail=detail,
+            )
+            if changed and delivery is Delivery.QUEUED and isinstance(native_root, str) and re.fullmatch(r"[0-9a-f]{64}", native_root):
+                row = conn.execute("SELECT options FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+                options = _load_dict(row[0])
+                options["codexDataRoot"] = native_root
+                conn.execute("UPDATE attempts SET options=? WHERE id=?", (_dump(options), attempt_id))
+            return changed
+
+    def prepare_withdrawal(self, task_id: str, seq: int, *, root_identity: str, now: float,
+                           pid: int, start: str, again: bool = False) -> tuple[dict[str, Any], bool]:
+        with self._transaction() as conn:
+            attempt = next((item for item in self.attempts(task_id) if item.seq == seq), None)
+            if attempt is None:
+                raise StoreError("withdraw_attempt_missing")
+            if (attempt.target.provider is not Provider.CODEX or attempt.role not in {Role.HANDOFF, Role.REVIEW}
+                    or attempt.delivery is not Delivery.QUEUED
+                    or native_id(attempt.target.native_id) is None or native_id(attempt.provider_ref) is None):
+                raise StoreError("withdraw_ineligible")
+            assert attempt.provider_ref is not None  # 上面的UUID验证已拒绝None
+            if not root_identity or attempt.options.get("codexDataRoot") != root_identity:
+                raise StoreError("withdraw_root_unproven")
+            rows = conn.execute("SELECT * FROM native_withdrawals WHERE attempt_id=? ORDER BY created_at DESC, rowid DESC",
+                                (attempt.id,)).fetchall()
+            active = conn.execute("SELECT * FROM native_withdrawals WHERE root_identity=? AND thread_id=? AND item_id=?"
+                                  " AND state IN ('prepared','sending')",
+                                  (root_identity, attempt.target.native_id.lower(), attempt.provider_ref.lower())).fetchone()
+            previous = active or (rows[0] if rows else None)
+            if previous is not None and (not again or previous["state"] not in {"unknown", "not_attempted", "refused"}):
+                return dict(previous), False
+            if len(rows) >= 16:
+                raise StoreError("withdraw_limit")
+            operation = new_id()
+            conn.execute("INSERT INTO native_withdrawals(id,task_id,attempt_id,attempt_seq,thread_id,item_id,root_identity,"
+                         "owner_pid,owner_start,created_at,state,reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (operation, task_id, attempt.id, seq, attempt.target.native_id.lower(), attempt.provider_ref.lower(),
+                          root_identity, pid, start, now, "prepared", "prepared"))
+            return dict(conn.execute("SELECT * FROM native_withdrawals WHERE id=?", (operation,)).fetchone()), True
+
+    def begin_withdrawal(self, operation: str, *, now: float, pid: int, start: str) -> None:
+        with self._transaction() as conn:
+            changed = conn.execute("UPDATE native_withdrawals SET state='sending',reason='sending',sending_at=?"
+                                   " WHERE id=? AND state='prepared' AND owner_pid=? AND owner_start=?",
+                                   (now, operation, pid, start)).rowcount
+            if changed != 1:
+                raise StoreError("withdraw_conflict")
+
+    def finish_withdrawal(self, operation: str, *, thread: str, item: str, state: str, reason: str,
+                          version: str, now: float) -> None:
+        if state not in {"deleted", "absent", "not_attempted", "refused", "unknown"}:
+            raise StoreError("withdraw_invalid_result")
+        with self._transaction() as conn:
+            changed = conn.execute("UPDATE native_withdrawals SET state=?,reason=?,server_version=?,finished_at=?"
+                                   " WHERE id=? AND thread_id=? AND item_id=? AND state IN ('prepared','sending')",
+                                   (state, reason, version, now, operation, thread, item)).rowcount
+            if changed != 1:
+                raise StoreError("withdraw_conflict")
+
+    def recover_withdrawals(self, *, now: float, proc_root: Path = procfs.DEFAULT_PROC) -> None:
+        rows = self._conn.execute("SELECT id,owner_pid,owner_start,state FROM native_withdrawals"
+                                  " WHERE state IN ('prepared','sending')").fetchall()
+        for row in rows:
+            info = procfs.read_process(row["owner_pid"], proc_root)
+            if info is not None and info.start_ticks == row["owner_start"]:
+                continue
+            state = "unknown" if row["state"] == "sending" else "not_attempted"
+            with self._transaction() as conn:
+                conn.execute("UPDATE native_withdrawals SET state=?,reason='owner_gone',finished_at=? WHERE id=? AND state=?",
+                             (state, now, row["id"], row["state"]))
+
+    def withdrawals(self, task_id: str) -> list[dict[str, Any]]:
+        # 展示只取安全列，root/进程/原始请求不离开业务层。
+        return [dict(row) for row in self._conn.execute(
+            "SELECT id,attempt_seq,state,reason,server_version,created_at,sending_at,finished_at FROM native_withdrawals"
+            " WHERE task_id=? ORDER BY created_at,rowid", (task_id,))]
 
     def transition_delivery(
         self,
@@ -1020,4 +1111,6 @@ class Store:
                 " ORDER BY COALESCE(closed_at, accepted_at) DESC LIMIT -1 OFFSET ?)",
                 (MAX_FINISHED_TASKS,),
             ).rowcount
+            conn.execute("DELETE FROM native_withdrawals WHERE state NOT IN ('prepared','sending','unknown')"
+                         " AND task_id NOT IN (SELECT id FROM tasks)")
         return int(expired) + int(overflow)

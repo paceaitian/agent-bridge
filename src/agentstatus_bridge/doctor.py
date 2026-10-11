@@ -162,6 +162,11 @@ def thread_title_lines(report: Mapping[str, object]) -> list[str]:
         )
     if report.get("stateDbUnavailable") is True:
         lines.append("  Codex 状态库读不到：正在看子代理的窗口可能被当成主会话")
+    native = report.get("nativeMetadata")
+    if isinstance(native, dict):
+        lines.append(f"Codex 原生元数据：{native.get('state')}；确认 {native.get('confirmed')}，"
+                     f"冲突 {native.get('conflicts')}，SQL 回退 {native.get('sqlFallback')}；"
+                     f"SQL：{native.get('sqlState')}（未查询不代表可用）")
     return lines
 
 

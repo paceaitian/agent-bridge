@@ -735,7 +735,9 @@ class DoctorTitleTests(DaemonBase):
         self.assertEqual(
             report,
             {"daemonMode": True, "withThreadId": 1, "shortThreadId": 0, "uuidNotParsed": 1, "withoutThreadId": 1,
-             "stateDbUnavailable": True},
+             "stateDbUnavailable": True,
+             "nativeMetadata": {"state": "socket_missing", "serverVersion": "unknown", "confirmed": 0,
+                                "conflicts": 0, "sqlFallback": 2, "sqlState": "unavailable"}},
         )
         lines = "\n".join(doctor.thread_title_lines(report))
         self.assertIn("不紧挨 activity", lines)

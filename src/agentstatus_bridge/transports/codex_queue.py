@@ -30,7 +30,7 @@ import subprocess
 
 from ..model import Consumption, Delivery, Endpoint, Provider
 from ..paths import codex_home
-from . import DeliveryContext, DeliveryOutcome, codex_rpc
+from . import DeliveryContext, DeliveryOutcome, codex_rpc, local_codex
 
 QUEUE_TIMEOUT_SECONDS = 60.0
 # 投递后查版本的超时：它在 finish_send 之前，缓存未命中时本条落账与 worker 发下一条最多因此晚这么久
@@ -176,11 +176,22 @@ class CodexQueueTransport:
         return self._executable or shutil.which("codex")
 
     def deliver(self, endpoint: Endpoint, text: str, context: DeliveryContext) -> DeliveryOutcome:
+        before = self._data_root()
         attempt = self._deliver_rpc(endpoint.ref.native_id, text, context.message_uuid)
         if isinstance(attempt, DeliveryOutcome):
-            return attempt
-        outcome = self._deliver_cli(endpoint, text)
-        return replace(outcome, detail={**outcome.detail, CHANNEL_KEY: CHANNEL_CLI, FALLBACK_KEY: attempt})
+            outcome = attempt
+        else:
+            outcome = self._deliver_cli(endpoint, text)
+            outcome = replace(outcome, detail={**outcome.detail, CHANNEL_KEY: CHANNEL_CLI, FALLBACK_KEY: attempt})
+        stamp = before if outcome.delivery is Delivery.QUEUED and before == self._data_root() else None
+        return replace(outcome, native_root=stamp)
+
+    @staticmethod
+    def _data_root() -> str | None:
+        try:
+            return local_codex.platform().root_identity(codex_home(), queue_database_path().parent)
+        except Exception:
+            return None  # 附属证据失败不改变已取得的投递结局
 
     def _deliver_rpc(self, thread: str, text: str, client_message_id: str) -> DeliveryOutcome | str:
         """RPC 通道；返回最终结果，或 add 帧发出之前的回退原因（这时可证明未入队）。
