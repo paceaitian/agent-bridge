@@ -548,7 +548,7 @@ class WindowsTests(unittest.TestCase):
             self.assertEqual(store.withdrawals(task.id)[0]['reason'],'owner_timeout')
             self.assertEqual(store.list_tasks()[0].id,task.id)
             summary.publish(store,self.root,force=True)
-            self.assertNotIn('claude-gen',(self.root/'summary.json').read_text())
+            self.assertNotIn('claude-gen',(self.root/'summary.json').read_text(encoding='utf-8'))
             with patch.dict(os.environ,{'AB_STATE_DIR':str(self.root)}),redirect_stdout(io.StringIO()):
                 self.assertEqual(cli.main(['status',task.id,'--json']),0)
 

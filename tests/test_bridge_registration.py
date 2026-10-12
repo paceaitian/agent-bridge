@@ -76,7 +76,7 @@ class RegistrationTests(unittest.TestCase):
     def test_reader_rejects_non_claude_even_when_valid_proof_is_present(self):
         self.assertEqual(self.write(),'recorded')
         path=next(self.r.root.glob('*.json'))
-        record=json.loads(path.read_text());record['provider']='codex'
+        record=json.loads(path.read_text(encoding='utf-8'));record['provider']='codex'
         self.p.files.atomic_write(self.r.root,json.dumps(record).encode(),name=key(record)+'.json',prefix='.r.')
         rows=self.r.load(qualify=lambda _:True).records
         codex=[row for row in rows if row['provider']=='codex']
@@ -165,7 +165,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(len(self.r.load().records),1)
     def test_capacity_and_incomplete_scan_never_prove_unique(self):
         self.assertEqual(self.write(),'recorded')
-        template=json.loads(next(self.r.root.glob('*.json')).read_text())
+        template=json.loads(next(self.r.root.glob('*.json')).read_text(encoding='utf-8'))
         for n in range(2,258):
             record={**template,'sessionId':f'019a0000-0000-7000-8000-{n:012x}'}
             self.p.files.atomic_write(self.r.root,json.dumps(record).encode(),name=key(record)+'.json',prefix='.r.')
@@ -205,7 +205,10 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual(disabled.load().reason,'registration_disabled')
         self.assertEqual(disabled.write({},provider='claude',writer=self.writer,now=1),'disabled')
         code='import sys; import agentstatus_bridge.registration; assert not any("agentstatus_bridge."+n in sys.modules for n in ("cli","worker","doctor","store"))'
-        done=subprocess.run([sys.executable,'-c',code],capture_output=True,text=True)
+        # 子进程不继承本进程对 sys.path 的修改（Windows CI 只在进程内加 src）；显式指向与本测试同一份包
+        src=str(Path(sys.modules['agentstatus_bridge'].__file__).resolve().parents[1])
+        env={**os.environ,'PYTHONPATH':os.pathsep.join(filter(None,(src,os.environ.get('PYTHONPATH'))))}
+        done=subprocess.run([sys.executable,'-c',code],capture_output=True,text=True,encoding='utf-8',env=env)
         self.assertEqual(done.returncode,0,done.stderr)
 
 
