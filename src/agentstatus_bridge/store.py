@@ -8,6 +8,10 @@
 
 from __future__ import annotations
 
+from .platforms.factory import get_platform
+from contextlib import ExitStack
+from .platforms.types import Presence
+
 from collections.abc import Collection, Iterator
 from contextlib import AbstractContextManager, contextmanager
 import json
@@ -21,7 +25,7 @@ from types import TracebackType
 from typing import Any
 import uuid
 
-from . import procfs
+from .platforms import process as procfs
 from .ids import is_id_prefix, new_id
 from .model import (
     CLOSURE_KIND,
@@ -245,35 +249,46 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._depth = 0
         self._withdrawals_ready = False
+        self._platform_lease = ExitStack()
 
     @classmethod
     def open(cls, directory: Path | None = None) -> Store:
         """打开（必要时创建）账本；schema 高于本程序时只读拒绝，不迁移不删除。"""
+        lease = ExitStack()
+        files: Any = get_platform().files
         try:
             root = ensure_private_dir(directory or state_dir())
             path = root / DB_NAME
-            if not path.exists():
-                os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+            if get_platform().name == 'windows':
+                lease.enter_context(files.lease(root))
+            get_platform().files.prepare_database(path)
             connection = sqlite3.connect(path, timeout=5.0, isolation_level=None)
         except (OSError, sqlite3.Error) as error:
+            lease.close()
             raise StoreError("store_unavailable") from error
         store = cls(connection)
+        store._platform_lease = lease
         try:
             store._configure()
             store._migrate()
             store._ensure_withdrawals()
             store._ensure_revision_objects()
             store._ensure_indexes()
+            if get_platform().name == 'windows':
+                files.validate_database(path)
         except StoreError:
-            connection.close()
+            store.close()
             raise
-        except sqlite3.DatabaseError as error:
-            connection.close()
+        except (sqlite3.DatabaseError, OSError) as error:
+            store.close()
             raise StoreError("store_corrupt") from error
         return store
 
     def close(self) -> None:
-        self._conn.close()
+        try:
+            self._conn.close()
+        finally:
+            self._platform_lease.close()
 
     def __enter__(self) -> Store:
         return self
@@ -938,6 +953,9 @@ class Store:
     def _withdrawal_owner_status(row: sqlite3.Row, proc_root: Path) -> str:
         if row["state"] not in {"prepared", "sending"}:
             return "finished"
+        if get_platform().name == 'windows':
+            state = procfs.windows_presence(row['owner_pid'], row['owner_start'])
+            return {Presence.CURRENT: 'alive', Presence.EXITED: 'gone', Presence.UNKNOWN: 'identity_unverified'}[state]
         namespace = row["owner_pid_namespace"]
         if namespace is not None and namespace != procfs.pid_namespace(proc_root):
             return "namespace_unverified"
@@ -1118,7 +1136,10 @@ class Store:
         for attempt in self.attempts_in((Delivery.SENDING,)):
             pid = attempt.delivery_detail.get("senderPid")
             start = attempt.delivery_detail.get("senderStart")
-            if isinstance(pid, int) and isinstance(start, str) and procfs.is_same_generation(pid, start, proc_root):
+            if get_platform().name == 'windows':
+                if not isinstance(pid, int) or not isinstance(start, str) or procfs.windows_presence(pid, start) is not Presence.EXITED:
+                    continue
+            elif isinstance(pid, int) and isinstance(start, str) and procfs.is_same_generation(pid, start, proc_root):
                 continue
             if self.transition_delivery(
                 attempt.id,

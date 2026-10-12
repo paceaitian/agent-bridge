@@ -16,18 +16,18 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from unittest.mock import Mock
+from dataclasses import replace
 
 from agentstatus_bridge.model import Delivery, Flow, Provider
 from agentstatus_bridge.store import DB_NAME, Store, StoreError
 from agentstatus_bridge.endpoints import ADAPTERS
+from agentstatus_bridge.platforms.linux.lifecycle import LOCK_RETRY_ATTEMPTS, worker_environment, worker_path
 from agentstatus_bridge.worker import (
     LOCK_NAME,
-    LOCK_RETRY_ATTEMPTS,
     ensure_worker,
     run_worker,
     wait_for_worker,
-    worker_environment,
-    worker_path,
     worker_running,
 )
 from bridge_support import RecordingTransport, endpoint, ref
@@ -59,7 +59,7 @@ class WorkerTests(unittest.TestCase):
         # worker 是 `python -m` 起的，argv0 认不出命令名：拉起方必须显式传，
         # 否则页脚会退回默认名而不是用户实际敲的那个（DESIGN §45.36）
         with (
-            patch("agentstatus_bridge.worker.subprocess.Popen") as popen,
+            patch("agentstatus_bridge.platforms.linux.lifecycle.subprocess.Popen") as popen,
             patch("agentstatus_bridge.worker.command_name", return_value="testcmd"),
             patch.dict(os.environ, {"AB_STATE_DIR": str(self.root / "inherited")}, clear=False),
         ):
@@ -71,6 +71,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(env["AB_COMMAND"], "testcmd")
         # 显式 root 优先于继承环境；删掉这次赋值不能靠父进程碰巧有同值蒙混过关。
         self.assertEqual(env["AB_STATE_DIR"], str(self.root))
+        self.assertEqual(popen.call_args.kwargs.get('cwd'),str(self.root))
 
     def test_worker_loop_renders_the_footer_with_the_resolved_command(self) -> None:
         # `run_worker` 那行 `command=command_name()` 此前零守卫：改成字面量时六个模块 200 个用例全绿，
@@ -82,6 +83,28 @@ class WorkerTests(unittest.TestCase):
         text = transport.calls[0][1]
         self.assertIn("testcmd report", text)
         self.assertNotIn("agent-bridge", text)
+
+    def test_run_worker_keeps_the_lifecycle_that_opened_its_lock(self):
+        from agentstatus_bridge.platforms.factory import make_platform
+        base=make_platform('linux')
+        owner,other=Mock(),Mock()
+        owner.open_lock.return_value=4242
+        owner.acquire_worker_lock.return_value=True
+        owner.install_stop.return_value={}
+        first=replace(base,lifecycle=owner);later=replace(base,lifecycle=other)
+        count=0
+        def fresh():
+            nonlocal count
+            count+=1
+            return first if count==1 else later
+        with patch('agentstatus_bridge.worker.get_platform',side_effect=fresh):
+            self.assertEqual(self._run_once(RecordingTransport(Provider.CODEX)),0)
+        owner.open_lock.assert_called_once()
+        owner.acquire_worker_lock.assert_called_once_with(4242)
+        owner.restore_stop.assert_called_once_with({})
+        owner.unlock.assert_called_once_with(4242)
+        owner.close_lock.assert_called_once_with(4242)
+        self.assertEqual(other.mock_calls,[])
 
     def test_environment_preserves_bridge_configuration_values(self) -> None:
         bridge = {
@@ -104,7 +127,7 @@ class WorkerTests(unittest.TestCase):
             "AB_COMMAND": "ab",
         }
         with (
-            patch("agentstatus_bridge.worker.subprocess.Popen") as popen,
+            patch("agentstatus_bridge.platforms.linux.lifecycle.subprocess.Popen") as popen,
             patch.dict(os.environ, inherited),
         ):
             self.assertEqual(paths.state_dir_source(), "integration")
@@ -222,8 +245,8 @@ class WorkerTests(unittest.TestCase):
             return object()
 
         with (
-            patch("agentstatus_bridge.worker.subprocess.Popen", side_effect=fake_popen) as popen,
-            patch("agentstatus_bridge.worker.signal.signal", return_value=None),  # 线程里不能装信号处理器
+            patch("agentstatus_bridge.platforms.linux.lifecycle.subprocess.Popen", side_effect=fake_popen) as popen,
+            patch("agentstatus_bridge.platforms.linux.lifecycle.signal.signal", return_value=None),  # 线程里不能装信号处理器
             patch("agentstatus_bridge.worker.IDLE_EXIT_SECONDS", 2.0),
         ):
             self.assertTrue(ensure_worker(self.root))  # 扩展补查
@@ -290,7 +313,7 @@ class WorkerTests(unittest.TestCase):
         # 新 worker 取锁的那一刻另一个进程正在探测（瞬时持共享锁）：重试后照常启动，不能以为已有实例而退出
         probe = self._hold_lock(fcntl.LOCK_SH)
         releaser = threading.Timer(0.02, self._release_lock, args=(probe,))
-        with patch("agentstatus_bridge.worker.LOCK_RETRY_SECONDS", 0.1):  # 重试预算 0.4 秒，远长于探测持锁的 0.02 秒
+        with patch("agentstatus_bridge.platforms.linux.lifecycle.LOCK_RETRY_SECONDS", 0.1):  # 重试预算 0.4 秒，远长于探测持锁的 0.02 秒
             releaser.start()
             try:
                 self.assertEqual(self._run_once(RecordingTransport(Provider.CODEX)), 0)
@@ -430,17 +453,21 @@ class WorkerSpawnInventoryTests(unittest.TestCase):
         "os.system", "os.popen", "os.fork", "os.forkpty", "os.posix_spawn", "os.posix_spawnp",
         "os.execv", "os.execve", "os.execvp", "os.spawnv", "os.spawnvp",
     })
+    PLATFORM_CALLS = frozenset({'run_capture', 'spawn_worker'})
     # 后台（长命）子进程：只有它会带着整份环境活下去，所以单独再钉一次
     BACKGROUND_CALLS = frozenset({
         "subprocess.Popen", "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell",
         "os.fork", "os.forkpty", "os.posix_spawn", "os.posix_spawnp",
     })
     EXPECTED = [
-        ("endpoints.py", ("tmux_pane_titles",), "subprocess.run"),              # tmux 只读标题（DESIGN §53.3.2）
-        ("endpoints.py", ("tmux_panes",), "subprocess.run"),                    # tmux 只读发现
-        ("reports.py", ("_git_resolve_commit",), "subprocess.run"),             # git rev-parse
-        ("transports/codex_queue.py", ("_default_runner",), "subprocess.run"),  # codex CLI
-        ("worker.py", ("ensure_worker",), "subprocess.Popen"),                  # 唯一的后台自调用
+        ('reports.py', ('_git_resolve_commit',), '.run_capture'),
+        ('transports/codex_queue.py', ('_default_runner',), '.run_capture'),
+        ('worker.py', ('ensure_worker',), '.spawn_worker'),
+        ("platforms/linux/mux.py", ("tmux_pane_titles",), "subprocess.run"),    # W1-1下沉，原argv不改
+        ("platforms/linux/mux.py", ("tmux_panes",), "subprocess.run"),          # tmux 只读发现
+        ("platforms/linux/lifecycle.py", ("run_capture",), "subprocess.run"), # 原git分支，不带errors参数
+        ("platforms/linux/lifecycle.py", ("run_capture",), "subprocess.run"), # 原codex分支，errors=replace
+        ("platforms/linux/lifecycle.py", ("spawn_worker",), "subprocess.Popen"),                  # 唯一的后台自调用
     ]
 
     @staticmethod
@@ -458,7 +485,9 @@ class WorkerSpawnInventoryTests(unittest.TestCase):
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
                 name = self._dotted(call.func)
-                if name not in self.SPAWN_CALLS:
+                if isinstance(call.func, ast.Attribute) and call.func.attr in self.PLATFORM_CALLS:
+                    name = '.' + call.func.attr
+                if name not in self.SPAWN_CALLS and name not in {'.'+n for n in self.PLATFORM_CALLS}:
                     continue
                 owners = tuple(sorted(
                     node.name for node in ast.walk(tree)
@@ -476,7 +505,9 @@ class WorkerSpawnInventoryTests(unittest.TestCase):
 
     def test_background_spawn_is_owned_by_ensure_worker(self) -> None:
         background = [site for site in self.inventory() if site[2] in self.BACKGROUND_CALLS]
-        self.assertEqual(background, [("worker.py", ("ensure_worker",), "subprocess.Popen")])
+        self.assertEqual(background, [("platforms/linux/lifecycle.py", ("spawn_worker",), "subprocess.Popen")])
+        self.assertEqual([site for site in self.inventory() if site[2]=='.spawn_worker'],
+                         [('worker.py', ('ensure_worker',), '.spawn_worker')])
 
     def test_no_aliased_or_from_import_can_hide_a_spawn(self) -> None:
         # `_dotted` 只认字面模块名，所以 `import subprocess as _sp` 或 `from subprocess import Popen`

@@ -23,6 +23,7 @@ import time
 from typing import Final
 
 from ..model import Delivery
+from ..platforms.transport_types import ByteStream, LocalFailure
 from . import local_codex
 from .websocket import WebSocket, _Closed, _Timeout
 
@@ -110,7 +111,7 @@ def control_socket_path(codex_home: Path) -> Path:
 
 def resolve_socket(link: Path) -> Path | RpcFallback:
     target = local_codex.platform().resolve(link)
-    return RpcFallback(target.reason) if isinstance(target, local_codex.LocalFailure) else target
+    return RpcFallback(target.reason) if isinstance(target, LocalFailure) else target
 
 
 def parse_server_version(user_agent: object) -> str:
@@ -200,7 +201,7 @@ def queue_add(
 class _Client(WebSocket):
     """一条连接上的一次投递；状态只活在这一次调用里。"""
 
-    def __init__(self, connection: local_codex.ByteStream, clock: Callable[[], float]) -> None:
+    def __init__(self, connection: ByteStream, clock: Callable[[], float]) -> None:
         super().__init__(connection, clock)
         self.stage = FALLBACK_CONNECT_FAILED
         self.add_started = False

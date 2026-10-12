@@ -1,6 +1,8 @@
 """`ab` 命令行：退出码合同、验收/重发/返工规则与不需要图形界面的完整流程。"""
 
 from __future__ import annotations
+from agentstatus_bridge.doctor import _runtime_available as actual_runtime_available
+from agentstatus_bridge.platforms import path_values
 
 from collections.abc import Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
@@ -19,12 +21,13 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from agentstatus_bridge.platforms.linux import files as linux_files
 from agentstatus_bridge import cli, doctor, naming, observer_dbus, paths, summary, views
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
 from agentstatus_bridge.endpoints import Caller, DiscoverySources
 from agentstatus_bridge.observer_dbus import ObserverView
 from agentstatus_bridge.model import Consumption, Delivery, Endpoint, EndpointRef, Flow, Provider, Role, Runtime, Verdict, Work
-from agentstatus_bridge.procfs import ProcessInfo
+from agentstatus_bridge.platforms.linux.process import ProcessInfo
 from agentstatus_bridge.store import Store, StoreError
 from bridge_support import discovering, endpoint, ref
 
@@ -82,7 +85,7 @@ class CliTests(unittest.TestCase):
             ),
             patch.object(doctor, "cli_version", return_value=None),
             # doctor 的 agentstatus_runtime 读的是真实 session bus：8 个 doctor 用例原来都连到本机 daemon（§48.1 第 3 条）
-            patch.object(doctor, "agentstatus_runtime", return_value={}),
+            patch.object(doctor, "_runtime_available", return_value=True),
             # doctor 的标题检查会扫真实 /proc 与 tmux（DESIGN §53.5）
             patch.object(doctor, "codex_title_report", return_value={"daemonMode": False}),
             patch.object(cli, "discover", side_effect=discovering(lambda: list(self.endpoints), self.discovered)),
@@ -164,7 +167,7 @@ class CliTests(unittest.TestCase):
         cases: list[tuple[list[dict[str, object]] | None, bool]] = [([], True), ([row], True), (None, False)]
         for reply, expected in cases:
             with self.subTest(reply=reply), \
-                    patch.object(doctor, "agentstatus_runtime", observer_dbus.agentstatus_runtime), \
+                    patch.object(doctor, "_runtime_available", actual_runtime_available), \
                     patch.object(observer_dbus, "_observer_rows", return_value=reply):
                 code, out, err = self.run_cli("doctor", "--json")
                 self.assertEqual(code, cli.EXIT_OK, err)
@@ -1184,7 +1187,7 @@ class DeviceNameTests(unittest.TestCase):
     def resolve(self, hostname: str, override: str | None = None) -> str:
         environment = {"AB_DEVICE": override} if override is not None else {}
         with (
-            patch.object(paths.socket, "gethostname", return_value=hostname),
+            patch.object(linux_files.socket, "gethostname", return_value=hostname),
             patch.dict(os.environ, environment, clear=False),
         ):
             if override is None:
@@ -1202,7 +1205,7 @@ class DeviceNameTests(unittest.TestCase):
             # 覆盖优先：跨设备时主机名可能重名，要能显式命名
             ("devbox", "arm-hub"): "arm-hub",
             ("devbox", "  "): "devbox",
-            ("x" * 80, None): "x" * paths.DEVICE_CHARS,
+            ("x" * 80, None): "x" * path_values.DEVICE_CHARS,
         }
         for (hostname, override), expected in cases.items():
             with self.subTest(hostname=hostname, override=override):
@@ -1319,14 +1322,14 @@ class StateRootTests(unittest.TestCase):
 
     def test_default_is_the_standalone_directory(self) -> None:
         root, source = self.resolve({})
-        self.assertEqual(root, str(Path.home() / ".local/state" / paths.STATE_DIR_NAME))
+        self.assertEqual(root, str(Path.home() / ".local/state" / path_values.STATE_DIR_NAME))
         self.assertEqual(source, "default")
         # 拆仓前的现役根不再是默认值：集成版必须显式绑，不能靠默认值碰巧相同
         self.assertNotEqual(root, str(Path.home() / ".local/state/agentstatus/bridge"))
 
     def test_xdg_state_home_is_respected(self) -> None:
         root, source = self.resolve({"XDG_STATE_HOME": "/tmp/xdg"})
-        self.assertEqual(root, f"/tmp/xdg/{paths.STATE_DIR_NAME}")
+        self.assertEqual(root, f"/tmp/xdg/{path_values.STATE_DIR_NAME}")
         self.assertEqual(source, "default")
 
     def test_source_separates_an_explicit_value_from_the_integration_binding(self) -> None:

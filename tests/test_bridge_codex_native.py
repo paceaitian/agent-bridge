@@ -1,5 +1,6 @@
 """§69 的边界测试；只用临时假 daemon，内容金丝雀不接触真实会话。"""
 from __future__ import annotations
+from agentstatus_bridge.platforms.linux import local_transport as linux_transport
 
 import base64
 import contextlib
@@ -18,7 +19,8 @@ from unittest.mock import patch
 
 from bridge_support import FakeProc, ProductionSocketUse
 from test_bridge_codex_rpc import FakeDaemon, THREAD, ITEM
-from agentstatus_bridge import cli, codex_metadata, endpoints, procfs
+from agentstatus_bridge import cli, codex_metadata, endpoints
+from agentstatus_bridge.platforms.linux import process as procfs
 from agentstatus_bridge.codex_metadata import MetadataCache, MAX_CACHED
 from agentstatus_bridge.transports import codex_native, local_codex
 from agentstatus_bridge.transports.codex_native import NativeBatch, ReadBatchClient, ThreadMetadata, project_thread
@@ -163,7 +165,7 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(len(daemon.received), 34)
 
     def test_empty_batch_does_not_touch_socket_or_version(self):
-        with patch.object(local_codex.LinuxPlatform, "resolve", side_effect=AssertionError("no candidate")):
+        with patch.object(linux_transport.LinuxPlatform, "resolve", side_effect=AssertionError("no candidate")):
             self.assertEqual(ReadBatchClient(lambda _: self.fail("version queried")).read(self.root, [], {}), NativeBatch())
             self.assertEqual(MetadataCache().read(self.root, {}), NativeBatch())
 
@@ -213,7 +215,7 @@ class NativeTests(unittest.TestCase):
 
     def test_production_guard_escapes_new_reader(self):
         target = Path(f"/tmp/codex-daemon-{os.getuid()}/agentstatus-guard-probe-does-not-exist")
-        with patch.object(local_codex.LinuxPlatform, "resolve", return_value=target), self.assertRaises(ProductionSocketUse):
+        with patch.object(linux_transport.LinuxPlatform, "resolve", return_value=target), self.assertRaises(ProductionSocketUse):
             self.read(type("Fixture", (), {"home": self.root})())
 
     def test_source_truth_table_and_conflicts(self):

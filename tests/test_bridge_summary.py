@@ -19,7 +19,8 @@ from unittest.mock import patch
 
 from agentstatus_bridge import cli, doctor, summary
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
-from agentstatus_bridge.endpoints import PaneInfo, tmux_panes
+from agentstatus_bridge.endpoints import PaneInfo
+from agentstatus_bridge.platforms.linux.mux import tmux_panes
 from agentstatus_bridge.ids import opaque_id
 from agentstatus_bridge.model import (
     CLOSURE_KIND,
@@ -506,7 +507,7 @@ class BindingTests(LedgerCase):
     def test_tmux_panes_reads_the_server_pid(self) -> None:
         output = "4001\t%7\t900\tproj\tname\nbad line\n4002\t%8\tx\tother\n"
         completed = subprocess.CompletedProcess([], 0, output, "")
-        with patch("agentstatus_bridge.endpoints.subprocess.run", return_value=completed):
+        with patch("agentstatus_bridge.platforms.linux.mux.subprocess.run", return_value=completed):
             panes = tmux_panes()
         self.assertEqual(panes, {4001: PaneInfo("%7", 4001, "proj\tname", 900)})
 
@@ -592,7 +593,7 @@ class SummaryCliTests(unittest.TestCase):
         self.send()
         with (
             patch.object(doctor, "cli_version", return_value="0.154.0"),
-            patch.object(doctor, "agentstatus_runtime", return_value={}),
+            patch.object(doctor, "_runtime_available", return_value=True),
         ):
             code, out, err = self.run_cli("doctor", "--json")
         self.assertEqual(code, cli.EXIT_OK, err)

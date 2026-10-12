@@ -1,6 +1,7 @@
 """协作桥原生通道：Codex queue 结果分类、Claude 帧/回执与真实 Unix socket 投递。"""
 
 from __future__ import annotations
+from agentstatus_bridge.platforms.transport_codec import encode_address
 
 from collections.abc import Sequence
 import json
@@ -14,7 +15,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from agentstatus_bridge import procfs
+from agentstatus_bridge.platforms.linux import process as procfs
 from agentstatus_bridge.views import project_delivery_detail
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
 from agentstatus_bridge.envelope import parse_header, render
@@ -26,7 +27,6 @@ from agentstatus_bridge.transports.claude_peer import (
     ClaudeInbox,
     ClaudePeerTransport,
     build_frame,
-    encode_address,
     normalize_sender_name,
     parse_receipt,
 )
@@ -146,7 +146,7 @@ class CodexQueueTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_missing_cli(self) -> None:
-        with patch("agentstatus_bridge.transports.codex_queue.shutil.which", return_value=None):
+        with patch("agentstatus_bridge.platforms.linux.files.shutil.which", return_value=None):
             outcome = CodexQueueTransport().deliver(
                 endpoint(ref(native=THREAD)), "x", DeliveryContext(message_uuid="u", sender_name="user")
             )
@@ -288,7 +288,7 @@ class CodexQueueEvidenceTests(unittest.TestCase):
         self.assertEqual(self.deliver(text="x" * (MAX_ARGV_MESSAGE_BYTES + 1)).detail, CLI_FALLBACK)
         self.queue_result = FileNotFoundError("codex")
         self.assertEqual(self.deliver().detail, CLI_FALLBACK)
-        with patch("agentstatus_bridge.transports.codex_queue.shutil.which", return_value=None):
+        with patch("agentstatus_bridge.platforms.linux.files.shutil.which", return_value=None):
             outcome = CodexQueueTransport(runner=self.runner).deliver(
                 endpoint(ref(native=THREAD)), "x", DeliveryContext(message_uuid="u", sender_name="user")
             )

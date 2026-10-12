@@ -14,7 +14,8 @@ import sqlite3
 from . import __version__, summary
 from .endpoints import codex_title_report
 from .naming import command_name
-from .observer_dbus import agentstatus_runtime
+from .platforms.factory import get_platform
+from .platforms.types import SampleState
 from .paths import claude_sessions_dir, device_name, state_dir, state_dir_source
 from .store import Store, StoreError
 from .transports.claude_peer import inbox_directory
@@ -43,8 +44,27 @@ def package_path() -> str:
     return str(package)
 
 
+def _runtime_available() -> bool:
+    return get_platform().runtime.sample().state in {SampleState.AVAILABLE, SampleState.EMPTY}
+
+
 def collect_checks() -> dict[str, object]:
     """收集 doctor 的全部事实；`checks` 的插入顺序就是文字输出的顺序（JSON 用 sort_keys 看不出），原样保留。"""
+    if get_platform().name == 'windows':
+        checks: dict[str, object] = {
+            'abVersion': __version__, 'platform': 'windows', 'providerEnabled': False,
+            'processQualification': 'unverified', 'discovery': 'unverified',
+            'codexVersion': 'not_queried', 'runtime': 'unsupported', 'workerAutomatic': False,
+            'windowsRealMachineGate': 'not_run', 'registrationAuthority': 'unverified',
+        }
+        try:
+            with Store.open() as local:
+                checks['ledgerReadable'] = True
+                checks['summary'] = summary.status(state_dir(), local)
+        except (StoreError, OSError):
+            checks['ledgerReadable'] = False
+            checks['storageReason'] = 'windows_storage_unverified'
+        return checks
     version = cli_version()
     root = state_dir()
     # 账本根与命令名是「这套装置到底在用哪个账本」的可读事实：默认值是独立版的，
@@ -75,7 +95,7 @@ def collect_checks() -> dict[str, object]:
         "claudeRegistryReadable": os.access(claude_sessions_dir(), os.R_OK),
         "claudeInboxDirectory": inbox_directory().is_dir(),
         # 可读≠有会话：observer 在线、零可见会话时也算可读（DESIGN §59）
-        "agentstatusRuntimeAvailable": agentstatus_runtime() is not None,
+        "agentstatusRuntimeAvailable": _runtime_available(),
         "workerLog": read_log_tail(root, lines=5),
     })
     try:

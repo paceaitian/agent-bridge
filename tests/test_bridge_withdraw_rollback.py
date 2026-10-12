@@ -16,7 +16,7 @@ from unittest.mock import patch
 from bridge_support import LedgerCase, ref
 from agentstatus_bridge.model import Delivery
 from agentstatus_bridge.store import Store
-from agentstatus_bridge import procfs
+from agentstatus_bridge.platforms.linux import process as procfs
 from agentstatus_bridge.transports import local_codex
 
 OLD = "87eff52af368938fd51b491db936f1de5ac72bc4"  # b3e4198^，尚未实现§69/70

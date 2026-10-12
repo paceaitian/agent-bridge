@@ -5,6 +5,7 @@
 """
 
 from __future__ import annotations
+from agentstatus_bridge.platforms.linux import local_transport as linux_transport
 
 import ast
 import base64
@@ -366,7 +367,7 @@ class SocketChecksTests(RpcCase):
             values = real_unpack(fmt, data)
             return (values[0], values[1] + 1, values[2]) if fmt == "3i" else values
 
-        with patch.object(local_codex.struct, "unpack", side_effect=other_uid):
+        with patch.object(linux_transport.struct, "unpack", side_effect=other_uid):
             self.assertEqual(self.add(daemon), RpcFallback("socket_rejected"))
         daemon.wait_connections(1)
         daemon.close()
@@ -681,7 +682,7 @@ class AddResultTests(RpcCase):
     def test_unexpected_failure_creating_the_socket_falls_back(self) -> None:
         # 还没外调：任何 Exception 都按写前归类，不冒泡给 dispatch 变成 UNKNOWN（§61 第 1 轮 Codex N04）
         daemon = self.daemon(listen=False)
-        with patch.object(local_codex.socket, "socket", side_effect=RuntimeError("audit hook")):
+        with patch.object(linux_transport.socket, "socket", side_effect=RuntimeError("audit hook")):
             self.assertEqual(self.guarded_add(daemon), RpcFallback("connect_failed"))
 
 
@@ -845,10 +846,15 @@ class SocketCreationInventoryTests(unittest.TestCase):
     """
 
     CALLS = frozenset({"socket.socket", "socket.create_connection", "socket.socketpair", "socket.fromfd"})
+    PLATFORM_CALLS = frozenset({'new_stream', 'connect_claude', 'inbox'})
     EXPECTED = [
-        ("transports/claude_peer.py", ("deliver",), "socket.socket"),   # Claude 对端投递
-        ("transports/claude_peer.py", ("open",), "socket.socket"),      # Claude 回执收件箱
-        ("transports/local_codex.py", ("new_stream",), "socket.socket"),  # §61/69/70 共享平台入口
+        ('transports/codex_native.py', ('__init__',), '.new_stream'),
+        ('transports/codex_rpc.py', ('queue_add',), '.new_stream'),
+        ('transports/claude_peer.py', ('deliver',), '.new_stream'),
+        ('transports/claude_peer.py', ('deliver',), '.connect_claude'),
+        ('transports/claude_peer.py', ('__init__',), '.inbox'),
+        ("platforms/linux/listener.py", ("open",), "socket.socket"),   # Claude 回执收件箱
+        ("platforms/linux/local_transport.py", ("new_stream",), "socket.socket"), # Codex/Claude共用流原语
     ]
 
     def test_every_socket_creation_site_is_accounted_for(self) -> None:
@@ -860,7 +866,9 @@ class SocketCreationInventoryTests(unittest.TestCase):
                 func = call.func
                 name = (f"{func.value.id}.{func.attr}"
                         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) else "")
-                if name not in self.CALLS:
+                if isinstance(func, ast.Attribute) and func.attr in self.PLATFORM_CALLS:
+                    name = '.' + func.attr
+                if name not in self.CALLS and name not in {'.'+n for n in self.PLATFORM_CALLS}:
                     continue
                 owners = tuple(sorted(
                     node.name for node in ast.walk(tree)

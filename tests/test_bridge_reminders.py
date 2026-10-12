@@ -9,7 +9,8 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from agentstatus_bridge import procfs, summary
+from agentstatus_bridge import summary
+from agentstatus_bridge.platforms.linux import process as procfs
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
 from agentstatus_bridge.dispatch import (
     REMINDER_MAX_SCAN_ERRORS,

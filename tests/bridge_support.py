@@ -26,62 +26,7 @@ from agentstatus_bridge.store import Store
 from agentstatus_bridge.transports import DeliveryContext, DeliveryOutcome
 
 
-def _production_codex_socket_roots() -> tuple[str, ...]:
-    """生产 Codex daemon 可能所在的目录：真实用户的 `~/.codex/`（取 passwd，测试改了 HOME 也不变）与
-    `/tmp/codex-daemon-<uid>/`。"""
-    import pwd
-    real_home = pwd.getpwuid(os.getuid()).pw_dir
-    return tuple(os.path.realpath(path) + os.sep for path in (
-        os.path.join(real_home, ".codex"), f"/tmp/codex-daemon-{os.getuid()}",
-    ))
-
-
-class ProductionSocketUse(BaseException):
-    """测试试图连接生产 Codex daemon。
-
-    是 BaseException 而不是 AssertionError：`codex_rpc.queue_add` 为了不让意外异常冒泡给 dispatch 而接住所有
-    Exception，会把 AssertionError 当成「连接失败」静默回退 CLI，用例照样通过（§61 第 1 轮 Fable P2-1）。
-    生产代码不为测试夹具开口子；BaseException 越过它，unittest 记 ERROR，`finally` 照常关 socket。
-    """
-
-
-def _install_production_socket_guard() -> None:
-    """任何测试经 AF_UNIX 连到生产 Codex daemon 都直接失败（DESIGN §61.2 第 9 条）。
-
-    2026-10-05 §61 开发时，一组用例经默认参数走到真实的 `queue_add`、连上了本机 daemon（假 thread id 被拒，
-    没有入队，但 initialize 以假版本改写了 daemon 的 UA 后缀）。守卫装在每个桥测试都 import 的这里，
-    直接跑单个模块也生效；只拦生产目录，临时目录里的假 server 不受影响。
-    """
-    import socket
-
-    if getattr(socket.socket, "_agentstatus_guarded", False):
-        return
-    roots = _production_codex_socket_roots()
-    original_connect = socket.socket.connect
-    original_connect_ex = socket.socket.connect_ex
-
-    def check(sock: socket.socket, address: object) -> None:
-        if sock.family != socket.AF_UNIX or not isinstance(address, (str, bytes, os.PathLike)):
-            return
-        path = os.fsdecode(address)  # pyright: ignore[reportArgumentType]
-        resolved = os.path.realpath(path) if path and not path.startswith("\0") else path
-        if any((resolved + os.sep).startswith(root) or resolved.startswith(root) for root in roots):
-            raise ProductionSocketUse(f"测试不得连接生产 Codex daemon：{path}")
-
-    def connect(self: socket.socket, address: Any) -> None:
-        check(self, address)
-        original_connect(self, address)
-
-    def connect_ex(self: socket.socket, address: Any) -> int:
-        check(self, address)
-        return original_connect_ex(self, address)
-
-    socket.socket.connect = connect  # type: ignore[method-assign]
-    socket.socket.connect_ex = connect_ex  # type: ignore[method-assign]
-    socket.socket._agentstatus_guarded = True  # type: ignore[attr-defined]
-
-
-_install_production_socket_guard()
+from bridge_platform_guard import ProductionSocketUse  # 兼容已有用例；导入即安装平台连接守卫
 
 
 def _isolate_host_policy_dirs() -> None:
@@ -94,15 +39,19 @@ def _isolate_host_policy_dirs() -> None:
     import tempfile
     from unittest import mock
 
-    from agentstatus_bridge import endpoints
-
     root = Path(tempfile.mkdtemp(prefix="agentstatus-test-policy-"))
     atexit.register(shutil.rmtree, root, ignore_errors=True)
-    # 回滚门会在子进程里用旧版 src 导入本模块，旧版可能还没有这些常量：有才改
-    if hasattr(endpoints, "CLAUDE_SYSTEM_DIR"):
-        mock.patch.object(endpoints, "CLAUDE_SYSTEM_DIR", root / "claude-absent").start()
-    if hasattr(endpoints, "GROK_SYSTEM_DIR"):
-        mock.patch.object(endpoints, "GROK_SYSTEM_DIR", root / "grok-absent").start()
+    # 回滚门加载真实旧src；按真实拥有者选择隔离目标，新版不能留一个不生效的旧模块patch。
+    try:
+        from agentstatus_bridge.platforms.linux import files as policy_owner
+    except ImportError:
+        # 仅真实历史src回滚子进程走这里；当前拥有者由直接import及隔离用例钉住。
+        policy_owner = importlib.import_module(".".join(("agentstatus_bridge", "endpoints")))
+    # 回滚旧版可能没有这些常量：有才改
+    if hasattr(policy_owner, "CLAUDE_SYSTEM_DIR"):
+        mock.patch.object(policy_owner, "CLAUDE_SYSTEM_DIR", root / "claude-absent").start()  # layout: allow 历史src才用旧拥有者，当前Linux files由正式隔离用例核对
+    if hasattr(policy_owner, "GROK_SYSTEM_DIR"):
+        mock.patch.object(policy_owner, "GROK_SYSTEM_DIR", root / "grok-absent").start()  # layout: allow 同上，兼容真实87eff52与dc3b61b回滚门
 
 
 _isolate_host_policy_dirs()

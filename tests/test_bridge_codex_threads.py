@@ -28,7 +28,7 @@ from agentstatus_bridge.endpoints import (
 )
 from agentstatus_bridge.observer_dbus import ObserverView
 from agentstatus_bridge.model import Endpoint, Provider
-from agentstatus_bridge.procfs import ProcessInfo
+from agentstatus_bridge.platforms.linux.process import ProcessInfo
 from agentstatus_bridge.reports import ReportError, _attribute  # pyright: ignore[reportPrivateUsage]
 from bridge_support import FakeProc, endpoint, ref
 

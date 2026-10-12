@@ -22,7 +22,7 @@ from agentstatus_bridge.model import (
     Work,
     describe,
 )
-from agentstatus_bridge.procfs import ProcessInfo
+from agentstatus_bridge.platforms.linux.process import ProcessInfo
 from agentstatus_bridge.reports import ReportError, ReportInput, apply_report
 from agentstatus_bridge.store import Store, StoreError
 from bridge_support import FakeProc, endpoint, ref

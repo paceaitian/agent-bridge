@@ -24,11 +24,11 @@ from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import re
-import shutil
 import sqlite3
 import subprocess
 
 from ..model import Consumption, Delivery, Endpoint, Provider
+from ..platforms.factory import get_platform
 from ..paths import codex_home
 from . import DeliveryContext, DeliveryOutcome, codex_rpc, local_codex
 
@@ -132,15 +132,7 @@ Runner = Callable[[Sequence[str], float], RunResult]
 
 
 def _default_runner(argv: Sequence[str], timeout: float) -> RunResult:
-    completed = subprocess.run(
-        list(argv),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        errors="replace",
-        timeout=timeout,
-        check=False,
-    )
+    completed = get_platform().lifecycle.run_capture(argv, timeout, replace_errors=True)
     return RunResult(completed.returncode, completed.stdout[-4096:], completed.stderr[-4096:])
 
 
@@ -173,7 +165,7 @@ class CodexQueueTransport:
         self._version_cache: tuple[tuple[str, int], str] | None = None
 
     def _resolve_executable(self) -> str | None:
-        return self._executable or shutil.which("codex")
+        return self._executable or get_platform().files.which("codex")
 
     def deliver(self, endpoint: Endpoint, text: str, context: DeliveryContext) -> DeliveryOutcome:
         before = self._data_root()
@@ -265,7 +257,7 @@ class CodexQueueTransport:
     def _release_version(self, release: str) -> str | None:
         """这个 release 路径上的 codex 版本，按（路径, mtime）缓存；取不到为 None。"""
         # 用外调前解析出的 release 路径查版本；mtime 是归档时间，只防同一路径被原地覆盖
-        key = (release, os.stat(release).st_mtime_ns)
+        key = (release, get_platform().files.mtime_ns(release))
         if self._version_cache is not None and self._version_cache[0] == key:
             return self._version_cache[1]
         version = cli_version(executable=release, runner=self._runner, timeout=VERSION_TIMEOUT_SECONDS)
@@ -278,7 +270,7 @@ class CodexQueueTransport:
 
 def _realpath(path: str) -> str | None:
     try:
-        return os.path.realpath(path)
+        return get_platform().files.realpath(path)
     except Exception:  # 诊断步骤不能影响投递本身
         return None
 
@@ -329,7 +321,7 @@ def queue_item_state(item_id: str, *, database: Path | None = None) -> Consumpti
     if not path.exists():
         return Consumption.UNKNOWN
     try:
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        connection = sqlite3.connect(get_platform().files.sqlite_uri(path, escaped=False), uri=True, timeout=1.0)
     except sqlite3.Error:
         return Consumption.UNKNOWN
     try:
@@ -347,7 +339,7 @@ def cli_version(
     *, executable: str | None = None, runner: Runner | None = None, timeout: float = 10.0
 ) -> str | None:
     """读取 `codex --version`（纯元数据命令），只接受整行恰为 `codex-cli <版本>` 的输出。"""
-    binary = executable or shutil.which("codex")
+    binary = executable or get_platform().files.which("codex")
     if binary is None:
         return None
     try:

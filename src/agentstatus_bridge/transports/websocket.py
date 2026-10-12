@@ -8,6 +8,7 @@ import json
 import os
 import socket
 
+from ..platforms.transport_types import ByteStream, LocalPlatform
 from . import local_codex
 
 MAX_MESSAGE_BYTES = 1024 * 1024
@@ -26,8 +27,8 @@ class _Timeout(Exception):
 
 
 class WebSocket:
-    def __init__(self, connection: local_codex.ByteStream, clock: Callable[[], float],
-                 platform: local_codex.LocalPlatform | None = None) -> None:
+    def __init__(self, connection: ByteStream, clock: Callable[[], float],
+                 platform: LocalPlatform | None = None) -> None:
         self._socket = connection
         self._clock = clock
         self._platform = platform or local_codex.platform()

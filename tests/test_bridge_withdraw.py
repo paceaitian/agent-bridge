@@ -1,5 +1,7 @@
 """§70 delete 的协议、三段事务、权限/崩溃和旧状态机隔离。"""
 from __future__ import annotations
+from agentstatus_bridge.platforms.null_transport import UnsupportedPlatform
+from agentstatus_bridge.platforms.linux import local_transport as linux_transport
 
 from dataclasses import asdict
 import json
@@ -20,7 +22,8 @@ from test_bridge_codex_native import CANARY, NativeDaemon
 from test_bridge_codex_rpc import THREAD, ITEM
 from agentstatus_bridge.transports import codex_withdraw, local_codex
 from agentstatus_bridge.transports.codex_withdraw import DeleteResult, QueueDeleteClient
-from agentstatus_bridge import cli, procfs, views
+from agentstatus_bridge import cli, views
+from agentstatus_bridge.platforms.linux import process as procfs
 from agentstatus_bridge.endpoints import Caller
 from agentstatus_bridge.model import Consumption, Delivery, Role, Work, Provider
 from agentstatus_bridge.store import Store, StoreError
@@ -118,7 +121,7 @@ class DeleteProtocolTests(unittest.TestCase):
 
     def test_production_guard_escapes_delete(self):
         target = Path(f"/tmp/codex-daemon-{os.getuid()}/agentstatus-guard-probe-does-not-exist")
-        with patch.object(local_codex.LinuxPlatform, "resolve", return_value=target), self.assertRaises(ProductionSocketUse):
+        with patch.object(linux_transport.LinuxPlatform, "resolve", return_value=target), self.assertRaises(ProductionSocketUse):
             QueueDeleteClient(lambda _: "0.162.1").delete(self.root, thread=THREAD, item=ITEM.lower(),
                 root_identity=local_codex.platform().root_identity(self.root), before_send=lambda budget: self.fail("boundary"))
 
@@ -565,7 +568,7 @@ class WithdrawalLedgerTests(LedgerCase):
             self.assertEqual(cli._exit_for_store_error(code), 6)
             self.assertNotEqual(cli.reason_text(code), code)
         self.assertNotEqual(cli.reason_text("withdraw_invalid_result"), "withdraw_invalid_result")
-        with patch.object(local_codex, "platform", return_value=local_codex.UnsupportedPlatform()):
+        with patch.object(local_codex, "platform", return_value=UnsupportedPlatform()):
             code, output, _ = self.run_cli(["withdraw", self.task.id, "--attempt", "1", "--json"])
             self.assertEqual(code, 6)
             self.assertIn("withdraw_platform_unsupported", output)

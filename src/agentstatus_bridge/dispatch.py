@@ -18,7 +18,8 @@ import re
 import time
 import uuid
 
-from . import envelope, procfs
+from . import envelope
+from .platforms import process as procfs
 from .endpoints import ADAPTERS
 from .ids import short
 from .naming import command_name
@@ -46,7 +47,8 @@ from .reminders import (
 )
 from .store import Store, StoreError
 from .transports import DeliveryContext, DeliveryOutcome, Transport
-from .transports.claude_peer import Receipt, encode_address, parse_receipt, parse_reply
+from .transports.claude_peer import Receipt, parse_receipt, parse_reply
+from .platforms.transport_codec import encode_address
 from .transports.codex_queue import queue_item_state
 
 # 原生调度提示按消息种类选（DESIGN §45.42）。取消忙时扣留之后，「对方什么时候读它」不再由

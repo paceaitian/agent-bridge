@@ -9,6 +9,7 @@
 """
 
 from __future__ import annotations
+from .platforms.factory import get_platform
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -17,7 +18,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from . import procfs
+from .platforms import process as procfs
 from .ids import short
 from .endpoints import Caller, codex_holdings
 from .model import (
@@ -85,13 +86,9 @@ GitRunner = Callable[[Path, str], str | None]
 
 def _git_resolve_commit(cwd: Path, value: str) -> str | None:
     try:
-        completed = subprocess.run(
+        completed = get_platform().lifecycle.run_capture(
             ["git", "-C", str(cwd), "rev-parse", "--verify", "--quiet", f"{value}^{{commit}}"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
             timeout=5.0,
-            check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

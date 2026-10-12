@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import time
 
+from ..platforms.transport_types import LocalFailure
 from . import local_codex
 from .codex_rpc import CLIENT_NAME, parse_server_version
 from .websocket import WebSocket, _Closed, _Timeout
@@ -87,7 +88,7 @@ class BoundedConnection(WebSocket):
         link = backend.control_socket_path(home)
         epoch = local_codex.socket_identity(link)
         target = backend.resolve(link)
-        if isinstance(target, local_codex.LocalFailure):
+        if isinstance(target, LocalFailure):
             raise NativeFailure(target.reason)
         self.home, self.link, self.epoch = home, link, epoch
         self.server_version = "unknown"
@@ -123,7 +124,7 @@ class BoundedConnection(WebSocket):
         if self.server_version not in VERIFIED_VERSIONS:
             raise NativeFailure("version_unverified")
         home = result.get("codexHome")
-        if not isinstance(home, str) or Path(home).resolve() != self.home.resolve():
+        if not isinstance(home, str) or not self._platform.home_equal(home, self.home):
             raise NativeFailure("home_mismatch")
         self.unchanged()
         self._send_json({"method": "initialized"}, deadline)
@@ -163,7 +164,7 @@ class ReadBatchClient:
         try:
             # socket缺失时不额外启动版本查询；版本查询本身也共享1秒总预算。
             failure = local_codex.platform().resolve(local_codex.platform().control_socket_path(home))
-            if isinstance(failure, local_codex.LocalFailure):
+            if isinstance(failure, LocalFailure):
                 return NativeBatch(reason=failure.reason)
             cli = self.version(max(0.001, deadline - self.clock()))
             if cli is None:

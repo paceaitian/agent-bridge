@@ -8,17 +8,15 @@ from __future__ import annotations
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-import fcntl
 import json
 import math
-import os
 from pathlib import Path
 import re
-import tempfile
 import time
 from typing import Any
 import unicodedata
 
+from .platforms.factory import get_platform
 from . import __version__
 from .ids import opaque_id, short
 from .labels import next_step, reason_text
@@ -149,6 +147,8 @@ def endpoint_binding(ref: EndpointRef) -> dict[str, Any]:
 def _observer_binding(
     provider: Provider, native_id: str, source: str, pane: object, pid: object, start: object, server: object,
 ) -> dict[str, Any]:
+    if get_platform().name == 'windows':
+        return {'source': source, 'pane': None, 'observerKeys': []}
     valid_pane = pane if isinstance(pane, str) and _PANE.fullmatch(pane) else None
     keys: list[dict[str, str]] = []
     if provider is Provider.CLAUDE:
@@ -575,12 +575,15 @@ def _reject_constant(name: str) -> float:
 
 @contextmanager
 def _lock(directory: Path) -> Iterator[None]:
-    descriptor = os.open(directory / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    # Capture the owner once: outside using_platform(), each default selection
+    # may construct a different backend. Handles/leases must return to their owner.
+    lifecycle = get_platform().lifecycle
+    descriptor = lifecycle.open_lock(directory / LOCK_NAME, nofollow=True)
     try:
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
         while True:
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lifecycle.try_lock(descriptor)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -589,26 +592,10 @@ def _lock(directory: Path) -> Iterator[None]:
         try:
             yield
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            lifecycle.unlock(descriptor)
     finally:
-        os.close(descriptor)
+        lifecycle.close_lock(descriptor)
 
 
 def _atomic_write(directory: Path, payload: bytes) -> None:
-    descriptor, name = tempfile.mkstemp(prefix=".summary.", suffix=".tmp", dir=directory)
-    temporary = Path(name)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, directory / SUMMARY_NAME)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    folder = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(folder)
-    finally:
-        os.close(folder)
+    get_platform().files.atomic_write(directory, payload, name=SUMMARY_NAME, prefix=".summary.")

@@ -25,11 +25,15 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
-import subprocess
 import tomllib
 from typing import Any
 
-from . import procfs
+from .platforms import process as procfs
+from .platforms.process import _argv_tokens
+from .platforms.pane import PaneInfo, _with_title
+from .platforms.mux import tmux_panes, tmux_pane_titles
+from .platforms.factory import get_platform, using_platform
+from .platforms.types import BridgePlatform, Capability
 from .codex_metadata import MetadataCache, discovery_cache
 from .codex_argv import _codex_class, _codex_non_interactive, codex_app_server
 from .ids import opaque_id
@@ -51,14 +55,6 @@ _WRITER_LOCK = re.compile(rf"(?P<uuid>{_UUID})\.lock")
 # observer 按标题给 hook 定 pane 时前缀的最短长度（与 `agentstatus.adapters.tmux_title._HOOK_PREFIX_MIN` 相同，
 # 两边由 test_codex_hook_mode 对齐）：桥按持有集核对唯一，短前缀也能认；observer 没有持有集，短于它就不认
 OBSERVER_HOOK_PREFIX_MIN = 29
-# Codex 标题末段的 thread-id 项（DESIGN §53.3.1）：至少到第 4 组（20 个 hex，过了 UUIDv7 的时间戳与版本位），
-# 可带上游 32 字符截断的 `...` 与自动生成标题期间的 ` <Braille spinner>`
-_TITLE_THREAD_ID = re.compile(
-    r"(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}(?:-[0-9a-f]{1,12})?)(?:\.\.\.)?(?: [\u2800-\u28ff])?",
-    re.IGNORECASE,
-)
-# 标题任意位置的 UUID 形状：只给 doctor 区分「配了但没放在末尾或与 spinner 粘连」
-_TITLE_UUID_SHAPE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}", re.IGNORECASE)
 # Codex 状态库：`state_<版本>.sqlite`；版本号编进文件名，两个 Codex 版本可能共用一个目录（DESIGN §45.48 R2）
 _CODEX_STATE_DB = re.compile(r"state_(?P<version>[0-9]{1,4})\.sqlite")
 # 单元变体的 SessionSource 在状态库里存成裸字符串（如 `cli`），对象变体存 JSON 文本
@@ -77,96 +73,6 @@ _CLAUDE_STATUS = {
     "shell": Runtime.BUSY,
     "waiting": Runtime.WAITING,
 }
-
-
-@dataclass(frozen=True)
-class PaneInfo:
-    pane_id: str
-    pane_pid: int
-    session_name: str
-    server_pid: int | None = None
-    # 标题末段解析出的 thread-id 前缀（小写）；原始标题不进这里（DESIGN §53.3.2）
-    thread_prefix: str | None = None
-    # 标题任意位置有 UUID 形状（只给 doctor 用）
-    title_has_uuid: bool = False
-
-
-def title_thread_prefix(title: str) -> str | None:
-    """取 Codex 标题末段的 thread-id 前缀（小写）；末段不是这个形状就返回 None（DESIGN §53.3.1）。
-
-    只看按 ` | ` 切开后的最后一段：用户的 thread 名可能就像 hex，`thread-title` 回退出的完整 UUID 也不在末段。
-    """
-    match = _TITLE_THREAD_ID.fullmatch(title.rsplit(" | ", 1)[-1].strip())
-    return match.group("id").lower() if match is not None else None
-
-
-def _with_title(pane: PaneInfo, title: str | None) -> PaneInfo:
-    if title is None:
-        return pane
-    return replace(pane, thread_prefix=title_thread_prefix(title), title_has_uuid=_TITLE_UUID_SHAPE.search(title) is not None)
-
-
-def tmux_panes() -> dict[int, PaneInfo]:
-    """读取默认 tmux server 的 pane（只读 list-panes）；tmux 不可用时返回空。"""
-    try:
-        completed = subprocess.run(
-            # #{pid} 是 tmux server PID：observer 的 Codex 会话键含它，摘要据此复算绑定（DESIGN §45.14）
-            ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{pane_id}\t#{pid}\t#{session_name}"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=3.0,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    if completed.returncode != 0:
-        return {}
-    panes: dict[int, PaneInfo] = {}
-    for line in completed.stdout.splitlines():
-        parts = line.split("\t", 3)
-        if (
-            len(parts) != 4
-            or not parts[0].isdigit()
-            or not re.fullmatch(r"%[0-9]+", parts[1])
-            or not parts[2].isdigit()
-        ):
-            continue
-        panes[int(parts[0])] = PaneInfo(
-            pane_id=parts[1], pane_pid=int(parts[0]), session_name=parts[3][:80], server_pid=int(parts[2])
-        )
-    return panes
-
-
-def tmux_pane_titles() -> dict[str, str]:
-    """读取各 pane 的标题（只读 list-panes）：pane_id → 原始标题，只在内存里用于抽 thread-id；tmux 不可用时返回空。
-
-    与 `tmux_panes` 分两次调用：现有格式里 `session_name` 放最后并允许含 tab，两个自由文本字段只能有一个
-    放末尾（DESIGN §53.3.2）。两次之间 pane 有变化时，对不上的 pane 当作没有标题，下次发现即恢复。
-    `-u` 让 tmux 不看调用方的 locale 也按 UTF-8 输出：非 UTF-8 环境下 tmux 会把 spinner 换成 `_`，
-    标题生成那几秒就认不出 thread-id（Opus 实现复核 P3-3）。
-    """
-    try:
-        completed = subprocess.run(
-            ["tmux", "-u", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_title}"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=3.0,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    if completed.returncode != 0:
-        return {}
-    titles: dict[str, str] = {}
-    for line in completed.stdout.splitlines():
-        pane_id, separator, title = line.partition("\t")
-        if separator and re.fullmatch(r"%[0-9]+", pane_id):
-            titles[pane_id] = title
-    return titles
 
 
 def _evidence_covers(evidence_at: float | None, status_at_ms: Any) -> bool:
@@ -220,9 +126,19 @@ class DiscoverySources:
     # pane_id → 原始标题（DESIGN §53.3.2）；测试给原始标题，经生产解析函数抽 thread-id
     titles: Callable[[], Mapping[str, str]] = tmux_pane_titles
     runtime: Callable[[], ObserverView] = agentstatus_view
-    uid: int = field(default_factory=os.getuid)
+    uid: int = field(default_factory=lambda: get_platform().files.uid())
     native_metadata: MetadataCache = field(default_factory=discovery_cache, compare=False)
     native_report: dict[str, object] = field(default_factory=dict, compare=False)
+    platform: BridgePlatform = field(default_factory=get_platform, compare=False)
+
+    def __post_init__(self) -> None:
+        # 保留显式注入的旧接缝；默认采样经组合根，不在类定义时做IO。
+        if self.panes is tmux_panes:
+            self.panes = self.platform.mux.panes
+        if self.titles is tmux_pane_titles:
+            self.titles = self.platform.mux.titles
+        if self.runtime is agentstatus_view:
+            self.runtime = self.platform.runtime.view
 
 
 def _pane_for(pid: int, panes: Mapping[int, PaneInfo], proc_root: Path) -> PaneInfo | None:
@@ -238,11 +154,7 @@ def _pane_for(pid: int, panes: Mapping[int, PaneInfo], proc_root: Path) -> PaneI
 
 
 def _is_owned_socket(path: str, uid: int) -> bool:
-    try:
-        status = os.lstat(path)
-    except OSError:
-        return False
-    return stat.S_ISSOCK(status.st_mode) and status.st_uid == uid
+    return get_platform().transport.owned_socket(path, uid)
 
 
 def _discover_claude(
@@ -426,7 +338,7 @@ def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThr
             break
         try:
             connection = sqlite3.connect(
-                f"{(root / name).as_uri()}?mode=ro", uri=True, timeout=CODEX_STATE_TIMEOUT_SECONDS
+                get_platform().files.sqlite_uri(root / name, escaped=True), uri=True, timeout=CODEX_STATE_TIMEOUT_SECONDS
             )
         except (sqlite3.Error, ValueError):
             newest_failed = newest_failed or position == 0
@@ -947,7 +859,16 @@ _AGENT_ENV_MARKERS = tuple(marker for adapter in ADAPTERS.values() for marker in
 
 def discover(sources: DiscoverySources | None = None) -> list[Endpoint]:
     """发现当前可交接的端点，按 provider 与 tmux 会话名排序。"""
+    if sources is None and get_platform().discovery is not Capability.VERIFIED:
+        return []
     config = sources or DiscoverySources()
+    with using_platform(config.platform):
+        return _discover_selected(config)
+
+
+def _discover_selected(config: DiscoverySources) -> list[Endpoint]:
+    if config.platform.discovery is not Capability.VERIFIED:
+        return []  # Windows W1不扫描provider、不将空持有集当root、不造伪pane。
     titles = config.titles()
     panes = {pid: _with_title(pane, titles.get(pane.pane_id)) for pid, pane in config.panes().items()}
     runtime = config.runtime()
@@ -969,7 +890,16 @@ def codex_title_report(sources: DiscoverySources | None = None) -> dict[str, obj
     （没放在末尾，或末段与 spinner 粘连）；都没有。认出的里面另数前缀被尾截短的（observer 不认，hook 结局
     不公开；Opus 实现复核第 2 轮 P3-3）。状态库不可用另报一项；不是 daemon 模式时只报这一点。
     """
+    if sources is None and get_platform().discovery is not Capability.VERIFIED:
+        return {'state': 'discovery_unverified'}
     config = sources or DiscoverySources()
+    with using_platform(config.platform):
+        return _title_report_selected(config)
+
+
+def _title_report_selected(config: DiscoverySources) -> dict[str, object]:
+    if config.platform.discovery is not Capability.VERIFIED:
+        return {"state": "discovery_unverified"}
     processes = scan_codex_holdings(config.proc_root, config.codex_home)
     if not codex_daemon_mode(processes):
         return {"daemonMode": False}
@@ -1067,12 +997,14 @@ class Caller:
     agent_process: procfs.ProcessInfo | None
     via: str | None = None  # ancestry / environment
     agent_env: bool = False
-    # 明确认出但不允许以会话身份行事的调用者：目前只有 "subagent"（Codex 子代理，DESIGN §45.48 R3）
+    # subagent（§45.48 R3）；platform_unverified（Windows W1未开放caller资格）。
     rejection: str | None = None
 
     @property
     def is_user_shell(self) -> bool:
         """既无 agent 祖先进程也无 agent 环境变量：用户直接在终端/SSH 中运行。"""
+        if self.rejection == 'platform_unverified':
+            return False
         return self.agent_process is None and not self.agent_env
 
 
@@ -1099,6 +1031,8 @@ def identify_caller(
 
     最近的 codex 祖先是 app-server（Codex 托管 daemon）时另走 `_codex_daemon_caller`（DESIGN §53.4）。
     """
+    if get_platform().name == 'windows':
+        return Caller(None,None,rejection='platform_unverified')
     env = os.environ if environ is None else environ
     chain = procfs.ancestry(pid if pid is not None else os.getpid(), proc_root)
     agent_env = any(env.get(name) for name in _AGENT_ENV_MARKERS)
@@ -1247,25 +1181,6 @@ def _caller_from_env(
 
 
 # 判权限类别时读命令行的上限；超过就是没读全（DESIGN §58.8）
-_PERMISSION_ARGV_BYTES = 64 * 1024
-
-
-def _argv_tokens(pid: int, proc_root: Path) -> tuple[list[str], bool]:
-    """读进程命令行用于识别启动标志：(token 列表, 是否读全)；只在内存里比较，不保存也不输出。
-
-    读失败或为空（进程正在退出等）也算没读全：读不到就不声明（DESIGN §58.8 第 2 轮）。
-    """
-    try:
-        # 有界读取：多读一个字节用来判断是否超过上限，与 procfs.launch_tokens 一致不整份读入
-        with (proc_root / str(pid) / "cmdline").open("rb") as stream:
-            raw = stream.read(_PERMISSION_ARGV_BYTES + 1)
-    except OSError:
-        return [], False
-    complete = 0 < len(raw) <= _PERMISSION_ARGV_BYTES
-    raw = raw[:_PERMISSION_ARGV_BYTES]
-    return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part], complete
-
-
 # Grok 的权限模式（DESIGN §60 ③）。以上游公开源码为准（xai-org/grok-build 1.0.45：`pager/src/app/cli.rs`、
 # `xai-grok-shell/src/util/config/permissions.rs`、`xai-grok-agent/src/config.rs`），随装文档与它有出入的地方见 DESIGN 60.1
 _GROK_BYPASS_FLAGS = frozenset({"--always-approve", "--yolo", "--dangerously-skip-permissions"})
@@ -1274,18 +1189,10 @@ _GROK_PROMPTING_CLI_MODES = frozenset({"default", "acceptEdits", "auto", "dontAs
 # `[ui] permission_mode` 的取值：只有 always-approve 是 bypass（上游别的字符串都按询问处理，这里当认不出）
 _GROK_PROMPTING_CONFIG_MODES = frozenset({"default", "ask", "auto"})
 # 系统级 managed_config.toml 与 requirements.toml 的位置（`22-permissions-and-safety.md:106`）
-GROK_SYSTEM_DIR = Path("/etc/grok")
 
 
 def _present(path: Path) -> bool:
-    """文件在不在；拿不准（权限不足等）按在处理，免得把可能存在的锁当成没有。"""
-    try:
-        path.lstat()
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    except OSError:
-        return True
-    return True
+    return get_platform().files.present(path)
 
 
 def _grok_cli_mode(tokens: list[str]) -> str | None:
@@ -1382,7 +1289,6 @@ def _grok_class(tokens: list[str], home: Path, system_dir: Path) -> str | None:
     return "bypass"
 
 
-CLAUDE_SYSTEM_DIR = Path("/etc/claude-code")
 # 官方 CLI reference 明确用于 print/非交互的标志；sdk-url 为任务书指定的 SDK 防呆（§73.6）。
 _CLAUDE_HEADLESS_FLAGS = frozenset({
     "-p", "--print", "--sdk-url", "--input-format", "--output-format", "--permission-prompt-tool",
@@ -1447,6 +1353,8 @@ def permission_class(
     - Grok：启动参数，没写时看用户 config.toml 的 `[ui] permission_mode`；有 requirements.toml 时不声明 bypass，
       命令行没读全判未知（DESIGN §60 ③）。
     """
+    if get_platform().name == 'windows':
+        return None
     agent = caller.agent_process
     if agent is None and caller.endpoint is not None:
         info = procfs.read_process(caller.endpoint.ref.pid, proc_root)
@@ -1457,7 +1365,7 @@ def permission_class(
     tokens, complete = _argv_tokens(agent.pid, proc_root)
     if agent.comm == "claude":
         return _claude_class(tokens, interactive=complete and agent.tty_nr != 0, complete=complete,
-                             system_dir=claude_system_dir or CLAUDE_SYSTEM_DIR)
+                             system_dir=claude_system_dir or get_platform().files.policy_dir("claude"))
     if agent.comm == "codex":
         if codex_app_server(tokens) or not complete:
             # 命令行没读全时被截掉的部分可能有改判的参数（如提示词后的 --approve-for-me），不声明（DESIGN §58.8）
@@ -1466,5 +1374,5 @@ def permission_class(
     if agent.comm == "grok":
         if not complete:
             return None
-        return _grok_class(tokens, grok_dir or grok_home(), GROK_SYSTEM_DIR)
+        return _grok_class(tokens, grok_dir or grok_home(), get_platform().files.policy_dir("grok"))
     return None

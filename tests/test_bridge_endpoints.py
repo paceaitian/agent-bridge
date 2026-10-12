@@ -1,6 +1,7 @@
 """协作桥端点发现：注册表代际、Codex thread 归属、目标解析、调用者与权限类别。"""
 
 from __future__ import annotations
+from agentstatus_bridge.platforms.linux import files as linux_files
 
 from collections.abc import Callable
 from dataclasses import replace
@@ -33,7 +34,7 @@ from agentstatus_bridge.observer_dbus import (
 )
 from agentstatus_bridge.ids import opaque_id
 from agentstatus_bridge.model import Provider, Runtime
-from agentstatus_bridge import procfs
+from agentstatus_bridge.platforms.linux import process as procfs
 from agentstatus_bridge.codex_argv import _codex_non_interactive  # pyright: ignore[reportPrivateUsage]
 from agentstatus_bridge.transports import DeliveryContext
 from agentstatus_bridge.transports.claude_peer import build_frame
@@ -997,7 +998,7 @@ class CallerTests(unittest.TestCase):
 
     def test_host_policy_dirs_are_isolated_in_tests(self) -> None:
         """bridge_support 把默认系统策略目录改指不存在的临时路径，core 不随宿主是否受管变红（§73.7）。"""
-        for path, host in ((endpoints_module.CLAUDE_SYSTEM_DIR, "/etc/claude-code"), (endpoints_module.GROK_SYSTEM_DIR, "/etc/grok")):
+        for path, host in ((linux_files.CLAUDE_SYSTEM_DIR, "/etc/claude-code"), (linux_files.GROK_SYSTEM_DIR, "/etc/grok")):
             self.assertNotEqual(str(path), host)
             self.assertFalse(path.exists())
         self.proc.add(8000, comm="claude", argv=["claude", "--dangerously-skip-permissions"], tty=34816)
@@ -1166,7 +1167,7 @@ class CallerTests(unittest.TestCase):
         self.proc.add(pid, comm="grok", argv=argv)
         self.proc.add(pid + 1000, comm="python3", ppid=pid)
         caller = identify_caller([], pid=pid + 1000, proc_root=self.proc.root, environ={})
-        with unittest.mock.patch.object(endpoints_module, "GROK_SYSTEM_DIR", system):
+        with unittest.mock.patch.object(linux_files, "GROK_SYSTEM_DIR", system):
             try:
                 return permission_class(caller, proc_root=self.proc.root, grok_dir=home)
             except TypeError as error:  # 让缺陷以 FAIL 出现，而不是 ERROR

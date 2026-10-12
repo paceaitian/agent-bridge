@@ -141,6 +141,8 @@ REASON_TEXTS: dict[str, str] = {
     "withdraw_root_missing": "缺少原投递或当前数据根证据，不能猜删",
     "withdraw_root_mismatch": "当前数据根与原投递存证不一致，未发撤回请求",
     "withdraw_platform_unsupported": "本平台尚不支持原生撤回，未发撤回请求",
+    "windows_provider_not_enabled": "Windows W1 尚未开放会话投递，尚未写入任务",
+    "platform_unsupported": "当前平台未受支持，尚未执行操作",
     "withdraw_not_allowed": "只有用户或发起任务的会话可以撤回原生队列项",
     "withdraw_store_unreadable": "撤回附表版本不可读；主账本仍可使用，撤回功能已停用",
     "withdraw_record_conflict": "撤回结果未落账：操作已被恢复或处理，请区分本次实际结果与账本记录",

@@ -1,0 +1,1361 @@
+{
+  "outputs": [
+    [
+      [
+        "peers"
+      ],
+      0,
+      "codex@fixture-label          %1    空闲     019a0000  prompting\n",
+      ""
+    ],
+    [
+      [
+        "peers",
+        "--json"
+      ],
+      0,
+      "{\n  \"peers\": [\n    {\n      \"device\": \"fixture-device\",\n      \"issues\": [],\n      \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n      \"pane\": \"%1\",\n      \"permissionClass\": \"prompting\",\n      \"provider\": \"codex\",\n      \"runtime\": \"idle\",\n      \"self\": false,\n      \"session\": \"fixture\\tlabel\",\n      \"target\": \"codex@fixture-label\",\n      \"threads\": [\n        \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\"\n      ]\n    }\n  ]\n}\n",
+      ""
+    ],
+    [
+      [
+        "send",
+        "--to",
+        "%1",
+        "--no-wait",
+        "--json",
+        "-m",
+        "synthetic"
+      ],
+      6,
+      "{\n  \"acceptedAt\": null,\n  \"attempts\": [\n    {\n      \"bodyBytes\": 9,\n      \"consumption\": \"not_observed\",\n      \"createdAt\": 1000.0,\n      \"delivery\": \"pending\",\n      \"deliveryAt\": null,\n      \"deliveryDetail\": {},\n      \"deliveryDetailRedacted\": false,\n      \"deliveryReason\": null,\n      \"messageId\": \"00000000000000000000000000000004\",\n      \"providerRef\": null,\n      \"refs\": [],\n      \"result\": null,\n      \"role\": \"handoff\",\n      \"sender\": null,\n      \"senderClass\": \"bypass\",\n      \"seq\": 1,\n      \"target\": {\n        \"name\": \"codex@fixture\\tlabel\",\n        \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n        \"pane\": \"%1\",\n        \"provider\": \"codex\"\n      },\n      \"work\": \"awaiting_ack\",\n      \"workAt\": null\n    }\n  ],\n  \"closedAt\": null,\n  \"control\": \"active\",\n  \"createdAt\": 1000.0,\n  \"flow\": \"handoff\",\n  \"hint\": null,\n  \"id\": \"00000000000000000000000000000002\",\n  \"nativeWithdrawals\": {\n    \"operations\": [],\n    \"readable\": true,\n    \"reason\": null,\n    \"version\": 1\n  },\n  \"origin\": null,\n  \"phase\": \"queued\",\n  \"phaseLabel\": \"排队\",\n  \"reason\": \"waiting_for_target\",\n  \"reasonText\": \"已排队，还没发出\",\n  \"reviewer\": null,\n  \"targetSessionMissing\": false,\n  \"targetStoppedWithoutReport\": false,\n  \"targetTurnEndedAt\": null,\n  \"title\": \"synthetic\",\n  \"updatedAt\": 1000.0,\n  \"verdict\": null\n}\n",
+      ""
+    ],
+    [
+      [
+        "tasks"
+      ],
+      0,
+      "00000000  排队   codex@fixture\tlabel          synthetic  （已排队，还没发出，0 秒前）\n",
+      ""
+    ],
+    [
+      [
+        "tasks",
+        "--json"
+      ],
+      0,
+      "{\n  \"tasks\": [\n    {\n      \"acceptedAt\": null,\n      \"attempts\": [\n        {\n          \"bodyBytes\": 9,\n          \"consumption\": \"not_observed\",\n          \"createdAt\": 1000.0,\n          \"delivery\": \"pending\",\n          \"deliveryAt\": null,\n          \"deliveryDetail\": {},\n          \"deliveryDetailRedacted\": false,\n          \"deliveryReason\": null,\n          \"messageId\": \"00000000000000000000000000000004\",\n          \"providerRef\": null,\n          \"refs\": [],\n          \"result\": null,\n          \"role\": \"handoff\",\n          \"sender\": null,\n          \"senderClass\": \"bypass\",\n          \"seq\": 1,\n          \"target\": {\n            \"name\": \"codex@fixture\\tlabel\",\n            \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n            \"pane\": \"%1\",\n            \"provider\": \"codex\"\n          },\n          \"work\": \"awaiting_ack\",\n          \"workAt\": null\n        }\n      ],\n      \"closedAt\": null,\n      \"control\": \"active\",\n      \"createdAt\": 1000.0,\n      \"flow\": \"handoff\",\n      \"id\": \"00000000000000000000000000000002\",\n      \"nativeWithdrawals\": {\n        \"operations\": [],\n        \"readable\": true,\n        \"reason\": null,\n        \"version\": 1\n      },\n      \"origin\": null,\n      \"phase\": \"queued\",\n      \"phaseLabel\": \"排队\",\n      \"reason\": \"waiting_for_target\",\n      \"reasonText\": \"已排队，还没发出\",\n      \"reviewer\": null,\n      \"targetSessionMissing\": false,\n      \"targetStoppedWithoutReport\": false,\n      \"targetTurnEndedAt\": null,\n      \"title\": \"synthetic\",\n      \"updatedAt\": 1000.0,\n      \"verdict\": null\n    }\n  ]\n}\n",
+      ""
+    ],
+    [
+      [
+        "status",
+        "00000000000000000000000000000002"
+      ],
+      0,
+      "任务 00000000 「synthetic」 排队：已排队，还没发出\n流程：交接；发起：用户；创建于 0 秒前\n  #1 交接 → codex@fixture\tlabel：桥内排队；工作：等待对方确认\n下一步：等后台 worker 发送；不需要了可 agent-bridge cancel 00000000\n时间线：\n  01-01 00:16:40 #1 创建任务\n",
+      ""
+    ],
+    [
+      [
+        "status",
+        "00000000000000000000000000000002",
+        "--json"
+      ],
+      0,
+      "{\n  \"acceptedAt\": null,\n  \"attempts\": [\n    {\n      \"bodyBytes\": 9,\n      \"consumption\": \"not_observed\",\n      \"createdAt\": 1000.0,\n      \"delivery\": \"pending\",\n      \"deliveryAt\": null,\n      \"deliveryDetail\": {},\n      \"deliveryDetailRedacted\": false,\n      \"deliveryReason\": null,\n      \"messageId\": \"00000000000000000000000000000004\",\n      \"providerRef\": null,\n      \"refs\": [],\n      \"result\": null,\n      \"role\": \"handoff\",\n      \"sender\": null,\n      \"senderClass\": \"bypass\",\n      \"seq\": 1,\n      \"target\": {\n        \"name\": \"codex@fixture\\tlabel\",\n        \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n        \"pane\": \"%1\",\n        \"provider\": \"codex\"\n      },\n      \"work\": \"awaiting_ack\",\n      \"workAt\": null\n    }\n  ],\n  \"closedAt\": null,\n  \"control\": \"active\",\n  \"createdAt\": 1000.0,\n  \"events\": [\n    {\n      \"at\": 1000.0,\n      \"attemptSeq\": 1,\n      \"detail\": {\n        \"flow\": \"handoff\"\n      },\n      \"kind\": \"created\"\n    }\n  ],\n  \"flow\": \"handoff\",\n  \"id\": \"00000000000000000000000000000002\",\n  \"nativeWithdrawals\": {\n    \"operations\": [],\n    \"readable\": true,\n    \"reason\": null,\n    \"version\": 1\n  },\n  \"origin\": null,\n  \"phase\": \"queued\",\n  \"phaseLabel\": \"排队\",\n  \"reason\": \"waiting_for_target\",\n  \"reasonText\": \"已排队，还没发出\",\n  \"reviewer\": null,\n  \"targetSessionMissing\": false,\n  \"targetStoppedWithoutReport\": false,\n  \"targetTurnEndedAt\": null,\n  \"title\": \"synthetic\",\n  \"updatedAt\": 1000.0,\n  \"verdict\": null\n}\n",
+      ""
+    ],
+    [
+      [
+        "summary",
+        "--refresh",
+        "--json"
+      ],
+      0,
+      "{\n  \"generatedAt\": 1000.0,\n  \"ledgerRevision\": 3,\n  \"overflow\": false,\n  \"published\": \"written\",\n  \"revision\": 3,\n  \"state\": \"ok\"\n}\n",
+      ""
+    ],
+    [
+      [
+        "doctor"
+      ],
+      0,
+      "agent-bridge 版本：0.1.0.dev0\n包路径：<package>/agentstatus_bridge\n对外命令名：agent-bridge\n本机设备名：fixture-device\n任务账本目录：<fixture>/bridge\n状态根目录：<fixture>/bridge\n状态根来源：env\n后台 worker 运行中：否\nCodex CLI 版本：None\nCodex 窗口标题里的会话 id：1 个能认出\nCodex 原生元数据：no_candidates；确认 0，冲突 0，SQL 直答 1，SQL 回退 0；SQL：available（未查询不代表可用）\nCodex CLI 输出证据：当前 codex 版本不可用，无法关联样本\nCodex RPC 证据（最近最多 200 条 Codex 尝试）：在本次查询窗口内没有可分类的 RPC 响应样本（传输失败的尝试不计入此项）\nClaude 会话注册表可读：是\nClaude 回执目录存在：否\nAgentStatus 忙闲状态可读：是\nworker 最近日志：（无）\n任务账本正常：是\n已关闭但对方可能仍在执行的任务：0\n协作摘要：正常\n",
+      ""
+    ],
+    [
+      [
+        "doctor",
+        "--json"
+      ],
+      0,
+      "{\n  \"abVersion\": \"0.1.0.dev0\",\n  \"agentstatusRuntimeAvailable\": true,\n  \"archivedWithNativeRisk\": 0,\n  \"claudeInboxDirectory\": false,\n  \"claudeRegistryReadable\": true,\n  \"codexQueueEvidence\": {\n    \"state\": \"version_unavailable\",\n    \"version\": null,\n    \"window\": 200\n  },\n  \"codexRpcEvidence\": {\n    \"fallbacks\": 0,\n    \"otherVersion\": 0,\n    \"recognized\": 0,\n    \"state\": \"no_samples\",\n    \"unknownVersion\": 0,\n    \"unrecognized\": 0,\n    \"version\": null,\n    \"window\": 200\n  },\n  \"codexThreadTitle\": {\n    \"daemonMode\": true,\n    \"nativeMetadata\": {\n      \"confirmed\": 0,\n      \"conflicts\": 0,\n      \"serverVersion\": \"unknown\",\n      \"sqlAnswered\": 1,\n      \"sqlFallback\": 0,\n      \"sqlState\": \"available\",\n      \"state\": \"no_candidates\"\n    },\n    \"shortThreadId\": 0,\n    \"stateDbUnavailable\": false,\n    \"uuidNotParsed\": 0,\n    \"withThreadId\": 1,\n    \"withoutThreadId\": 0\n  },\n  \"codexVersion\": null,\n  \"command\": \"agent-bridge\",\n  \"device\": \"fixture-device\",\n  \"ledger\": \"<fixture>/bridge\",\n  \"ledgerOk\": true,\n  \"packagePath\": \"<package>/agentstatus_bridge\",\n  \"stateRoot\": \"<fixture>/bridge\",\n  \"stateRootSource\": \"env\",\n  \"summaryState\": \"正常\",\n  \"workerLog\": [],\n  \"workerRunning\": false\n}\n",
+      ""
+    ]
+  ],
+  "commands": [
+    [
+      [
+        "tmux",
+        "-u",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}\t#{pane_title}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_pid}\t#{pane_id}\t#{pid}\t#{session_name}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "-u",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}\t#{pane_title}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_pid}\t#{pane_id}\t#{pid}\t#{session_name}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "-u",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}\t#{pane_title}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_pid}\t#{pane_id}\t#{pid}\t#{session_name}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "-u",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}\t#{pane_title}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_pid}\t#{pane_id}\t#{pid}\t#{session_name}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "-u",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}\t#{pane_title}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_pid}\t#{pane_id}\t#{pid}\t#{session_name}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "-u",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}\t#{pane_title}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_pid}\t#{pane_id}\t#{pid}\t#{session_name}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "-u",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}\t#{pane_title}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_pid}\t#{pane_id}\t#{pid}\t#{session_name}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "-u",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}\t#{pane_title}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_pid}\t#{pane_id}\t#{pid}\t#{session_name}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "-u",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}\t#{pane_title}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ],
+    [
+      [
+        "tmux",
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_pid}\t#{pane_id}\t#{pid}\t#{session_name}"
+      ],
+      {
+        "stdin": -3,
+        "capture_output": true,
+        "text": true,
+        "errors": "replace",
+        "timeout": 3.0,
+        "check": false
+      }
+    ]
+  ],
+  "effects": [
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/bridge.sqlite3",
+      65,
+      384
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/worker.lock",
+      66,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      5
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "open",
+      "<fixture>/bridge/.summary.<random>.tmp",
+      131266,
+      384
+    ],
+    [
+      "fchmod",
+      "<fixture>/bridge/.summary.<random>.tmp",
+      384
+    ],
+    [
+      "fsync",
+      "<fixture>/bridge/.summary.<random>.tmp"
+    ],
+    [
+      "replace",
+      "<fixture>/bridge/.summary.<random>.tmp",
+      "<fixture>/bridge/summary.json"
+    ],
+    [
+      "open",
+      "<fixture>/bridge",
+      65536,
+      511
+    ],
+    [
+      "fsync",
+      "<fixture>/bridge"
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/worker.lock",
+      66,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      5
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/worker.lock",
+      66,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      5
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/worker.lock",
+      66,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      5
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/worker.lock",
+      66,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      5
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/worker.lock",
+      66,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      5
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "open",
+      "<fixture>/bridge/.summary.<random>.tmp",
+      131266,
+      384
+    ],
+    [
+      "fchmod",
+      "<fixture>/bridge/.summary.<random>.tmp",
+      384
+    ],
+    [
+      "fsync",
+      "<fixture>/bridge/.summary.<random>.tmp"
+    ],
+    [
+      "replace",
+      "<fixture>/bridge/.summary.<random>.tmp",
+      "<fixture>/bridge/summary.json"
+    ],
+    [
+      "open",
+      "<fixture>/bridge",
+      65536,
+      511
+    ],
+    [
+      "fsync",
+      "<fixture>/bridge"
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/worker.lock",
+      66,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      5
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/worker.lock",
+      66,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      5
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/worker.lock",
+      66,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      5
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/summary.lock",
+      131138,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      6
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/summary.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "open",
+      "<fixture>/bridge/worker.lock",
+      66,
+      384
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      5
+    ],
+    [
+      "flock",
+      "<fixture>/bridge/worker.lock",
+      8
+    ],
+    [
+      "mkdir",
+      "<fixture>/bridge",
+      448
+    ],
+    [
+      "chmod",
+      "<fixture>/bridge",
+      448
+    ]
+  ],
+  "files": [
+    [
+      "bridge.sqlite3",
+      "0o600"
+    ],
+    [
+      "summary.json",
+      "0o600"
+    ],
+    [
+      "summary.lock",
+      "0o600"
+    ],
+    [
+      "worker.lock",
+      "0o600"
+    ]
+  ],
+  "summary": "{\"abVersion\":\"0.1.0.dev0\",\"attentionIndex\":[],\"counts\":{\"active\":1,\"attention\":0,\"decision\":0,\"failure\":0,\"result\":0},\"deliveries\":[],\"device\":\"fixture-device\",\"generatedAt\":1000.0,\"ledgerId\":\"00000000000000000000000000000001\",\"ledgerRevision\":3,\"overflow\":false,\"schema\":1,\"tasks\":[{\"attention\":{\"kind\":\"none\"},\"createdAt\":1000.0,\"current\":{\"attemptId\":\"00000000000000000000000000000003\",\"consumption\":\"not_observed\",\"delivery\":\"pending\",\"deliveryAt\":null,\"role\":\"handoff\",\"seq\":1,\"work\":\"awaiting_ack\",\"workAt\":null},\"flow\":\"handoff\",\"id\":\"00000000000000000000000000000002\",\"next\":{\"action\":\"wait\",\"command\":null,\"text\":\"等后台 worker 发送；不需要了可 agent-bridge cancel 00000000000000000000000000000002\"},\"origin\":null,\"originIsUser\":true,\"phase\":\"queued\",\"phaseLabel\":\"排队\",\"reason\":\"waiting_for_target\",\"reasonText\":\"已排队，还没发出\",\"reviewer\":null,\"short\":\"00000000\",\"target\":{\"binding\":{\"observerKeys\":[{\"key\":\"codex:0edc2a8c5a64e6a76514aea1\",\"match\":\"generation\"}],\"pane\":\"%1\",\"source\":\"selected\"},\"label\":\"codex@fixture label\",\"pane\":\"%1\",\"provider\":\"codex\",\"role\":\"handoff\"},\"title\":\"synthetic\",\"updatedAt\":1000.0}]}",
+  "logical": {
+    "tasks": [
+      {
+        "id": "00000000000000000000000000000002",
+        "created_at": 1000.0,
+        "updated_at": 1000.0,
+        "title": "synthetic",
+        "flow": "handoff",
+        "origin": null,
+        "reviewer": null,
+        "control": "active",
+        "verdict": null,
+        "accepted_at": null,
+        "viewed_at": null,
+        "closed_at": null,
+        "close_reason": null,
+        "options": "{\"allowShared\":false,\"notify\":true}"
+      }
+    ],
+    "attempts": [
+      {
+        "id": "00000000000000000000000000000003",
+        "task_id": "00000000000000000000000000000002",
+        "seq": 1,
+        "role": "handoff",
+        "target": "{\"label\":\"fixture\\tlabel\",\"nativeId\":\"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\"pane\":\"%1\",\"pid\":200,\"provider\":\"codex\",\"startTicks\":\"001234\",\"tmuxServerPid\":90}",
+        "message_id": "00000000000000000000000000000004",
+        "created_at": 1000.0,
+        "body": "synthetic",
+        "refs": "[]",
+        "delivery": "pending",
+        "delivery_reason": null,
+        "delivery_at": null,
+        "provider_ref": null,
+        "delivery_detail": "{}",
+        "consumption": "not_observed",
+        "work": "awaiting_ack",
+        "work_at": null,
+        "result": null,
+        "sender": null,
+        "sender_class": "bypass",
+        "options": "{\"allowShared\":false}"
+      }
+    ],
+    "meta": [
+      {
+        "key": "native_withdrawals_version",
+        "value": "1"
+      },
+      {
+        "key": "ledger_revision",
+        "value": "3"
+      },
+      {
+        "key": "ledger_id",
+        "value": "00000000000000000000000000000001"
+      }
+    ],
+    "native_withdrawals": []
+  },
+  "process": {
+    "rows": [
+      {
+        "pid": 99,
+        "ppid": 0,
+        "comm": "sh",
+        "start_ticks": "9",
+        "tty_nr": 42
+      },
+      {
+        "pid": 100,
+        "ppid": 99,
+        "comm": "sh",
+        "start_ticks": "10",
+        "tty_nr": 42
+      },
+      {
+        "pid": 200,
+        "ppid": 100,
+        "comm": "codex",
+        "start_ticks": "001234",
+        "tty_nr": 42
+      },
+      {
+        "pid": 250,
+        "ppid": 200,
+        "comm": "codex",
+        "start_ticks": "1235",
+        "tty_nr": 0
+      },
+      {
+        "pid": 300,
+        "ppid": 100,
+        "comm": "claude",
+        "start_ticks": "9007199254740993",
+        "tty_nr": 42
+      },
+      {
+        "pid": 400,
+        "ppid": 400,
+        "comm": "name (nested)",
+        "start_ticks": "88",
+        "tty_nr": 0
+      }
+    ],
+    "chain": [
+      {
+        "pid": 200,
+        "ppid": 100,
+        "comm": "codex",
+        "start_ticks": "001234",
+        "tty_nr": 42
+      },
+      {
+        "pid": 100,
+        "ppid": 99,
+        "comm": "sh",
+        "start_ticks": "10",
+        "tty_nr": 42
+      },
+      {
+        "pid": 99,
+        "ppid": 0,
+        "comm": "sh",
+        "start_ticks": "9",
+        "tty_nr": 42
+      }
+    ],
+    "cycle": [
+      {
+        "pid": 400,
+        "ppid": 400,
+        "comm": "name (nested)",
+        "start_ticks": "88",
+        "tty_nr": 0
+      }
+    ],
+    "namespace": "pid:[fixture]",
+    "argv": [
+      "--ask-for-approval",
+      "on-request"
+    ],
+    "same": true,
+    "different": false
+  }
+}

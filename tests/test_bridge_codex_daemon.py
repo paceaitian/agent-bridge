@@ -31,9 +31,10 @@ from agentstatus_bridge.endpoints import (
     identify_caller,
     permission_class,
     resolve_target,
-    title_thread_prefix,
-    tmux_pane_titles,
 )
+from agentstatus_bridge.platforms.pane import title_thread_prefix
+from agentstatus_bridge.platforms.linux.mux import tmux_pane_titles
+from agentstatus_bridge.platforms.linux import mux
 from agentstatus_bridge.model import Endpoint, EndpointRef, Provider
 from agentstatus_bridge.observer_dbus import ObserverView
 from agentstatus_bridge.reports import ReportError, _attribute  # pyright: ignore[reportPrivateUsage]
@@ -166,7 +167,7 @@ class TitleVectorTests(unittest.TestCase):
     def test_tmux_titles_are_read_by_pane_id_and_raw_titles_stay_out_of_pane_info(self) -> None:
         output = f"%1\t{title(T1)}\n%2\tbad\twith tab\nnot-a-pane\tx\n%3\n"
         completed = subprocess.CompletedProcess([], 0, output, "")
-        with patch.object(endpoints_module.subprocess, "run", return_value=completed) as run:
+        with patch.object(mux.subprocess, "run", return_value=completed) as run:
             titles = tmux_pane_titles()
         self.assertEqual(titles, {"%1": title(T1), "%2": "bad\twith tab"})
         # -u：不随调用方的 locale 把 spinner 换成 `_`（Opus 实现复核 P3-3）
@@ -177,7 +178,7 @@ class TitleVectorTests(unittest.TestCase):
         )
 
     def test_tmux_unavailable_gives_no_titles(self) -> None:
-        with patch.object(endpoints_module.subprocess, "run", side_effect=OSError):
+        with patch.object(mux.subprocess, "run", side_effect=OSError):
             self.assertEqual(tmux_pane_titles(), {})
 
 

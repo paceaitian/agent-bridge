@@ -16,7 +16,8 @@ from pathlib import Path
 import sys
 import time
 
-from . import __version__, procfs, summary
+from . import __version__, summary
+from .platforms import process as procfs
 from .codex_metadata import command_scope
 from .endpoints import (
     Caller,
@@ -61,7 +62,8 @@ from .model import (
     work_attempts,
 )
 from .naming import command_name
-from .observer_dbus import ObserverView, agentstatus_view
+from .observer_dbus import ObserverView
+from .platforms.factory import get_platform, using_platform
 from .paths import codex_home, codex_sqlite_home, device_name, state_dir
 from .reports import ReportError, ReportInput, apply_report, file_reference
 from .store import DB_NAME, MAX_BODY_BYTES, Store, StoreError
@@ -93,6 +95,7 @@ EXIT_FAILURE_REPORTED = 5
 EXIT_UNAVAILABLE = 6
 EXIT_UNKNOWN = 7
 EXIT_STORE = 8
+EXIT_NOT_ENABLED = 9
 
 SEND_WAIT_SECONDS = 15.0
 # 新拉起的 worker 取得单实例锁前的等待上限
@@ -262,7 +265,9 @@ def _observations() -> tuple[list[Endpoint], ObserverView]:
     端点状态与提示证据出自同一份快照（端点忙闲按 pane 与 provider 取行，提示证据按目标的 observer 键取行，
     DESIGN §62 ④⑤）；任一来源不可用时提示自然缺席。
     """
-    view = agentstatus_view()
+    view = get_platform().runtime.view()
+    if get_platform().name == 'windows':
+        return [], view
     return discover(DiscoverySources(runtime=lambda: view)), view
 
 
@@ -996,7 +1001,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.json:
         _print_json(checks)
         return EXIT_OK
-    print_checks(checks)
+    if get_platform().name == 'windows':
+        for key, value in checks.items():
+            print(f'{key}: {value}')
+    else:
+        print_checks(checks)
     return EXIT_OK
 
 
@@ -1005,8 +1014,11 @@ def _refresh_summary(*, force: bool = False, revive: bool = False) -> summary.Pu
 
     revive：命令结束后若还有待办（含未到期的发起方提醒）而 worker 不在（崩溃、重启），顺手拉起（DESIGN §45.28.3）。
     """
+    revive = revive and get_platform().name != 'windows'
     try:
         root = state_dir()
+        if get_platform().name == 'windows':
+            get_platform().files.ensure_private_dir(root)
         if not (root / DB_NAME).is_file():
             return None  # 没用过协作桥的机器不创建账本
         with Store.open(root) as store:
@@ -1027,6 +1039,8 @@ def _revive_from_summary(store: Store) -> None:
     这是辅助动作：不能改变摘要输出与退出码，出错也不像其他命令那样兜底再拉一次。
     worker 由 gnome-shell 环境拉起时，worker_environment 会给 PATH 补上 ~/.local/bin，保证找得到 codex。
     """
+    if get_platform().name == 'windows':
+        return
     try:
         _revive_worker(store, time.time())
     except Exception:  # needs_worker 读账本也可能抛 sqlite3.Error 等 _revive_worker 不接的异常
@@ -1036,7 +1050,14 @@ def _revive_from_summary(store: Store) -> None:
 def cmd_summary(args: argparse.Namespace) -> int:
     # 只有 --if-stale（扩展的定时与打开菜单补查）在发布后按需拉起 worker：普通 summary 与只带 --refresh 的手动重建不拉起。
     # 早先因 gnome-shell 的 PATH 找不到 codex 而完全不拉起（§45.28.3 实现修订），现由 worker 环境补 PATH 解决（§45.30）
-    root = state_dir()
+    if get_platform().name == 'windows':
+        try:
+            root = state_dir()
+            get_platform().files.ensure_private_dir(root)
+        except OSError as error:
+            raise CliError('store_unavailable', EXIT_STORE) from error
+    else:
+        root = state_dir()
     ledger = (root / DB_NAME).is_file()
     published: summary.PublishResult | None = None
     if args.refresh or args.if_stale:
@@ -1190,6 +1211,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     global _worker_ensured
     _worker_ensured = False
     args = build_parser().parse_args(argv)
+    try:
+        platform = get_platform()
+    except ValueError as error:
+        if str(error) != 'platform_unsupported':
+            raise
+        _report_error(args, 'platform_unsupported')
+        return EXIT_REJECTED
+    with using_platform(platform):
+        return _run_command(args)
+
+
+def _run_command(args: argparse.Namespace) -> int:
+    if get_platform().name == 'windows':
+        # Before body/ref reads, ledger/summary, caller sampling, or finally/revive.
+        if args.command not in {'doctor', 'tasks', 'status', 'summary', 'peers'}:
+            _report_error(args, 'windows_provider_not_enabled')
+            return EXIT_NOT_ENABLED
+        if args.command == 'peers':
+            value = {'peers': [], 'discovery': 'unverified', 'providerEnabled': False}
+            _print_json(value) if args.json else print('Windows 会话发现未验证；未开放投递。')
+            return EXIT_OK
     # 任一调用前后补查摘要：提交后未发布（进程被杀、锁超时）的窗口由下一次调用收敛；worker 与 summary 自行处理
     refresh = args.command not in {"worker", "summary"}
     if refresh:

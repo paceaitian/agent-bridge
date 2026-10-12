@@ -217,28 +217,8 @@ def agentstatus_runtime() -> dict[str, Runtime] | None:
 
 
 def _observer_rows() -> list[Mapping[str, Any]] | None:
-    """读一次 ListSessions 并返回其中的对象行（可能为空）；不可用、超限或格式不对时返回 None。"""
-    try:
-        import gi
-
-        gi.require_version("Gio", "2.0")
-        from gi.repository import Gio  # pyright: ignore[reportAttributeAccessIssue]
-
-        proxy = Gio.DBusProxy.new_for_bus_sync(
-            Gio.BusType.SESSION,
-            Gio.DBusProxyFlags.DO_NOT_AUTO_START,
-            None,
-            AGENTSTATUS_BUS_NAME,
-            AGENTSTATUS_OBJECT_PATH,
-            AGENTSTATUS_INTERFACE_NAME,
-            None,
-        )
-        flags = getattr(Gio.DBusCallFlags, "NO_AUTO_START", Gio.DBusCallFlags.NONE)
-        reply = proxy.call_sync("ListSessions", None, flags, 2000, None)
-        raw = reply.unpack()[0]
-    except Exception:  # 可选数据源：任何失败都只意味着“状态未知”
-        return None
-    return _parse_observer_reply(raw)
+    from .platforms.linux.observer_io import read_reply  # layout: allow 纯投影模块在Windows可导入而不加载Linux/GI
+    return _parse_observer_reply(read_reply(AGENTSTATUS_BUS_NAME, AGENTSTATUS_OBJECT_PATH, AGENTSTATUS_INTERFACE_NAME))
 
 
 def _parse_observer_reply(raw: object) -> list[Mapping[str, Any]] | None:

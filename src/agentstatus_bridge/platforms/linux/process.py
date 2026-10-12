@@ -1,12 +1,11 @@
-"""只读 /proc 查询：进程代际、祖先链与打开的文件，用于端点发现和报告归属。"""
+"""Linux /proc 原语；从 procfs 原样下沉，旧 None/bool/字节窗口合同不改。"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from ..process_values import ProcessInfo, DEFAULT_PROC
 import os
 from pathlib import Path
 
-DEFAULT_PROC = Path("/proc")
 
 
 def pid_namespace(proc_root: Path = DEFAULT_PROC) -> str | None:
@@ -24,16 +23,6 @@ _MAX_ARGV_BYTES = 16384
 _MAX_ARGV_TOKENS = 64
 _MAX_ARGV_TOKEN_BYTES = 256
 
-
-@dataclass(frozen=True)
-class ProcessInfo:
-    """一个进程的最小身份：PID 加启动时刻（clock ticks）才能排除 PID 复用。"""
-
-    pid: int
-    ppid: int
-    comm: str
-    start_ticks: str
-    tty_nr: int = 0  # 控制终端设备号，0 表示没有控制终端
 
 
 def read_process(pid: int, proc_root: Path = DEFAULT_PROC) -> ProcessInfo | None:
@@ -122,3 +111,22 @@ def is_same_generation(pid: int, start_ticks: str, proc_root: Path = DEFAULT_PRO
     """判断 PID 是否仍是记录时的同一进程。"""
     info = read_process(pid, proc_root)
     return info is not None and info.start_ticks == start_ticks
+
+
+_PERMISSION_ARGV_BYTES = 64 * 1024
+
+
+def _argv_tokens(pid: int, proc_root: Path) -> tuple[list[str], bool]:
+    """读进程命令行用于识别启动标志：(token 列表, 是否读全)；只在内存里比较，不保存也不输出。
+
+    读失败或为空（进程正在退出等）也算没读全：读不到就不声明（DESIGN §58.8 第 2 轮）。
+    """
+    try:
+        # 有界读取：多读一个字节用来判断是否超过上限，与 procfs.launch_tokens 一致不整份读入
+        with (proc_root / str(pid) / "cmdline").open("rb") as stream:
+            raw = stream.read(_PERMISSION_ARGV_BYTES + 1)
+    except OSError:
+        return [], False
+    complete = 0 < len(raw) <= _PERMISSION_ARGV_BYTES
+    raw = raw[:_PERMISSION_ARGV_BYTES]
+    return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part], complete

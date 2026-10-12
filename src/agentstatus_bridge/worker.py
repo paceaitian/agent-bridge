@@ -7,23 +7,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-import fcntl
 import json
 import os
 from pathlib import Path
-import signal
-import subprocess
-import sys
 import time
 from types import FrameType
 
+from .platforms.factory import get_platform
 from . import summary
 from .dispatch import Dispatcher, LogFn
 from .codex_metadata import MetadataCache
 from .endpoints import ADAPTERS, DiscoverySources, discover
 from .model import Endpoint, Provider
 from .naming import COMMAND_ENV, command_name
-from .paths import STATE_DIR_ENV, ensure_private_dir, state_dir
+from .paths import ensure_private_dir, state_dir
+from .platforms.path_values import STATE_DIR_ENV
 from .store import Store, StoreError
 from .transports import Transport
 from .transports.claude_peer import ClaudeInbox, ClaudePeerTransport
@@ -35,17 +33,7 @@ LOOP_SECONDS = 1.0
 IDLE_EXIT_SECONDS = 120.0
 MAX_CONSECUTIVE_FAILURES = 30
 MAX_LOG_BYTES = 256 * 1024
-# 取单实例锁被占用时的重试：探测只瞬时持共享锁，稍等即可取得；另一个 worker 会一直持有排他锁（DESIGN §45.30.6）
-LOCK_RETRY_ATTEMPTS = 5
-LOCK_RETRY_SECONDS = 0.02
 
-# 拉起 worker 的可能是某个 agent 会话里的命令；这些变量属于那个会话，不能带进常驻 worker
-# （worker 再调用 codex queue 时也不应带着发起会话的 thread/权限变量）。
-# 每加一个 provider，这里要覆盖它在 ADAPTERS 里声明的 env markers——有用例按注册表逐个核对（DESIGN §45.34）
-_SESSION_ENV_PREFIXES = ("CLAUDE_CODE_", "CODEX_", "GROK_")
-_SESSION_ENV_NAMES = frozenset({"CLAUDECODE", "CLAUDE_PID"})
-# 数据根指针不是会话身份：剥掉它们 worker 会去看另一个目录，发现结果与调用方不一致
-_KEEP_ENV = frozenset({"CODEX_HOME", "CODEX_SQLITE_HOME", "GROK_HOME"})
 
 
 class WorkerLog:
@@ -62,13 +50,7 @@ class WorkerLog:
             default=str,
         )
         try:
-            if self.path.exists() and self.path.stat().st_size > MAX_LOG_BYTES:
-                os.replace(self.path, self.path.with_name(self.path.name + ".1"))
-            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-            try:
-                os.write(fd, (line + "\n").encode("utf-8"))
-            finally:
-                os.close(fd)
+            get_platform().files.append_log(self.path, (line + "\n").encode("utf-8"), MAX_LOG_BYTES)
         except OSError:
             pass  # 日志失败不能影响投递
 
@@ -94,16 +76,17 @@ def worker_running(root: Path | None = None) -> bool:
     探测与新 worker 取锁撞在同一刻时，由 worker 取锁重试消化（_acquire_worker_lock，DESIGN §45.30.6）。
     """
     path = _lock_path(root or state_dir())
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    lifecycle = get_platform().lifecycle
+    fd = lifecycle.open_lock(path)
     try:
-        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        lifecycle.try_lock(fd, shared=True)
     except BlockingIOError:
         return True
     else:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        lifecycle.unlock(fd)
         return False
     finally:
-        os.close(fd)
+        lifecycle.close_lock(fd)
 
 
 def wait_for_worker(root: Path | None = None, *, timeout: float = 2.0) -> bool:
@@ -118,75 +101,27 @@ def wait_for_worker(root: Path | None = None, *, timeout: float = 2.0) -> bool:
         time.sleep(0.05)
 
 
-def worker_path(path: str | None) -> str:
-    """worker 的 PATH：调用方原有顺序不变，缺 ~/.local/bin 时补在末尾（DESIGN §45.30）。
-
-    扩展从 gnome-shell 调用 `ab summary --if-stale` 时 PATH 没有 ~/.local/bin，而 codex 装在那里；
-    与 agentstatus.service 给自己的私有 PATH 补同一目录是同一做法。只追加不前置，调用方已有的同名命令仍优先。
-    PATH 为空或未设置时先取系统默认路径 os.defpath，与 exec 和 shutil.which 在未设置时的回退一致；其余情况原样保留调用方的字符串。
-    """
-    local_bin = str(Path.home() / ".local" / "bin")
-    current = path if path and any(path.split(os.pathsep)) else os.defpath
-    # 末尾带 / 的同一目录也算已有；重复构造不会重复追加
-    if any(os.path.normpath(segment) == local_bin for segment in current.split(os.pathsep) if segment):
-        return current
-    return f"{current}{os.pathsep}{local_bin}"
-
-
-def worker_environment(base: Mapping[str, str]) -> dict[str, str]:
-    """worker 环境：去掉调用方会话私有变量，保证能导入本包、能找到 ~/.local/bin 下的 codex。"""
-    env = {
-        key: value
-        for key, value in base.items()
-        if key in _KEEP_ENV or (key not in _SESSION_ENV_NAMES and not key.startswith(_SESSION_ENV_PREFIXES))
-    }
-    package_parent = str(Path(__file__).resolve().parents[1])
-    existing = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = package_parent if not existing else f"{package_parent}{os.pathsep}{existing}"
-    env["PATH"] = worker_path(env.get("PATH"))
-    return env
-
-
-def _acquire_worker_lock(fd: int) -> bool:
-    """取单实例排他锁；被占用时短暂重试，只有一直拿不到（另一个 worker 在持有）才放弃。
-
-    旧实现一次失败就退出：探测恰好瞬时持锁的那一刻，新拉起的 worker 会以为已有实例而退出，结果一个 worker 都没有。
-    """
-    for attempt in range(LOCK_RETRY_ATTEMPTS):
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except BlockingIOError:
-            if attempt + 1 < LOCK_RETRY_ATTEMPTS:
-                time.sleep(LOCK_RETRY_SECONDS)
-    return False
-
 
 def ensure_worker(root: Path | None = None) -> bool:
     """确保后台 worker 在运行；需要时以独立会话拉起，返回是否新启动。"""
+    if get_platform().name == 'windows':
+        return False
     directory = root or state_dir()
     if worker_running(directory):
         return False
-    env = worker_environment(os.environ)
+    env = get_platform().lifecycle.worker_environment(os.environ)
     env[STATE_DIR_ENV] = str(directory)
     # worker 由 `python -m` 拉起，argv0 是解释器：把调用方解析出的命令名显式传下去，
     # 否则页脚会退回默认名而不是用户实际敲的那个（DESIGN §45.36）
     env[COMMAND_ENV] = command_name()
-    subprocess.Popen(
-        [sys.executable, "-m", "agentstatus_bridge", "worker"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        start_new_session=True,
-        cwd=str(directory),
-        env=env,
-    )
+    get_platform().lifecycle.spawn_worker(directory, env)
     return True
 
 
 def default_transports() -> dict[Provider, Transport]:
     """各 provider 的投递通道；只读 provider（适配器 inbox=False）不在其中（DESIGN §45.34）。"""
+    if get_platform().name == 'windows':
+        return {}
     transports: dict[Provider, Transport] = {
         Provider.CODEX: CodexQueueTransport(),
         Provider.CLAUDE: ClaudePeerTransport(),
@@ -229,10 +164,14 @@ def run_worker(
 
     单轮异常只记日志并退避重试，连续失败过多才退出，不让排队静默停摆（DESIGN §45.6）。
     """
+    platform = get_platform()
+    if platform.name == 'windows':
+        return 9
+    lifecycle = platform.lifecycle
     directory = root or state_dir()
-    lock_fd = os.open(_lock_path(directory), os.O_RDWR | os.O_CREAT, 0o600)
-    if not _acquire_worker_lock(lock_fd):
-        os.close(lock_fd)
+    lock_fd = lifecycle.open_lock(_lock_path(directory))
+    if not lifecycle.acquire_worker_lock(lock_fd):
+        lifecycle.close_lock(lock_fd)
         return 0
     stopping = False
 
@@ -240,7 +179,7 @@ def run_worker(
         nonlocal stopping
         stopping = True
 
-    previous = {number: signal.signal(number, _stop) for number in (signal.SIGTERM, signal.SIGINT)}
+    previous = lifecycle.install_stop(_stop)
     log = WorkerLog(directory / LOG_NAME)
     try:
         # 先开账本再绑收件箱：账本失败时不在 Claude socket 目录留下残留
@@ -334,8 +273,7 @@ def run_worker(
                     inbox.close()
                 log("stop", {"consecutiveFailures": failures})
     finally:
-        for number, handler in previous.items():
-            signal.signal(number, handler)
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
+        lifecycle.restore_stop(previous)
+        lifecycle.unlock(lock_fd)
+        lifecycle.close_lock(lock_fd)
     return 0
