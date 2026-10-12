@@ -877,6 +877,133 @@ class CallerTests(unittest.TestCase):
         alone = identify_caller([first], pid=950, proc_root=self.proc.root, environ={})
         self.assertEqual((alone.endpoint, alone.via), (first, "ancestry"))
 
+    def test_claude_plan_requires_bypass_availability(self) -> None:
+        vectors = [
+            (["--permission-mode", "plan"], None), (["--permission-mode=plan"], None),
+            (["--permission-mode", "plan", "--allow-dangerously-skip-permissions"], "bypass"),
+            (["--permission-mode=plan", "--dangerously-skip-permissions"], "bypass"),
+            (["--allow-dangerously-skip-permissions"], None),
+            (["--permission-mode", "not-a-mode"], None),
+            (["--permission-mode=bypassPermissions"], "bypass"),
+            *[(["--permission-mode", mode], "prompting") for mode in ("default", "acceptEdits", "auto", "dontAsk")],
+        ]
+        for index, (argv, expected) in enumerate(vectors):
+            pid = 8000 + index
+            with self.subTest(argv=argv):
+                self.proc.add(pid, comm="claude", argv=["claude", *argv], tty=34816)
+                caller = endpoints_module.Caller(None, procfs.read_process(pid, self.proc.root))
+                self.assertEqual(permission_class(caller, proc_root=self.proc.root), expected)
+
+    def test_claude_plan_requires_interactive_terminal(self) -> None:
+        # 独立固定向量，不从生产集合生成；无头标志即使有tty也不能冒称交互。
+        vectors = [
+            ["-p", "synthetic"], ["--print"], ["--input-format", "stream-json"],
+            ["--output-format=stream-json"], ["--sdk-url", "ws://synthetic.invalid"],
+            ["--permission-prompt-tool", "synthetic"], ["--permission-prompts=none"],
+            ["--include-partial-messages"], ["--forward-subagent-text"], ["--include-hook-events"],
+            ["--prompt-suggestions"], ["--replay-user-messages"],
+            ["--append-subagent-system-prompt", "synthetic"], ["--append-subagent-system-prompt-file", "synthetic"],
+            ["--init"], ["--init-only"], ["--maintenance"], ["--max-budget-usd", "1"],
+            ["--max-turns", "1"], ["--no-session-persistence"], ["--json-schema", "{}"],
+            ["--output-format=json"], ["--input-format=text"],
+        ]
+        for danger in ("--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"):
+            for extra, tty in [([], 0), *[(args, 34816) for args in vectors]]:
+                with self.subTest(extra=extra, tty=tty, danger=danger):
+                    self.proc.add(8000, comm="claude", argv=["claude", "--permission-mode=plan", danger, *extra], tty=tty)
+                    caller = endpoints_module.Caller(None, procfs.read_process(8000, self.proc.root))
+                    self.assertIsNone(permission_class(caller, proc_root=self.proc.root, claude_system_dir=self.root / "managed"))
+        for extra in ([], ["--bare"]):
+            self.proc.add(8000, comm="claude", argv=["claude", "--permission-mode=plan", danger, *extra], tty=34816)
+            caller = endpoints_module.Caller(None, procfs.read_process(8000, self.proc.root))
+            self.assertEqual(permission_class(caller, proc_root=self.proc.root, claude_system_dir=self.root / "managed"), "bypass")
+        self.proc.add(8000, comm="claude", argv=["claude", "--permission-mode=plan", danger, "x" * 70000], tty=34816)
+        caller = endpoints_module.Caller(None, procfs.read_process(8000, self.proc.root))
+        self.assertIsNone(permission_class(caller, proc_root=self.proc.root, claude_system_dir=self.root / "managed"))
+
+    def test_claude_last_mode_conflicts_and_managed_settings(self) -> None:
+        vectors = [
+            (["--permission-mode=bypassPermissions", "--permission-mode", "acceptEdits"], "prompting"),
+            (["--permission-mode", "acceptEdits", "--permission-mode=bypassPermissions"], "bypass"),
+            (["--permission-mode=bypassPermissions", "--permission-mode=plan"], None),
+            (["--permission-mode=plan", "--permission-mode=default", "--allow-dangerously-skip-permissions"], "prompting"),
+            (["--permission-mode=bypassPermissions", "--permission-mode"], None),
+            (["--permission-mode=manual"], "prompting"),
+            *[(["--dangerously-skip-permissions", "--permission-mode=" + mode], None)
+              for mode in ("default", "manual", "acceptEdits", "auto", "dontAsk", "unknown")],
+            (["--dangerously-skip-permissions", "--permission-mode=bypassPermissions"], "bypass"),
+            (["--dangerously-skip-permissions", "--restricted"], None),
+            (["--permission-mode=plan", "--allow-dangerously-skip-permissions", "--restricted"], None),
+        ]
+        system_dir = self.root / "managed"
+        for argv, expected in vectors:
+            with self.subTest(argv=argv):
+                self.proc.add(8000, comm="claude", argv=["claude", *argv], tty=34816)
+                caller = endpoints_module.Caller(None, procfs.read_process(8000, self.proc.root))
+                self.assertEqual(permission_class(caller, proc_root=self.proc.root, claude_system_dir=system_dir), expected)
+        for name in ("managed-settings.json", "managed-settings.d"):
+            for argv in (["--dangerously-skip-permissions"], ["--permission-mode=bypassPermissions"],
+                         ["--permission-mode=plan", "--allow-dangerously-skip-permissions"]):
+                with self.subTest(name=name, argv=argv):
+                    system_dir.mkdir(exist_ok=True)
+                    item = system_dir / name
+                    if name.endswith(".d"):
+                        item.mkdir()
+                    else:
+                        item.write_text("not-json-must-not-be-parsed")
+                    self.proc.add(8000, comm="claude", argv=["claude", *argv], tty=34816)
+                    caller = endpoints_module.Caller(None, procfs.read_process(8000, self.proc.root))
+                    try:
+                        self.assertIsNone(permission_class(caller, proc_root=self.proc.root, claude_system_dir=system_dir))
+                    finally:
+                        item.rmdir() if item.is_dir() else item.unlink()
+        with unittest.mock.patch.object(Path, "lstat", autospec=True, side_effect=self._lstat_denied_under(system_dir)):
+            self.assertIsNone(permission_class(caller, proc_root=self.proc.root, claude_system_dir=system_dir))
+
+    def test_claude_plan_interactivity_is_preserved_in_the_frame(self) -> None:
+        for tty, extra, bypass in ((34816, [], True), (0, [], False), (34816, ["-p", "synthetic"], False)):
+            self.proc.add(8000, comm="claude", argv=["claude", "--permission-mode=plan", "--dangerously-skip-permissions", *extra], tty=tty)
+            caller = endpoints_module.Caller(None, procfs.read_process(8000, self.proc.root))
+            sender_class = permission_class(caller, proc_root=self.proc.root, claude_system_dir=self.root / "managed")
+            frame = json.loads(build_frame("synthetic", DeliveryContext(message_uuid="m", sender_name="x", sender_class=sender_class)))
+            self.assertEqual('from-mode="bypass"' in frame["message"]["content"], bypass)
+
+    def test_claude_truncation_combined_short_flags_and_separator(self) -> None:
+        """§73.7：argv 没读全不声明 bypass；含 p 的短选项合写算 print；`--` 之后不计；托管存在不改 prompting。"""
+        managed = self.root / "managed"
+        long_prompt = "x" * (70 * 1024)
+        vectors = [
+            (["--permission-mode=bypassPermissions", long_prompt, "--permission-mode=default"], None),
+            (["--dangerously-skip-permissions", long_prompt, "--restricted"], None),
+            (["--dangerously-skip-permissions", long_prompt], None),
+            (["--dangerously-skip-permissions", "x" * 1024], "bypass"),
+            (["-pc", "--permission-mode", "plan", "--allow-dangerously-skip-permissions"], None),
+            (["-cp", "--permission-mode=plan", "--dangerously-skip-permissions"], None),
+            (["-c", "--permission-mode=plan", "--dangerously-skip-permissions"], "bypass"),
+            (["-cv", "--permission-mode=plan", "--dangerously-skip-permissions"], "bypass"),  # 合写但不含 p
+            (["--", "--dangerously-skip-permissions"], None),
+            (["--permission-mode=default", "--", "--permission-mode=bypassPermissions"], "prompting"),
+        ]
+        for argv, expected in vectors:
+            with self.subTest(argv=[token[:40] for token in argv]):
+                self.proc.add(8000, comm="claude", argv=["claude", *argv], tty=34816)
+                caller = endpoints_module.Caller(None, procfs.read_process(8000, self.proc.root))
+                self.assertEqual(permission_class(caller, proc_root=self.proc.root, claude_system_dir=managed), expected)
+        managed.mkdir()
+        (managed / "managed-settings.json").write_text("not-json-must-not-be-parsed")
+        self.proc.add(8000, comm="claude", argv=["claude", "--permission-mode=default"], tty=34816)
+        caller = endpoints_module.Caller(None, procfs.read_process(8000, self.proc.root))
+        self.assertEqual(permission_class(caller, proc_root=self.proc.root, claude_system_dir=managed), "prompting")
+
+    def test_host_policy_dirs_are_isolated_in_tests(self) -> None:
+        """bridge_support 把默认系统策略目录改指不存在的临时路径，core 不随宿主是否受管变红（§73.7）。"""
+        for path, host in ((endpoints_module.CLAUDE_SYSTEM_DIR, "/etc/claude-code"), (endpoints_module.GROK_SYSTEM_DIR, "/etc/grok")):
+            self.assertNotEqual(str(path), host)
+            self.assertFalse(path.exists())
+        self.proc.add(8000, comm="claude", argv=["claude", "--dangerously-skip-permissions"], tty=34816)
+        caller = endpoints_module.Caller(None, procfs.read_process(8000, self.proc.root))
+        self.assertEqual(permission_class(caller, proc_root=self.proc.root), "bypass")
+
     def _codex_class_for(self, argv: list[str], toml: str | None, pid: int) -> str | None:
         """在合成 /proc 上按给定 argv 与 config.toml 走真实的 identify_caller → permission_class。"""
         config = self.root / "codex-layers.toml"
@@ -989,11 +1116,15 @@ class CallerTests(unittest.TestCase):
         # 读不到也不声明：空 cmdline 与读失败（进程正在退出）
         self.assertIsNone(self._codex_class_for([], yolo, 3510))
         self.assertIsNone(self._codex_class_after_cmdline_vanishes(yolo, 3512))
-        # 截断判未知只对 Codex：Claude 照旧按读到的明确模式判类
+        # §73.7 起 Claude 同样不在截断时声明：末项模式与 --restricted 让被截掉的尾部也能改判（复审 P3-1）
         self.proc.add(3514, comm="claude", argv=["claude", "--dangerously-skip-permissions", long_prompt])
         self.proc.add(4514, comm="python3", ppid=3514)
         caller = identify_caller([], pid=4514, proc_root=self.proc.root, environ={})
-        self.assertEqual(permission_class(caller, proc_root=self.proc.root), "bypass")
+        self.assertIsNone(permission_class(caller, proc_root=self.proc.root))
+        self.proc.add(3518, comm="claude", argv=["claude", "--permission-mode=default", long_prompt])
+        self.proc.add(4518, comm="python3", ppid=3518)
+        caller = identify_caller([], pid=4518, proc_root=self.proc.root, environ={})
+        self.assertIsNone(permission_class(caller, proc_root=self.proc.root))
 
     def _codex_class_after_cmdline_vanishes(self, toml: str, pid: int) -> str | None:
         """先按正常 argv 建进程、认出调用者，再删掉 cmdline，模拟判类时读失败。"""

@@ -77,6 +77,8 @@ from .views import (
     _print_closure,
     _print_task,
     _task_document,
+    _withdrawal_document,
+    _withdrawn,
 )
 from .worker import ensure_worker, run_worker, wait_for_worker, worker_running
 from .transports import local_codex
@@ -111,8 +113,11 @@ class CliError(Exception):
 
 
 def _exit_for_store_error(code: str) -> int:
-    if code.startswith("store_") or code in {"schema_too_new", "corrupt_record"}:
+    if code.startswith("store_") or code in {"schema_too_new", "corrupt_record", "withdraw_store_unreadable",
+                                             "withdraw_record_conflict", "withdraw_invalid_result"}:
         return EXIT_STORE
+    if code in {"withdraw_root_missing", "withdraw_root_mismatch", "withdraw_platform_unsupported"}:
+        return EXIT_UNAVAILABLE
     if code in {"task_not_found", "task_ambiguous"}:
         return EXIT_TARGET
     return EXIT_REJECTED
@@ -508,10 +513,21 @@ def cmd_tasks(args: argparse.Namespace) -> int:
             view = describe(task, attempts)
             target = view.current.target.display() if view.current else "-"
             hint = hints.get(task.id, _NO_HINT)
+            withdrawals = _withdrawal_document(store, task)
+            withdrawal_note = ""
+            if not withdrawals["readable"]:
+                withdrawal_note = "，原生撤回附表不可读"
+            if _withdrawn(view.current, withdrawals["operations"]):
+                hint = _NO_HINT
+                withdrawal_note += "，本桥已移除该队列项（不证明未执行）"
+            if any(item["ownerStatus"] == "gone" for item in withdrawals["operations"]):
+                withdrawal_note += "，执行者已不在，下次 withdraw 恢复"
+            elif any(item["ownerStatus"] == "namespace_unverified" for item in withdrawals["operations"]):
+                withdrawal_note += "，执行者 PID 命名空间不可核对，不判死"
             flag = "，未发现对方会话" if hint.missing else "，对方已停下未汇报" if hint.stopped_at is not None else ""
             print(
                 f"{short(task.id)}  {PHASE_LABELS[view.phase]:<4} {target:<28}"
-                f" {task.title[:40]}  （{reason_text(view.reason)}{flag}，{_age(task.updated_at, now)}）"
+                f" {task.title[:40]}  （{reason_text(view.reason)}{flag}{withdrawal_note}，{_age(task.updated_at, now)}）"
             )
     return EXIT_OK
 
@@ -796,29 +812,43 @@ def cmd_withdraw(args: argparse.Namespace) -> int:
     if info is None:
         raise CliError("withdraw_owner_unknown", EXIT_UNAVAILABLE)
     home, sqlite_home = codex_home(), codex_sqlite_home()
-    root_identity = local_codex.platform().root_identity(home, sqlite_home)
+    backend = local_codex.platform()
+    if not backend.supported:
+        raise CliError("withdraw_platform_unsupported", EXIT_UNAVAILABLE)
+    root_identity = backend.root_identity(home, sqlite_home)
     if root_identity is None:
-        raise CliError("withdraw_root_unproven", EXIT_UNAVAILABLE)
+        raise CliError("withdraw_root_missing", EXIT_UNAVAILABLE)
     with _open_store() as store:
         store.recover_withdrawals(now=now)
         with store.transaction():
             task = _task(store, args.task)
             if not _may_decide(caller, task):
-                raise CliError("accept_not_allowed")
-            try:
-                operation, created = store.prepare_withdrawal(task.id, args.attempt, root_identity=root_identity,
-                    now=now, pid=info.pid, start=info.start_ticks, again=args.again)
-            except StoreError as error:
-                if error.code in {"withdraw_attempt_missing", "withdraw_ineligible", "withdraw_root_unproven", "withdraw_limit"}:
-                    raise CliError(error.code) from error
-                raise
+                raise CliError("withdraw_not_allowed")
+            operation, created = store.prepare_withdrawal(task.id, args.attempt, root_identity=root_identity,
+                now=now, pid=info.pid, start=info.start_ticks, again=args.again)
         if created:
             client = QueueDeleteClient(lambda timeout: cli_version(timeout=timeout))
             outcome = client.delete(home, thread=operation["thread_id"], item=operation["item_id"],
                 root_identity=root_identity, sqlite_home=sqlite_home,
-                before_send=lambda: store.begin_withdrawal(operation["id"], now=time.time(), pid=info.pid, start=info.start_ticks))
-            store.finish_withdrawal(operation["id"], thread=operation["thread_id"], item=operation["item_id"],
-                state=outcome.state, reason=outcome.reason, version=outcome.server_version, now=time.time())
+                before_send=lambda budget: store.begin_withdrawal(operation["id"], now=time.time(), pid=info.pid,
+                                                                  start=info.start_ticks, budget=budget))
+            try:
+                store.finish_withdrawal(operation["id"], thread=operation["thread_id"], item=operation["item_id"],
+                    state=outcome.state, reason=outcome.reason, version=outcome.server_version, now=time.time())
+            except StoreError as error:
+                try:
+                    recorded = next((item for item in store.withdrawals(task.id) if item["id"] == operation["id"]), None)
+                except Exception:
+                    recorded = None
+                actual = {"state": outcome.state, "reason": outcome.reason, "serverVersion": outcome.server_version}
+                if args.json:
+                    _print_json({"version": 1, "taskId": task.id, "ok": False, "code": error.code,
+                                 "reasonText": reason_text(error.code), "operation": recorded,
+                                 "actualResult": actual, "execution": "not_proven_unexecuted"})
+                else:
+                    print(f"撤回结果落账失败：{reason_text(error.code)}（{error.code}）；"
+                          f"本次实际结果 {outcome.state}（{outcome.reason}），账本未覆盖；不证明未执行")
+                return EXIT_STORE
         current = next(item for item in store.withdrawals(operation["task_id"]) if item["id"] == operation["id"])
         if args.json:
             _print_json({"version": 1, "taskId": task.id, "operation": current,
@@ -826,6 +856,8 @@ def cmd_withdraw(args: argparse.Namespace) -> int:
         else:
             print(f"任务 {short(task.id)} #{args.attempt} 撤回：{current['state']}（{current['reason']}）")
             print("仅描述原生队列项；不证明从未执行，不能停止已开始的工作；原投递与重发规则不变")
+        if current["reason"] in {"boundary_store_busy", "boundary_record_failed"}:
+            return EXIT_STORE
         return {"deleted": EXIT_OK, "absent": EXIT_OK, "refused": EXIT_REJECTED,
                 "unknown": EXIT_UNKNOWN}.get(current["state"], EXIT_UNAVAILABLE)
 
@@ -984,7 +1016,7 @@ def _refresh_summary(*, force: bool = False, revive: bool = False) -> summary.Pu
                 if revive and not _worker_ensured:
                     _revive_worker(store, time.time())
     except Exception:  # 摘要是可重建投影：任何失败都不能阻止命令或覆盖已提交的结果（3A-F02）
-        if not _worker_ensured:  # 与正常结束同一口径：本次已新拉起过就不重复（Codex 复审 S03）
+        if revive and not _worker_ensured:  # 异常也不能替 withdraw/manual summary 拉 worker
             _start_worker()
         return None
 

@@ -41,6 +41,7 @@ class NativeBatch:
     records: dict[str, ThreadMetadata] = field(default_factory=dict)
     reason: str = "no_candidates"
     server_version: str = "unknown"
+    not_held: tuple[str, ...] = ()
 
 
 def project_thread(value: object, requested: str) -> ThreadMetadata:
@@ -152,7 +153,7 @@ class ReadBatchClient:
         self.version, self.clock = version, clock
 
     def read(self, home: Path, threads: Collection[str], peers: Mapping[str, Collection[int]]) -> NativeBatch:
-        wanted = sorted({value for item in threads if (value := native_id(item)) is not None})[:MAX_IDS]
+        wanted = list(dict.fromkeys(value for item in threads if (value := native_id(item)) is not None))[:MAX_IDS]
         if not wanted:
             return NativeBatch()
         started = self.clock()
@@ -170,9 +171,10 @@ class ReadBatchClient:
             if self.clock() >= deadline:
                 return NativeBatch(reason="deadline")
             client = BoundedConnection(home, deadline, self.clock)
+            not_held = tuple(thread for thread in wanted if client.peer_pid not in peers.get(thread, ()))
             wanted = [thread for thread in wanted if client.peer_pid in peers.get(thread, ())]
             if not wanted:
-                raise NativeFailure("peer_not_holder")
+                return NativeBatch(reason="peer_not_holder", not_held=not_held)
             client.initialize(cli, deadline, experimental=False)
             version = client.server_version
             records: dict[str, ThreadMetadata] = {}
@@ -187,7 +189,7 @@ class ReadBatchClient:
                 else:
                     records[thread] = ThreadMetadata("unknown")
             client.unchanged()
-            return NativeBatch(records, "ok", version)
+            return NativeBatch(records, "ok", version, not_held)
         except NativeFailure as error:
             return NativeBatch(reason=error.reason, server_version=client.server_version if client else version)
         except _Timeout:

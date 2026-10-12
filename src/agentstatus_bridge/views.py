@@ -141,6 +141,18 @@ class _TargetHint:
 _NO_HINT = _TargetHint()
 
 
+def _withdrawal_document(store: Store, task: Task) -> dict[str, Any]:
+    readable = store.withdrawals_readable
+    return {"version": 1, "readable": readable,
+            "reason": None if readable else "withdraw_store_unreadable",
+            "operations": store.withdrawals(task.id) if readable else []}
+
+
+def _withdrawn(attempt: Attempt | None, operations: list[dict[str, Any]]) -> bool:
+    return attempt is not None and attempt.delivery is Delivery.QUEUED and any(
+        item["attemptSeq"] == attempt.seq and item["state"] == "deleted" for item in operations)
+
+
 def _task_document(
     store: Store,
     task: Task,
@@ -151,6 +163,9 @@ def _task_document(
 ) -> dict[str, object]:
     attempts = store.attempts(task.id)
     view = describe(task, attempts)
+    withdrawals = _withdrawal_document(store, task)
+    if _withdrawn(view.current, withdrawals["operations"]):
+        hint = _NO_HINT
     document: dict[str, object] = {
         "id": task.id,
         "title": task.title,
@@ -171,7 +186,7 @@ def _task_document(
         "targetTurnEndedAt": hint.stopped_at,
         "targetSessionMissing": hint.missing,
         "attempts": [_attempt_document(item, include_body=include_body) for item in attempts],
-        "nativeWithdrawals": {"version": 1, "operations": store.withdrawals(task.id)},
+        "nativeWithdrawals": withdrawals,
     }
     if events:
         document["events"] = store.events(task.id)
@@ -207,6 +222,9 @@ def _print_task(
 ) -> None:
     attempts = store.attempts(task.id)
     view = describe(task, attempts)
+    withdrawals = _withdrawal_document(store, task)
+    if _withdrawn(view.current, withdrawals["operations"]):
+        hint = _NO_HINT
     cmd = command_name()
     title = f"「{task.title}」" if task.title else ""
     print(f"任务 {short(task.id)} {title} {PHASE_LABELS[view.phase]}：{reason_text(view.reason)}")
@@ -220,6 +238,8 @@ def _print_task(
             if text and text != delivery:
                 delivery = f"{delivery}（{text}）"
         consumption = CONSUMPTION_LABELS[attempt.consumption]
+        if _withdrawn(attempt, withdrawals["operations"]):
+            consumption = "本桥已移除该队列项；不证明未执行，不能停止已开始的工作"
         if consumption:
             delivery = f"{delivery}，{consumption}"
         work = "" if attempt.role is Role.NOTICE else f"；工作：{WORK_LABELS[attempt.work]}"
@@ -256,9 +276,15 @@ def _print_task(
             f"先去确认；{action}；不再需要可 {cmd} close {ref}"
         )
     step = _next_step(task, attempts)
-    for operation in store.withdrawals(task.id):
-        print(f"  原生撤回 #{operation['attempt_seq']}：{operation['state']}（{operation['reason']}），"
-              f"{_clock(operation['finished_at'] or operation['created_at'])}；不证明未执行")
+    if not withdrawals["readable"]:
+        print(f"  原生撤回：{reason_text('withdraw_store_unreadable')}")
+    for operation in withdrawals["operations"]:
+        print(f"  原生撤回 #{operation['attemptSeq']}：{operation['state']}（{operation['reason']}），"
+              f"{_clock(operation['finishedAt'] or operation['createdAt'])}；不证明未执行")
+        if operation["ownerStatus"] == "gone":
+            print("    执行者已不在，下次 withdraw 恢复；当前仅显示，不改账本")
+        elif operation["ownerStatus"] == "namespace_unverified":
+            print("    执行者 PID 命名空间不可核对，不判死、不恢复")
     if step:
         print(f"下一步：{step}")
     events = store.events(task.id, limit=20)

@@ -944,13 +944,14 @@ class CliTests(unittest.TestCase):
             return real_publish(*args, **kwargs)  # type: ignore[arg-type]
 
         cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]
-        cli.ensure_worker.side_effect = [OSError("spawn"), True]  # type: ignore[attr-defined]
+        cli.ensure_worker.side_effect = [True]  # type: ignore[attr-defined]
         try:
             with patch.object(cli.summary, "publish", side_effect=failing_first):
                 self.assertEqual(self.run_cli("tasks")[0], 0)
         finally:
             cli.ensure_worker.side_effect = None  # type: ignore[attr-defined]
-        self.assertEqual(cli.ensure_worker.call_count, 2)  # type: ignore[attr-defined]
+        # §73：入口刷新 revive=False，异常也不拉起；末尾补拉仍必须发生。
+        self.assertEqual(cli.ensure_worker.call_count, 1)  # type: ignore[attr-defined]
         self.mark_sent(task_id)
         self.caller = as_agent(IMPL)
         cli.ensure_worker.reset_mock()  # type: ignore[attr-defined]

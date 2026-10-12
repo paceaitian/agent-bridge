@@ -277,8 +277,9 @@ class NativeTests(unittest.TestCase):
             partial = endpoints._classify_codex_threads(replace(sources, codex_sqlite_home=self.root / "missing"),
                                                         {THREAD, ITEM.lower()}, processes)
             self.assertTrue(partial.unavailable)  # native部分成功不能洗掉SQL不可用
-        self.assertEqual(result.kinds, {THREAD: "subagent", ITEM.lower(): "root"})
-        self.assertEqual(sources.native_report["sqlFallback"], 1)
+        self.assertEqual(result.kinds, {THREAD: "root", ITEM.lower(): "root"})
+        self.assertEqual(sources.native_report["state"], "no_candidates")
+        self.assertEqual((sources.native_report["sqlAnswered"], sources.native_report["sqlFallback"]), (2, 0))
         with patch.object(procfs, "read_process", return_value=None):
             lost = endpoints._classify_codex_threads(sources, {THREAD}, processes)
         self.assertEqual(lost.kinds[THREAD], "root")  # 丢失持有的native子代理证据未被复用
@@ -292,7 +293,197 @@ class NativeTests(unittest.TestCase):
             result = endpoints._classify_codex_threads(sources, {THREAD}, endpoints.scan_codex_holdings(proc.root, home))
         self.assertEqual(result.kinds, {THREAD: "subagent"})
         self.assertIsNone(endpoints._codex_title_root(THREAD, {THREAD}, result))
-        self.assertEqual(sources.native_report["sqlState"], "not_queried")
+        self.assertEqual(sources.native_report["sqlState"], "unavailable")  # §73 先查SQL，失败不能被native洗掉
+
+    def test_sql_complete_does_not_initialize_native(self):
+        home = self.root / "codex"
+        home.mkdir()
+        parent = ITEM.lower()
+        with sqlite3.connect(home / "state_1.sqlite") as db:
+            db.execute("CREATE TABLE threads(id TEXT, source TEXT)")
+            db.executemany("INSERT INTO threads VALUES (?, ?)", ((parent, "cli"),
+                (THREAD, json.dumps({"subagent": {"thread_spawn": {"parent_thread_id": parent}}}))))
+        proc = FakeProc(self.root / "proc")
+        proc.add(20, comm="codex", argv=("codex", "app-server"), fds=tuple(
+            str(home / "thread-writer-locks" / f"{thread}.lock") for thread in (THREAD, parent)))
+        sources = endpoints.DiscoverySources(proc_root=proc.root, codex_home=home)
+        with patch.object(sources.native_metadata.reader, "read") as read:
+            classes = endpoints._classify_codex_threads(sources, {THREAD, parent}, endpoints.scan_codex_holdings(proc.root, home))
+        read.assert_not_called()
+        self.assertEqual(classes.kinds, {THREAD: "subagent", parent: "root"})
+        self.assertEqual(endpoints._codex_title_root(THREAD, {THREAD, parent}, classes), parent)
+        self.assertEqual(sources.native_report["sqlState"], "available")
+
+    def test_missing_row_and_review_parent_are_supplemented_and_holdings_memoized(self):
+        home = self.root / "codex"
+        home.mkdir()
+        child = "019affff-0000-7000-8000-000000000001"
+        parent = ITEM.lower()
+        with sqlite3.connect(home / "state_1.sqlite") as db:
+            db.execute("CREATE TABLE threads(id TEXT, source TEXT)")
+            db.executemany("INSERT INTO threads VALUES (?, ?)", ((parent, "cli"), (THREAD, '{"subagent":"review"}')))
+        proc = FakeProc(self.root / "proc")
+        ids = {THREAD, child, parent}
+        proc.add(20, comm="codex", argv=("codex", "app-server"), fds=tuple(
+            str(home / "thread-writer-locks" / f"{thread}.lock") for thread in ids))
+        sources = endpoints.DiscoverySources(proc_root=proc.root, codex_home=home)
+        processes = endpoints.scan_codex_holdings(proc.root, home)
+        batch = NativeBatch({THREAD: ThreadMetadata("subagent", parent), child: ThreadMetadata("subagent", parent)}, "ok")
+        with patch.object(sources.native_metadata.reader, "read", return_value=batch) as read, \
+                patch.object(endpoints, "codex_holdings", wraps=endpoints.codex_holdings) as holdings:
+            classes = endpoints._classify_codex_threads(sources, ids, processes, {THREAD})
+        self.assertEqual(read.call_args.args[1], [THREAD, child])
+        self.assertEqual(holdings.call_count, 1, "网络后每pid一次，而不是每记录一次")
+        for thread in (THREAD, child):
+            self.assertEqual(endpoints._codex_title_root(thread, ids, classes), parent)
+
+    def test_internal_and_memory_sources_never_initialize(self):
+        home = self.root / "codex"
+        home.mkdir()
+        variants = [{"internal": "guardian"}, {"internal": "memory_consolidation"},
+                    {"subagent": "memory_consolidation"}]
+        ids = [f"019a0000-0000-7000-8000-{i:012x}" for i in range(1, 4)]
+        with sqlite3.connect(home / "state_1.sqlite") as db:
+            db.execute("CREATE TABLE threads(id TEXT, source TEXT)")
+            db.executemany("INSERT INTO threads VALUES (?, ?)", [(key, json.dumps(source)) for key, source in zip(ids, variants)])
+        proc = FakeProc(self.root / "proc")
+        proc.add(20, comm="codex", argv=("codex", "app-server"), fds=tuple(
+            str(home / "thread-writer-locks" / f"{key}.lock") for key in ids))
+        for _ in range(2):  # 两条独立命令不能每次重连
+            sources = endpoints.DiscoverySources(proc_root=proc.root, codex_home=home)
+            with patch.object(sources.native_metadata.reader, "read") as read:
+                classes = endpoints._classify_codex_threads(sources, set(ids), endpoints.scan_codex_holdings(proc.root, home))
+            read.assert_not_called()
+            self.assertEqual(classes.kinds, {key: "subagent" for key in ids})
+            self.assertEqual(classes.parents, {})
+            self.assertEqual(classes.parent_not_needed, frozenset(ids))
+            self.assertEqual(sources.native_report["sqlAnswered"], 3)
+            self.assertEqual(sources.native_report["sqlFallback"], 0)
+
+    def test_unknown_internal_variant_remains_a_native_candidate(self):
+        """§73.7：只有 0.162.1 已知的两个 Internal 变体免补查；将来的新变体（含带字段、不可哈希的形态）照常交给 native、不抛异常。"""
+        variants = ['{"internal":"future_variant"}', json.dumps({"internal": {"guardian": {"parent_thread_id": ITEM.lower()}}}),
+                    '{"internal":["guardian"]}']
+        for index, source in enumerate(variants):
+            with self.subTest(source=source):
+                home = self.root / f"codex-{index}"
+                home.mkdir()
+                with sqlite3.connect(home / "state_1.sqlite") as db:
+                    db.execute("CREATE TABLE threads(id TEXT, source TEXT)")
+                    db.execute("INSERT INTO threads VALUES (?, ?)", (THREAD, source))
+                proc = FakeProc(self.root / f"proc-{index}")
+                proc.add(20, comm="codex", argv=("codex", "app-server"), fds=(str(home / "thread-writer-locks" / f"{THREAD}.lock"),))
+                sources = endpoints.DiscoverySources(proc_root=proc.root, codex_home=home)
+                with patch.object(sources.native_metadata.reader, "read", return_value=NativeBatch(reason="deadline")) as read:
+                    try:
+                        classes = endpoints._classify_codex_threads(sources, {THREAD}, endpoints.scan_codex_holdings(proc.root, home))
+                    except TypeError as error:  # 复审 P2-1：曾让整个 discover 崩溃
+                        self.fail(f"带字段的 internal 变体不能让分类抛异常：{error}")
+                read.assert_called_once()
+                self.assertEqual(read.call_args.args[1], [THREAD])
+                self.assertNotIn(THREAD, classes.parent_not_needed)
+
+    def test_compact_parent_and_missing_child_remain_native_candidates(self):
+        home = self.root / "codex"
+        home.mkdir()
+        parent = ITEM.lower()
+        with sqlite3.connect(home / "state_1.sqlite") as db:
+            db.execute("CREATE TABLE threads(id TEXT, source TEXT)")
+            db.executemany("INSERT INTO threads VALUES (?, ?)", [(parent, "cli"), (THREAD, '{"subagent":"compact"}')])
+        proc = FakeProc(self.root / "proc")
+        proc.add(20, comm="codex", argv=("codex", "app-server"), fds=(str(home / "thread-writer-locks" / f"{THREAD}.lock"),))
+        sources = endpoints.DiscoverySources(proc_root=proc.root, codex_home=home)
+        with patch.object(sources.native_metadata.reader, "read", return_value=NativeBatch({THREAD: ThreadMetadata("subagent", parent)}, "ok")) as read:
+            classes = endpoints._classify_codex_threads(sources, {THREAD, parent}, endpoints.scan_codex_holdings(proc.root, home))
+        read.assert_called_once()
+        self.assertEqual(read.call_args.args[1], [THREAD])
+        self.assertEqual(classes.parents[THREAD], parent)
+        self.assertEqual(sources.native_report["sqlAnswered"], 1)
+        self.assertEqual(sources.native_report["sqlFallback"], 0)
+
+    def test_sql_fallback_counts_only_selected_or_cached_unconfirmed_ids(self):
+        home = self.root / "codex"
+        proc = FakeProc(self.root / "proc")
+        ids = {f"019a0000-0000-7000-8000-{i:012x}" for i in range(40)}
+        proc.add(20, comm="codex", argv=("codex", "app-server"), fds=tuple(
+            str(home / "thread-writer-locks" / f"{key}.lock") for key in ids))
+        clock = [0.0]
+        cache = MetadataCache(clock=lambda: clock[0], single_batch=True)
+        sources = endpoints.DiscoverySources(proc_root=proc.root, codex_home=home, native_metadata=cache)
+        selected = sorted(ids, reverse=True)[:32]
+        batch = NativeBatch({key: ThreadMetadata("unknown") for key in selected}, "ok")
+        with patch.object(cache.reader, "read", return_value=batch) as read:
+            processes = endpoints.scan_codex_holdings(proc.root, home)
+            for expected_calls in (1, 1):
+                endpoints._classify_codex_threads(sources, ids, processes)
+                self.assertEqual(read.call_count, expected_calls)
+                self.assertEqual(sources.native_report["sqlAnswered"], 0)
+                self.assertEqual(sources.native_report["sqlFallback"], 32, "未查的8项不算回退")
+            clock[0] = 6.0
+            endpoints._classify_codex_threads(sources, ids, processes)
+            self.assertEqual(sources.native_report["sqlFallback"], 0, "过期缓存/命令批次耗尽不是本轮native尝试")
+            endpoints._classify_codex_threads(sources, ids, {})
+            self.assertEqual(sources.native_report["sqlFallback"], 0)
+
+    def test_attempted_resets_when_no_holders_follow_an_attempt(self):
+        """§73.7（复审 D4）：无 holder 的提前返回也清掉上一轮尝试集，sqlFallback 不沿用旧轮。"""
+        key = "019a0000-0000-7000-8000-000000000001"
+        cache = MetadataCache(clock=lambda: 0.0)
+        with patch.object(cache.reader, "read", return_value=NativeBatch(reason="deadline")):
+            cache.read(self.root, {key: ((1, "1"),)})
+        self.assertEqual(cache.attempted, frozenset({key}))
+        cache.read(self.root, {})
+        self.assertEqual(cache.attempted, frozenset())
+
+    def test_cli_priority_and_reader_preserves_selected_order(self):
+        ids = [f"019a0000-0000-7000-8000-{i:012x}" for i in range(40)]
+        selected = [ids[0], ids[1], *reversed(ids[2:])][:32]
+        reader = ReadBatchClient(lambda _: "0.162.1")
+        with patch.object(reader, "read", return_value=NativeBatch(reason="deadline")) as read:
+            cache = MetadataCache(reader, single_batch=True)
+            cache.read(self.root, {key: ((1, "1"),) for key in ids}, preferred=[ids[0]], absent=[ids[1]])
+        self.assertEqual(read.call_args.args[1], selected)
+        daemon = self.daemon()
+        result = self.read(daemon, ids=selected + ids)
+        self.assertEqual(result.reason, "ok")
+        self.assertEqual([m["params"]["threadId"] for m in daemon.received if m.get("method") == "thread/read"], selected)
+
+    def test_peer_not_holder_preserves_positive_cache_and_negative_expires(self):
+        reader = ReadBatchClient(lambda _: "0.162.1")
+        now = [0.0]
+        cache = MetadataCache(reader, clock=lambda: now[0])
+        first, second = THREAD, ITEM.lower()
+        with patch.object(reader, "read", side_effect=[
+            NativeBatch({first: ThreadMetadata("root")}, "ok"),
+            NativeBatch(reason="peer_not_holder", not_held=(second,)),
+            NativeBatch({second: ThreadMetadata("root")}, "ok"),
+        ]) as read:
+            cache.read(self.root, {first: ((1, "1"),)})
+            holders = {first: ((1, "1"),), second: ((2, "1"),)}
+            result = cache.read(self.root, holders)
+            self.assertEqual(result.records, {first: ThreadMetadata("root")})
+            cache.read(self.root, holders)
+            self.assertEqual(read.call_count, 2)
+            now[0] = 6.1
+            cache.read(self.root, holders)
+            self.assertEqual(read.call_count, 3)
+
+    def test_reader_reports_non_peer_ids_in_mixed_batch(self):
+        daemon = self.daemon()
+        result = self.read(daemon, ids=[THREAD, ITEM.lower()], peers={THREAD: {os.getpid()}, ITEM.lower(): {-1}})
+        self.assertEqual(result.not_held, (ITEM.lower(),))
+        self.assertEqual(result.records, {THREAD: ThreadMetadata("root")})
+        self.assertEqual(daemon.methods(), ["initialize", "initialized", "thread/read"])
+
+    def test_real_batch_failure_invalidates_cached_positive_evidence(self):
+        reader = ReadBatchClient(lambda _: "0.162.1")
+        cache = MetadataCache(reader)
+        with patch.object(reader, "read", side_effect=[NativeBatch({THREAD: ThreadMetadata("root")}, "ok"),
+                                                      NativeBatch(reason="server_request_seen")]):
+            cache.read(self.root, {THREAD: ((1, "1"),)})
+            result = cache.read(self.root, {THREAD: ((1, "1"),), ITEM.lower(): ((1, "1"),)})
+        self.assertEqual(result.records, {})
+        self.assertEqual(result.reason, "server_request_seen")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ class LocalFailure:
 
 
 class LocalPlatform(Protocol):
+    supported: bool
     def control_socket_path(self, home: Path) -> Path: ...
     def resolve(self, link: Path) -> Path | LocalFailure: ...
     def new_stream(self) -> ByteStream: ...
@@ -37,6 +38,7 @@ class LocalPlatform(Protocol):
 
 
 class UnsupportedPlatform:
+    supported = False
     def control_socket_path(self, home: Path) -> Path:
         return home / "app-server-control" / "app-server-control.sock"
 
@@ -57,6 +59,7 @@ class UnsupportedPlatform:
 
 
 class LinuxPlatform(UnsupportedPlatform):
+    supported = True
     def resolve(self, link: Path) -> Path | LocalFailure:
         if not os.path.lexists(link):
             return LocalFailure("socket_missing")

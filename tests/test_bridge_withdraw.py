@@ -6,6 +6,9 @@ import json
 import contextlib
 import io
 import os
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
@@ -19,7 +22,7 @@ from agentstatus_bridge.transports import codex_withdraw, local_codex
 from agentstatus_bridge.transports.codex_withdraw import DeleteResult, QueueDeleteClient
 from agentstatus_bridge import cli, procfs, views
 from agentstatus_bridge.endpoints import Caller
-from agentstatus_bridge.model import Delivery, Role, Work, Provider
+from agentstatus_bridge.model import Consumption, Delivery, Role, Work, Provider
 from agentstatus_bridge.store import Store, StoreError
 from agentstatus_bridge.dispatch import Dispatcher
 from agentstatus_bridge.transports import DeliveryOutcome
@@ -40,7 +43,7 @@ class DeleteProtocolTests(unittest.TestCase):
         stamp = local_codex.platform().root_identity(daemon.home)
         result = QueueDeleteClient(lambda _: "0.162.1").delete(
             daemon.home, thread=THREAD, item=ITEM.lower(), root_identity=stamp,
-            before_send=hook or (lambda: self.boundaries.append("sending")),
+            before_send=hook or (lambda budget: self.boundaries.append("sending")),
         )
         return result, daemon
 
@@ -59,7 +62,7 @@ class DeleteProtocolTests(unittest.TestCase):
                 daemon = NativeDaemon(Path(tmp), replies=lambda _, value=value: {"result": {"deleted": value}})
                 try:
                     result = QueueDeleteClient(lambda _: "0.162.1").delete(daemon.home, thread=THREAD, item=ITEM.lower(),
-                        root_identity=local_codex.platform().root_identity(daemon.home), before_send=lambda: None)
+                        root_identity=local_codex.platform().root_identity(daemon.home), before_send=lambda budget: None)
                     self.assertEqual(result.state, state)
                 finally:
                     daemon.close()
@@ -100,7 +103,7 @@ class DeleteProtocolTests(unittest.TestCase):
         self.assertEqual(len(daemon.received), 3)
 
     def test_callback_failure_does_not_send(self):
-        def failing():
+        def failing(budget):
             raise RuntimeError(CANARY)
         result, daemon = self.run_delete({"result": {"deleted": True}}, hook=failing)
         daemon.thread.join(1)
@@ -111,13 +114,74 @@ class DeleteProtocolTests(unittest.TestCase):
     def test_wrong_root_is_rejected_without_connecting(self):
         self.assertEqual(QueueDeleteClient(lambda _: "0.162.1").delete(
             self.root, thread=THREAD, item=ITEM.lower(), root_identity="different",
-            before_send=lambda: self.fail("boundary called")), DeleteResult("not_attempted", "root_mismatch"))
+            before_send=lambda budget: self.fail("boundary called")), DeleteResult("not_attempted", "root_mismatch"))
 
     def test_production_guard_escapes_delete(self):
         target = Path(f"/tmp/codex-daemon-{os.getuid()}/agentstatus-guard-probe-does-not-exist")
         with patch.object(local_codex.LinuxPlatform, "resolve", return_value=target), self.assertRaises(ProductionSocketUse):
             QueueDeleteClient(lambda _: "0.162.1").delete(self.root, thread=THREAD, item=ITEM.lower(),
-                root_identity=local_codex.platform().root_identity(self.root), before_send=lambda: self.fail("boundary"))
+                root_identity=local_codex.platform().root_identity(self.root), before_send=lambda budget: self.fail("boundary"))
+
+    def test_boundary_budget_and_store_failures_never_become_unknown(self):
+        for failure, reason in ((StoreError("store_busy"), "boundary_store_busy"),
+                                (StoreError("store_write_failed"), "boundary_record_failed")):
+            with self.subTest(reason=reason), TemporaryDirectory() as tmp:
+                daemon = NativeDaemon(Path(tmp))
+                try:
+                    def boundary(budget):
+                        self.assertGreater(budget, 0)
+                        self.assertLessEqual(budget, 10)
+                        raise failure
+                    result = QueueDeleteClient(lambda _: "0.162.1").delete(daemon.home,
+                        thread=THREAD, item=ITEM.lower(), root_identity=local_codex.platform().root_identity(daemon.home),
+                        before_send=boundary)
+                    daemon.thread.join(1)
+                    self.assertEqual((result.state, result.reason), ("not_attempted", reason))
+                    self.assertEqual(daemon.methods(), ["initialize", "initialized"])
+                finally:
+                    daemon.close()
+
+    def test_deadline_checked_both_sides_of_boundary(self):
+        for expire_before in (False, True):
+            with self.subTest(expire_before=expire_before), TemporaryDirectory() as tmp:
+                daemon = NativeDaemon(Path(tmp))
+                now, calls = [0.0], []
+                original_encode = codex_withdraw.BoundedConnection._encode
+                def encode(client, value):
+                    if expire_before and value.get("method") == "thread/queue/delete":
+                        now[0] = 11.0
+                    return original_encode(client, value)
+                def boundary(budget):
+                    calls.append(budget)
+                    now[0] = 11.0
+                try:
+                    with patch.object(codex_withdraw.BoundedConnection, "_encode", encode):
+                        result = QueueDeleteClient(lambda _: "0.162.1", clock=lambda: now[0]).delete(
+                            daemon.home, thread=THREAD, item=ITEM.lower(),
+                            root_identity=local_codex.platform().root_identity(daemon.home), before_send=boundary)
+                    daemon.thread.join(1)
+                    self.assertEqual((result.state, result.reason), ("not_attempted", "deadline"))
+                    self.assertEqual(len(calls), 0 if expire_before else 1)
+                    self.assertEqual(daemon.methods(), ["initialize", "initialized"])
+                finally:
+                    daemon.close()
+
+    def test_deadline_before_actual_sendall_is_still_not_attempted(self):
+        now = [0.0]
+        daemon = NativeDaemon(self.root)
+        self.addCleanup(daemon.close)
+        send_frame = codex_withdraw.BoundedConnection._send_frame
+        def expire(client, opcode, payload, deadline):
+            if b'thread/queue/delete' in payload:
+                now[0] = 11.0
+            return send_frame(client, opcode, payload, deadline)
+        with patch.object(codex_withdraw.BoundedConnection, "_send_frame", expire):
+            result = QueueDeleteClient(lambda _: "0.162.1", clock=lambda: now[0]).delete(
+                daemon.home, thread=THREAD, item=ITEM.lower(), root_identity=local_codex.platform().root_identity(daemon.home),
+                before_send=lambda budget: None)
+        daemon.thread.join(1)
+        self.assertEqual((result.state, result.reason), ("not_attempted", "deadline"))
+        self.assertEqual(daemon.methods(), ["initialize", "initialized"])
 
 
 class WithdrawalLedgerTests(LedgerCase):
@@ -290,10 +354,12 @@ class WithdrawalLedgerTests(LedgerCase):
         return code, output.getvalue(), refresh
 
     def test_command_permissions_are_checked_before_any_delete(self):
-        for caller in (Caller(endpoint(ref(native=THREAD)), self.info), Caller(None, None, agent_env=True, rejection="subagent")):
-            code, _, _ = self.run_cli(["withdraw", self.task.id, "--attempt", "1"], caller=caller,
+        for caller, reason in ((Caller(endpoint(ref(native=THREAD)), self.info), "withdraw_not_allowed"),
+                               (Caller(None, None, agent_env=True, rejection="subagent"), "sender_is_subagent")):
+            code, output, _ = self.run_cli(["withdraw", self.task.id, "--attempt", "1", "--json"], caller=caller,
                                       delete=lambda *a, **kw: self.fail("unauthorized delete"))
             self.assertEqual(code, 3)
+            self.assertEqual(json.loads(output[output.index("{"):])["code"], reason)
         self.assertEqual(self.store.withdrawals(self.task.id), [])
 
     def test_command_persists_boundary_no_long_transaction_and_does_not_wake_worker(self):
@@ -302,7 +368,7 @@ class WithdrawalLedgerTests(LedgerCase):
             self.assertEqual((kwargs["thread"], kwargs["item"]), (THREAD, ITEM.lower()))
             with Store.open(self.root) as other:
                 self.assertEqual(other.withdrawals(self.task.id)[0]["state"], "prepared")
-            kwargs["before_send"]()
+            kwargs["before_send"](1.0)
             with Store.open(self.root) as other:
                 self.assertEqual(other.withdrawals(self.task.id)[0]["state"], "sending")
                 other.update_task(self.task.id, now=117, event="synthetic", control="paused")
@@ -333,6 +399,364 @@ class WithdrawalLedgerTests(LedgerCase):
                     delete=lambda *a, **kw: self.fail("implicit native delete"))
                 self.assertIn(code, (0, 3))
         self.assertEqual(self.store.withdrawals(self.task.id), [])
+
+    def test_first_open_interleaving_reads_version_in_write_transaction(self):
+        # 同时首次安装附表；断言读版本也在锁内，不只靠 OR IGNORE 掩盖读后写。
+        barrier = threading.Barrier(2)
+        initial_reads = threading.Barrier(2)
+        transactional_reads = []
+        class Connection(sqlite3.Connection):
+            def execute(connection, sql, *args):
+                if sql.startswith("SELECT value FROM meta WHERE key='native_withdrawals_version'"):
+                    if not connection.execute("SELECT name FROM sqlite_master WHERE name='native_withdrawals'").fetchone():
+                        transactional_reads.append(connection.in_transaction)
+                    if not connection.in_transaction and not getattr(connection, "read_initial_version", False):
+                        connection.read_initial_version = True
+                        value = super().execute(sql, *args).fetchone()
+                        initial_reads.wait(3)  # 两方均先看到无版本，再开始竞争写事务
+                        return type("Fetched", (), {"fetchone": lambda _: value})()
+                return super().execute(sql, *args)
+        class ConcurrentStore(Store):
+            def _ensure_withdrawals(store):
+                barrier.wait(3)
+                super()._ensure_withdrawals()
+        root = self.root.parent / "race"
+        # 只准备旧主 schema，两个 opener 才会真正同时首次安装附表。
+        root.mkdir(mode=0o700)
+        with sqlite3.connect(root / "bridge.sqlite3", isolation_level=None) as connection:
+            old = Store(connection)
+            old._configure()
+            old._migrate()
+        connect = sqlite3.connect
+        def open_one():
+            try:
+                with ConcurrentStore.open(root) as store:
+                    return store.withdrawals_readable
+            except StoreError as error:
+                return error.code  # 两方都成功是被测判据，安装异常应以断言FAIL呈现
+        with patch("agentstatus_bridge.store.sqlite3.connect", side_effect=lambda *a, **kw: connect(*a, **kw, factory=Connection)):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                self.assertEqual(list(pool.map(lambda _: open_one(), range(2))), [True, True])
+        self.assertTrue(transactional_reads)
+        self.assertIn(True, transactional_reads, "需要安装附表时，必须在写事务中重读版本")
+
+    def test_unknown_table_version_only_disables_withdrawals(self):
+        with self.store.transaction() as conn:
+            conn.execute("UPDATE meta SET value='2' WHERE key='native_withdrawals_version'")
+        try:
+            opened = Store.open(self.root)
+        except StoreError as error:
+            self.fail(f"附表不可读阻断了主账本：{error.code}")
+        with opened as other:
+            self.assertFalse(other.withdrawals_readable)
+            doc = views._task_document(other, self.task)["nativeWithdrawals"]
+            self.assertEqual(doc, {"version": 1, "readable": False, "reason": "withdraw_store_unreadable", "operations": []})
+            other.update_task(self.task.id, now=200, event="test", control="paused")
+            self.assertEqual(other.get_task(self.task.id).control, "paused")
+            with self.assertRaisesRegex(StoreError, "withdraw_store_unreadable"):
+                other.prepare_withdrawal(self.task.id, 1, root_identity=self.stamp, now=210, pid=1, start="1")
+            other.prune(now=220)
+        code, output, _ = self.run_cli(["withdraw", self.task.id, "--attempt", "1", "--json"])
+        self.assertEqual(code, 8)
+        self.assertIn("withdraw_store_unreadable", output)
+
+    def test_cold_open_wal_busy_is_bounded_and_both_stores_succeed(self):
+        root = self.root.parent / "cold"
+        connect = sqlite3.connect
+        busy = sqlite3.OperationalError("synthetic busy")
+        busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        wal_calls = []
+        class ColdConnection(sqlite3.Connection):
+            def execute(connection, sql, *args):
+                if sql == "PRAGMA journal_mode=WAL":
+                    wal_calls.append(sql)
+                    if len(wal_calls) == 1:
+                        # A配置时B抢先完整首开空账本；A遇到的是WAL切换的瞬时BUSY。
+                        with patch("agentstatus_bridge.store.sqlite3.connect", connect):
+                            with Store.open(root) as other:
+                                if not other.withdrawals_readable:
+                                    raise AssertionError("second opener failed")
+                        raise busy
+                return super().execute(sql, *args)
+        with patch("agentstatus_bridge.store.sqlite3.connect", side_effect=lambda *a, **kw: connect(*a, **kw, factory=ColdConnection)):
+            try:
+                opened = Store.open(root)
+            except StoreError as error:
+                self.fail(f"first opener failed: {error.code}")
+            with opened:
+                self.assertTrue(opened.withdrawals_readable)
+        self.assertEqual(len(wal_calls), 2)
+        with patch.object(Store, "_configure", Store._configure):
+            class AlwaysBusy:
+                def execute(self, *args):
+                    raise busy
+            with patch("agentstatus_bridge.store.time.monotonic", side_effect=[0.0, 6.0]):
+                with self.assertRaisesRegex(StoreError, "store_busy"):
+                    Store._configure(type("BoundedFixture", (), {"_conn": AlwaysBusy()})())
+
+    def test_owner_liveness_read_only_and_namespace_guard(self):
+        operation, _ = self.prepare()
+        revision = self.store.ledger_revision()
+        with patch.object(procfs, "read_process", return_value=None):
+            rows = self.store.withdrawals(self.task.id)
+            self.assertEqual(rows[0]["ownerStatus"], "gone")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                views._print_task(self.store, self.task, now=150, show_body=False)
+            self.assertIn("执行者已不在，下次 withdraw 恢复", output.getvalue())
+            self.assertEqual(self.store.ledger_revision(), revision)
+            self.assertEqual(rows[0]["state"], "prepared")
+            with patch.object(cli, "_observations", return_value=([], cli.ObserverView())):
+                code, compact, _ = self.run_cli(["tasks"])
+            self.assertEqual(code, 0)
+            self.assertIn("执行者已不在，下次 withdraw 恢复", compact)
+            self.assertEqual(self.store.ledger_revision(), revision)
+            with patch.object(procfs, "pid_namespace", return_value="pid:[different]"):
+                self.store.recover_withdrawals(now=151)
+                self.assertEqual(self.store.withdrawals(self.task.id)[0]["ownerStatus"], "namespace_unverified")
+                self.assertEqual(self.store.withdrawals(self.task.id)[0]["state"], "prepared")
+        with self.store.transaction() as conn:
+            conn.execute("UPDATE native_withdrawals SET owner_pid_namespace=NULL WHERE id=?", (operation["id"],))
+        with patch.object(procfs, "read_process", return_value=None):
+            self.store.recover_withdrawals(now=152)
+        self.assertEqual(self.store.withdrawals(self.task.id)[0]["state"], "not_attempted")
+
+    def test_finish_conflict_returns_actual_result_without_overwriting_unknown(self):
+        def delete(home, **kwargs):
+            kwargs["before_send"](1.0)
+            with Store.open(self.root) as other, patch.object(procfs, "read_process", return_value=None):
+                other.recover_withdrawals(now=130)
+            return DeleteResult("deleted", "deleted", "0.162.1")
+        code, output, _ = self.run_cli(["withdraw", self.task.id, "--attempt", "1", "--json"], delete=delete)
+        self.assertEqual(code, 8)
+        doc = json.loads(output)
+        self.assertEqual(doc["code"], "withdraw_record_conflict")
+        self.assertIn("actualResult", doc)
+        self.assertEqual(doc["actualResult"], {"state": "deleted", "reason": "deleted", "serverVersion": "0.162.1"})
+        self.assertEqual(doc["operation"]["state"], "unknown")
+        self.assertEqual(self.store.withdrawals(self.task.id)[0]["state"], "unknown")
+        code, output, _ = self.run_cli(["withdraw", self.task.id, "--attempt", "1", "--again"], delete=delete)
+        self.assertEqual(code, 8)
+        self.assertIn("本次实际结果 deleted", output)
+        self.assertIn("账本未覆盖", output)
+
+    def test_summary_failure_respects_withdraw_revive_false(self):
+        output = io.StringIO()
+        with (patch.dict(os.environ, {"AB_STATE_DIR": str(self.root), "CODEX_HOME": str(self.home), "CODEX_SQLITE_HOME": str(self.home)}),
+              patch.object(cli, "discover", return_value=[]), patch.object(cli, "identify_caller", return_value=Caller(None, None)),
+              patch.object(cli.summary, "publish", side_effect=RuntimeError("synthetic")),
+              patch.object(cli, "_start_worker") as start,
+              patch.object(QueueDeleteClient, "delete", return_value=DeleteResult("not_attempted", "boundary_store_busy")),
+              contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+            self.assertEqual(cli.main(["withdraw", self.task.id, "--attempt", "1"]), 8)
+            start.assert_not_called()
+
+    def test_root_reasons_and_public_keys(self):
+        with self.assertRaisesRegex(StoreError, "^withdraw_root_missing$"):
+            self.store.prepare_withdrawal(self.task.id, 1, root_identity="", now=110, pid=1, start="1")
+        with self.store.transaction() as conn:
+            conn.execute("UPDATE attempts SET options='{}' WHERE id=?", (self.attempt.id,))
+            with self.assertRaisesRegex(StoreError, "^withdraw_root_missing$"):
+                self.store.prepare_withdrawal(self.task.id, 1, root_identity=self.stamp, now=110, pid=1, start="1")
+            conn.execute("UPDATE attempts SET options=? WHERE id=?", (json.dumps({"codexDataRoot": self.stamp}), self.attempt.id))
+        with self.assertRaisesRegex(StoreError, "withdraw_root_mismatch"):
+            self.store.prepare_withdrawal(self.task.id, 1, root_identity="0" * 64, now=110, pid=1, start="1")
+        for code in ("withdraw_root_missing", "withdraw_root_mismatch", "withdraw_platform_unsupported"):
+            self.assertEqual(cli._exit_for_store_error(code), 6)
+            self.assertNotEqual(cli.reason_text(code), code)
+        self.assertNotEqual(cli.reason_text("withdraw_invalid_result"), "withdraw_invalid_result")
+        with patch.object(local_codex, "platform", return_value=local_codex.UnsupportedPlatform()):
+            code, output, _ = self.run_cli(["withdraw", self.task.id, "--attempt", "1", "--json"])
+            self.assertEqual(code, 6)
+            self.assertIn("withdraw_platform_unsupported", output)
+        operation, _ = self.prepare()
+        self.finish(operation)
+        keys = set(self.store.withdrawals(self.task.id)[0])
+        self.assertEqual(keys, {"id", "attemptSeq", "state", "reason", "serverVersion", "createdAt", "sendingAt", "finishedAt", "ownerStatus"})
+
+    def test_deleted_item_does_not_suggest_forgotten_report_or_retry(self):
+        operation, _ = self.prepare()
+        self.finish(operation)
+        with self.store.transaction() as conn:
+            conn.execute("UPDATE attempts SET consumption=? WHERE id=?", (Consumption.LEFT_QUEUE.value, self.attempt.id))
+        hint = views._TargetHint(stopped_at=130, missing=True)
+        doc = views._task_document(self.store, self.task, hint=hint)
+        self.assertFalse(doc["targetStoppedWithoutReport"])
+        self.assertFalse(doc["targetSessionMissing"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            views._print_task(self.store, self.task, now=200, show_body=False, hint=hint)
+        self.assertIn("本桥已移除", output.getvalue())
+        self.assertNotIn("可能忘了", output.getvalue())
+        self.assertNotIn("retry", output.getvalue())
+        self.assertEqual(self.current(self.attempt).consumption, Consumption.LEFT_QUEUE)
+        with patch.object(cli, "_observations", return_value=([], cli.ObserverView())), \
+                patch.object(cli, "_target_hint", return_value=hint):
+            code, compact, _ = self.run_cli(["tasks"])
+            self.assertEqual(code, 0)
+            self.assertIn("本桥已移除", compact)
+            self.assertNotIn("对方已停下未汇报", compact)
+            self.assertNotIn("未发现对方会话", compact)
+            next_attempt = self.store.add_attempt(self.task.id, role=Role.HANDOFF, target=ref(native=ITEM.lower()),
+                body="synthetic next", refs=[], now=210, sender=None, sender_class=None)
+            self.store.begin_send(next_attempt.id, now=211, pid=self.info.pid, start_ticks=self.info.start_ticks)
+            self.store.finish_send(next_attempt.id, delivery=Delivery.QUEUED, reason="codex_queued", provider_ref=THREAD,
+                                   detail={}, native_root=self.stamp, now=212)
+            _, next_output, _ = self.run_cli(["tasks"])
+            self.assertIn("未发现对方会话", next_output, "旧attempt撤回不能抑制新attempt提示")
+            next_doc = views._task_document(self.store, self.task, hint=hint)
+            self.assertTrue(next_doc["targetSessionMissing"])
+
+    def test_unknown_withdraw_version_prune_keeps_attached_rows_n22(self):
+        operation, _ = self.prepare()
+        self.finish(operation)
+        self.store.update_task(self.task.id, now=200, event="closed", closed_at=200)
+        before = tuple(self.store._conn.execute("SELECT * FROM native_withdrawals WHERE id=?", (operation["id"],)).fetchone())
+        with self.store.transaction() as conn:
+            conn.execute("UPDATE meta SET value='future-version' WHERE key='native_withdrawals_version'")
+        with Store.open(self.root) as other:
+            self.assertFalse(other.withdrawals_readable)
+            self.assertEqual(other.prune(now=200 + 40 * 86400), 1)
+            remaining = [tuple(row) for row in other._conn.execute("SELECT * FROM native_withdrawals")]
+            self.assertEqual(remaining, [before], "未知版本不能删除已经失去主任务的附表行")
+
+    def test_withdraw_timeout_recovers_both_states_but_not_before_boundary(self):
+        for state in ("prepared", "sending"):
+            for owner in ("alive", "other-namespace", "namespace-unreadable"):
+                with self.subTest(state=state, owner=owner):
+                    operation, created = self.prepare(again=True)
+                    self.assertTrue(created)
+                    if state == "sending":
+                        self.store.begin_withdrawal(operation["id"], now=115, pid=self.info.pid, start=self.info.start_ticks)
+                    context = (contextlib.nullcontext() if owner == "alive" else
+                               patch.object(procfs, "pid_namespace", return_value="pid:[other]" if owner == "other-namespace" else None))
+                    with context:
+                        revision = self.store.ledger_revision()
+                        for now in (110 - 601, 100, 709.999, 710):  # created_at=110；回拨（含超过门槛的回拨）、门槛前、恰门槛均不动
+                            self.store.recover_withdrawals(now=now)
+                            current = next(row for row in self.store.withdrawals(self.task.id) if row["id"] == operation["id"])
+                            self.assertEqual(current["state"], state)
+                            self.assertEqual(self.store.ledger_revision(), revision)
+                        self.store.recover_withdrawals(now=710.001)
+                    current = next(row for row in self.store.withdrawals(self.task.id) if row["id"] == operation["id"])
+                    self.assertEqual(current["state"], "not_attempted" if state == "prepared" else "unknown")
+                    self.assertEqual(current["reason"], "owner_timeout")
+                    with self.assertRaisesRegex(StoreError, "withdraw_record_conflict"):
+                        self.finish(operation)
+                    self.assertEqual(next(row for row in self.store.withdrawals(self.task.id) if row["id"] == operation["id"]), current)
+
+    def test_timeout_late_result_cli_reports_actual_without_overwrite(self):
+        def delete(home, **kwargs):
+            kwargs["before_send"](1.0)
+            with Store.open(self.root) as other, patch.object(procfs, "pid_namespace", return_value="pid:[other]"):
+                created = other.withdrawals(self.task.id)[-1]["createdAt"]
+                other.recover_withdrawals(now=created + 601)
+            return DeleteResult("deleted", "deleted", "0.162.1")
+        code, output, _ = self.run_cli(["withdraw", self.task.id, "--attempt", "1", "--json"], delete=delete)
+        doc = json.loads(output)
+        self.assertEqual(code, 8)
+        self.assertEqual(doc["code"], "withdraw_record_conflict")
+        self.assertEqual(doc["actualResult"]["state"], "deleted")
+        self.assertEqual((doc["operation"]["state"], doc["operation"]["reason"]), ("unknown", "owner_timeout"))
+
+    def test_live_owner_is_not_recovered_m1(self):
+        operation, _ = self.prepare()
+        self.store.recover_withdrawals(now=120)
+        self.assertEqual(self.store.withdrawals(self.task.id)[0]["state"], "prepared")
+        self.store.begin_withdrawal(operation["id"], now=121, pid=self.info.pid, start=self.info.start_ticks)
+        self.store.recover_withdrawals(now=122)
+        self.assertEqual(self.store.withdrawals(self.task.id)[0]["state"], "sending")
+
+    def test_begin_requires_exact_owner_pid_and_start_m13(self):
+        operation, _ = self.prepare()
+        for pid, start in ((self.info.pid + 1, self.info.start_ticks), (self.info.pid, "reused")):
+            with self.subTest(pid=pid, start=start), self.assertRaisesRegex(StoreError, "withdraw_conflict"):
+                self.store.begin_withdrawal(operation["id"], now=121, pid=pid, start=start)
+            self.assertEqual(self.store.withdrawals(self.task.id)[0]["state"], "prepared")
+
+    def test_boundary_limits_sqlite_busy_wait_and_restores_timeout(self):
+        operation, _ = self.prepare()
+        seen = []
+        with Store.open(self.root) as other, other.transaction():
+            self.store._conn.set_trace_callback(seen.append)
+            with self.assertRaisesRegex(StoreError, "store_busy"):
+                self.store.begin_withdrawal(operation["id"], now=120, pid=self.info.pid, start=self.info.start_ticks, budget=0.01)
+            self.store._conn.set_trace_callback(None)
+        self.assertIn("PRAGMA busy_timeout=10", seen)
+        self.assertEqual(self.store._conn.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+
+    def test_deleted_and_absent_are_not_repeated_with_again_m14(self):
+        operation, _ = self.prepare()
+        for state in ("deleted", "absent"):
+            with self.subTest(state=state):
+                with self.store.transaction() as conn:
+                    conn.execute("UPDATE native_withdrawals SET state=? WHERE id=?", (state, operation["id"]))
+                same, created = self.prepare(again=True)
+                self.assertFalse(created)
+                self.assertEqual(same["id"], operation["id"])
+                self.assertEqual(len(self.store.withdrawals(self.task.id)), 1)
+
+    def test_seventeenth_explicit_operation_is_rejected_m16(self):
+        for _ in range(16):
+            operation, created = self.prepare(again=True)
+            self.assertTrue(created)
+            self.finish(operation, "unknown")
+        with self.assertRaisesRegex(StoreError, "withdraw_limit"):
+            self.prepare(again=True)
+        self.assertEqual(len(self.store.withdrawals(self.task.id)), 16)
+
+    def test_add_home_symlink_switch_does_not_save_root_m21(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            daemon = NativeDaemon(base)
+            self.addCleanup(daemon.close)
+            other = base / "other"
+            other.mkdir()
+            home = base / "home-link"
+            home.symlink_to(daemon.home, target_is_directory=True)
+            def response(request):
+                home.unlink()
+                home.symlink_to(other, target_is_directory=True)
+                return {"result": {"queuedSubmission": {"id": ITEM.lower(),
+                    "clientUserMessageId": request["params"]["clientUserMessageId"]}}}
+            daemon.replies = response
+            transport = CodexQueueTransport()
+            with (patch.dict(os.environ, {"CODEX_HOME": str(home), "CODEX_SQLITE_HOME": str(home)}),
+                  patch.object(transport, "_resolve_executable", return_value="/synthetic/codex"),
+                  patch.object(transport, "_release_version", return_value="0.162.1")):
+                task, attempt = self.create(target=ref(native=THREAD))
+                dispatcher = Dispatcher(self.store, lambda: [endpoint(attempt.target)], {Provider.CODEX: transport}, clock=lambda: 140)
+                self.assertEqual(dispatcher.dispatch(attempt, [endpoint(attempt.target)]), "sent")
+            self.assertEqual(self.current(attempt).delivery, Delivery.QUEUED)
+            self.assertNotIn("codexDataRoot", self.current(attempt).options)
+            self.assertEqual(daemon.methods(), ["initialize", "initialized", "thread/queue/add"])
+
+    def test_delete_home_switch_after_initialize_never_sends_m22(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            daemon = NativeDaemon(base)
+            self.addCleanup(daemon.close)
+            other = base / "other"
+            other.mkdir()
+            # 会合点前后保持相同socket，单靠daemon epoch检测不能兜住数据根漂移。
+            (other / "app-server-control").mkdir()
+            (other / "app-server-control/app-server-control.sock").symlink_to(daemon.socket_path)
+            home = base / "home-link"
+            home.symlink_to(daemon.home, target_is_directory=True)
+            root = local_codex.platform().root_identity(home)
+            initialize = codex_withdraw.BoundedConnection.initialize
+            def switch(client, *args, **kwargs):
+                initialize(client, *args, **kwargs)
+                home.unlink()
+                home.symlink_to(other, target_is_directory=True)
+            boundary = []
+            with patch.object(codex_withdraw.BoundedConnection, "initialize", switch):
+                result = QueueDeleteClient(lambda _: "0.162.1").delete(home, thread=THREAD, item=ITEM.lower(),
+                    root_identity=root, before_send=lambda budget: boundary.append(budget))
+            daemon.thread.join(1)
+            self.assertEqual((result.state, result.reason), ("not_attempted", "root_mismatch"))
+            self.assertEqual(boundary, [])
+            self.assertEqual(daemon.methods(), ["initialize", "initialized"])
 
 
 if __name__ == "__main__":

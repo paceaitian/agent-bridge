@@ -7,6 +7,16 @@ import os
 from pathlib import Path
 
 DEFAULT_PROC = Path("/proc")
+
+
+def pid_namespace(proc_root: Path = DEFAULT_PROC) -> str | None:
+    """本进程可比较的 PID 命名空间标识；不读命令/环境，读不到不猜。"""
+    try:
+        return os.readlink(proc_root / "self/ns/pid")
+    except OSError:
+        return None
+
+
 _MAX_ANCESTRY = 64
 # 识别启动模式用的有界读取：只比较已知选项与子命令名，不保存也不输出（DESIGN §45.33.2）。
 # 窗口要够宽：`codex -c a=1 … -c a=16 exec` 这类长选项串若把子命令挤出窗口，就会把非交互进程当成可投递目标。

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import os
+import select
 from pathlib import Path
 import socket
 import struct
@@ -751,7 +752,10 @@ class TransportChannelTests(RpcCase):
                 self.assertNotIn(FALLBACK_KEY, outcome.detail)
 
     def test_without_a_cli_version_the_socket_is_never_touched(self) -> None:
-        daemon = self.daemon()
+        # 刻意不启动accept线程：即使慢机未accept，也必须从backlog抓到一次错误连接。
+        daemon = FakeDaemon(self.root, listen=False)
+        daemon.listener.listen(1)
+        self.addCleanup(daemon.close)
 
         def no_version(argv: Sequence[str], timeout: float) -> RunResult:
             if argv[1] == "--version":
@@ -765,7 +769,7 @@ class TransportChannelTests(RpcCase):
         with patch.dict(os.environ, {"CODEX_HOME": str(daemon.home)}):
             outcome = transport.deliver(endpoint(ref(native=THREAD)), "hello",
                                         DeliveryContext(message_uuid=MESSAGE, sender_name="user"))
-        daemon.close()
+        self.assertEqual(select.select([daemon.listener], [], [], 0)[0], [])
         self.assertEqual(daemon.connections, 0)
         self.assertEqual(outcome.detail[FALLBACK_KEY], "version_unavailable")
         self.assertEqual(len(self.queue_calls()), 1)

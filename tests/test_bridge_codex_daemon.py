@@ -737,12 +737,17 @@ class DoctorTitleTests(DaemonBase):
             {"daemonMode": True, "withThreadId": 1, "shortThreadId": 0, "uuidNotParsed": 1, "withoutThreadId": 1,
              "stateDbUnavailable": True,
              "nativeMetadata": {"state": "socket_missing", "serverVersion": "unknown", "confirmed": 0,
-                                "conflicts": 0, "sqlFallback": 2, "sqlState": "unavailable"}},
+                                "conflicts": 0, "sqlAnswered": 0, "sqlFallback": 2, "sqlState": "unavailable"}},
         )
         lines = "\n".join(doctor.thread_title_lines(report))
         self.assertIn("不紧挨 activity", lines)
         self.assertIn("停在选择器", lines)
         self.assertIn("状态库读不到", lines)
+        self.assertIn("SQL 直答 0，SQL 回退 2", lines)
+        native = report["nativeMetadata"]
+        assert isinstance(native, dict)
+        native.pop("sqlAnswered")
+        self.assertIn("SQL 直答 未知", "\n".join(doctor.thread_title_lines(report)))
         # 不输出标题原文与 thread id
         for secret in ("proj", T1[:8], T2[:8], "Working"):
             self.assertNotIn(secret, lines)

@@ -84,6 +84,30 @@ def _install_production_socket_guard() -> None:
 _install_production_socket_guard()
 
 
+def _isolate_host_policy_dirs() -> None:
+    """桥判类默认按宿主 Claude/Grok 系统策略目录是否存在来决定能否声明 bypass；测试一律改指不存在的临时路径，
+    免得受管机器或 WSL（官方：`/etc/claude-code` 在 WSL 上用户可写）上的 core 因宿主环境变红（§73.7）。
+    需要「存在」的用例自己传目录或再补丁。这里用不停止的 patch.object：测试里不要调用 `patch.stopall()`，
+    否则这层隔离会悄悄失效。"""
+    import atexit
+    import shutil
+    import tempfile
+    from unittest import mock
+
+    from agentstatus_bridge import endpoints
+
+    root = Path(tempfile.mkdtemp(prefix="agentstatus-test-policy-"))
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
+    # 回滚门会在子进程里用旧版 src 导入本模块，旧版可能还没有这些常量：有才改
+    if hasattr(endpoints, "CLAUDE_SYSTEM_DIR"):
+        mock.patch.object(endpoints, "CLAUDE_SYSTEM_DIR", root / "claude-absent").start()
+    if hasattr(endpoints, "GROK_SYSTEM_DIR"):
+        mock.patch.object(endpoints, "GROK_SYSTEM_DIR", root / "grok-absent").start()
+
+
+_isolate_host_policy_dirs()
+
+
 class FakeProc:
     """在临时目录里构造 /proc 的最小子集：stat、cmdline 与 fd 符号链接。"""
 

@@ -38,6 +38,7 @@ class WebSocket:
         self.close_deadline: float | None = None
         self.receive_budget: int | None = None
         self.strict_size = False
+        self.on_write_start: Callable[[], None] | None = None
 
     def _now(self) -> float:
         return self._clock()
@@ -126,6 +127,8 @@ class WebSocket:
     def _sendall(self, data: bytes, deadline: float) -> None:
         self._socket.settimeout(self._remaining(deadline))
         try:
+            if self.on_write_start is not None:
+                self.on_write_start()
             self._socket.sendall(data)
         except socket.timeout as error:
             raise _Timeout("send") from error

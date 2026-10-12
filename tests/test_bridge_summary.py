@@ -787,7 +787,7 @@ class SummaryRobustCliTests(unittest.TestCase):
             code, out, err = self.run_cli("status", task_id, "--json")
         self.assertEqual(code, cli.EXIT_OK, err)
         self.assertEqual(json.loads(out)["id"], task_id)
-        self.assertEqual(start.call_count, 2)
+        self.assertEqual(start.call_count, 1)  # §73：入口刷新不 revive，异常也服从；末尾仍补拉
 
     def test_damage_after_a_committed_accept_keeps_its_success(self) -> None:
         task_id = self.send()

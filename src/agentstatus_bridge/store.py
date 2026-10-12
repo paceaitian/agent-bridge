@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import time
 from types import TracebackType
 from typing import Any
 import uuid
@@ -58,6 +59,7 @@ MAX_TITLE_CHARS = 120
 MAX_FILES = 16
 FINISHED_RETENTION_SECONDS = 30 * 86400
 MAX_FINISHED_TASKS = 1000
+WITHDRAWAL_RECOVERY_SECONDS = 600  # 远大于10秒受控等待预算，防止异空间/卡住的活动行永久占位（§73.6）
 
 _SCHEMA_V2: tuple[str, ...] = (
     """CREATE TABLE IF NOT EXISTS meta (
@@ -242,6 +244,7 @@ class Store:
         self._conn = connection
         self._conn.row_factory = sqlite3.Row
         self._depth = 0
+        self._withdrawals_ready = False
 
     @classmethod
     def open(cls, directory: Path | None = None) -> Store:
@@ -285,7 +288,20 @@ class Store:
         self.close()
 
     def _configure(self) -> None:
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # 空账本两个首次opener竞争切WAL时，SQLite有的BUSY不走busy_timeout。
+        # 仅重试这一只影响连接配置的操作，沿既有5秒预算，不重试任何业务写入。
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError as error:
+                if getattr(error, "sqlite_errorcode", 0) & 0xFF != sqlite3.SQLITE_BUSY:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise StoreError("store_busy") from error
+                time.sleep(min(0.02, remaining))
         # 发送意图必须在外调前真正落盘
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -306,23 +322,42 @@ class Store:
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def _ensure_withdrawals(self) -> None:
+        # 已安装的账本保留纯读快路（含只读账本）；需要安装/补列时，锁内必须再读版本。
         version = self._conn.execute("SELECT value FROM meta WHERE key='native_withdrawals_version'").fetchone()
         if version is not None:
             if version[0] != "1":
-                raise StoreError("schema_too_new")
-            return
+                return
+            if "owner_pid_namespace" in {row[1] for row in self._conn.execute("PRAGMA table_info(native_withdrawals)")}:
+                self._withdrawals_ready = True
+                return
         with self._transaction() as conn:
+            version = conn.execute("SELECT value FROM meta WHERE key='native_withdrawals_version'").fetchone()
+            if version is not None and version[0] != "1":
+                return  # 附表不可读不能阻断主账本；也不改未来版本的对象。
             conn.execute("""CREATE TABLE IF NOT EXISTS native_withdrawals (
                 id TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, attempt_seq INTEGER NOT NULL,
                 thread_id TEXT NOT NULL, item_id TEXT NOT NULL, root_identity TEXT NOT NULL,
-                owner_pid INTEGER NOT NULL, owner_start TEXT NOT NULL,
+                owner_pid INTEGER NOT NULL, owner_start TEXT NOT NULL, owner_pid_namespace TEXT,
                 created_at REAL NOT NULL, sending_at REAL, finished_at REAL,
                 state TEXT NOT NULL, reason TEXT NOT NULL, server_version TEXT NOT NULL DEFAULT 'unknown'
             )""")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(native_withdrawals)")}
+            if "owner_pid_namespace" not in columns:
+                conn.execute("ALTER TABLE native_withdrawals ADD COLUMN owner_pid_namespace TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS withdrawals_by_task ON native_withdrawals(task_id, created_at)")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS withdrawals_active ON native_withdrawals(root_identity, thread_id, item_id)"
                          " WHERE state IN ('prepared','sending')")
-            conn.execute("INSERT INTO meta(key,value) VALUES ('native_withdrawals_version','1')")
+            conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES ('native_withdrawals_version','1')")
+        self._withdrawals_ready = True
+
+    @property
+    def withdrawals_readable(self) -> bool:
+        version = self._conn.execute("SELECT value FROM meta WHERE key='native_withdrawals_version'").fetchone()
+        return self._withdrawals_ready and version is not None and version[0] == "1"
+
+    def _require_withdrawals(self) -> None:
+        if not self.withdrawals_readable:
+            raise StoreError("withdraw_store_unreadable")
 
     def _ensure_revision_objects(self) -> None:
         """幂等安装修订号触发器与账本标识：纯增量辅助对象，不提升 user_version，旧版程序照常读写。"""
@@ -331,13 +366,14 @@ class Store:
             row[0]
             for row in self._conn.execute("SELECT key FROM meta WHERE key IN (?, ?)", (_REVISION_KEY, _LEDGER_ID_KEY))
         }
-        if {name for name, _, _ in _REVISION_TRIGGERS} <= present and keys == {_REVISION_KEY, _LEDGER_ID_KEY}:
+        triggers = tuple(item for item in _REVISION_TRIGGERS if item[1] != "native_withdrawals" or self.withdrawals_readable)
+        if {name for name, _, _ in triggers} <= present and keys == {_REVISION_KEY, _LEDGER_ID_KEY}:
             return
         with self._transaction() as conn:
             # 已有值保持不变：重复安装不得重置修订号或更换账本标识
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES (?, '0')", (_REVISION_KEY,))
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)", (_LEDGER_ID_KEY, uuid.uuid4().hex))
-            for name, table, operation in _REVISION_TRIGGERS:
+            for name, table, operation in triggers:
                 conn.execute(
                     f"CREATE TRIGGER IF NOT EXISTS {name} AFTER {operation} ON {table} BEGIN"
                     f" UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = '{_REVISION_KEY}'; END"
@@ -825,6 +861,7 @@ class Store:
     def prepare_withdrawal(self, task_id: str, seq: int, *, root_identity: str, now: float,
                            pid: int, start: str, again: bool = False) -> tuple[dict[str, Any], bool]:
         with self._transaction() as conn:
+            self._require_withdrawals()
             attempt = next((item for item in self.attempts(task_id) if item.seq == seq), None)
             if attempt is None:
                 raise StoreError("withdraw_attempt_missing")
@@ -833,8 +870,10 @@ class Store:
                     or native_id(attempt.target.native_id) is None or native_id(attempt.provider_ref) is None):
                 raise StoreError("withdraw_ineligible")
             assert attempt.provider_ref is not None  # 上面的UUID验证已拒绝None
-            if not root_identity or attempt.options.get("codexDataRoot") != root_identity:
-                raise StoreError("withdraw_root_unproven")
+            if not root_identity or not attempt.options.get("codexDataRoot"):
+                raise StoreError("withdraw_root_missing")
+            if attempt.options.get("codexDataRoot") != root_identity:
+                raise StoreError("withdraw_root_mismatch")
             rows = conn.execute("SELECT * FROM native_withdrawals WHERE attempt_id=? ORDER BY created_at DESC, rowid DESC",
                                 (attempt.id,)).fetchall()
             active = conn.execute("SELECT * FROM native_withdrawals WHERE root_identity=? AND thread_id=? AND item_id=?"
@@ -847,46 +886,74 @@ class Store:
                 raise StoreError("withdraw_limit")
             operation = new_id()
             conn.execute("INSERT INTO native_withdrawals(id,task_id,attempt_id,attempt_seq,thread_id,item_id,root_identity,"
-                         "owner_pid,owner_start,created_at,state,reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                         "owner_pid,owner_start,owner_pid_namespace,created_at,state,reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                          (operation, task_id, attempt.id, seq, attempt.target.native_id.lower(), attempt.provider_ref.lower(),
-                          root_identity, pid, start, now, "prepared", "prepared"))
+                          root_identity, pid, start, procfs.pid_namespace(), now, "prepared", "prepared"))
             return dict(conn.execute("SELECT * FROM native_withdrawals WHERE id=?", (operation,)).fetchone()), True
 
-    def begin_withdrawal(self, operation: str, *, now: float, pid: int, start: str) -> None:
-        with self._transaction() as conn:
-            changed = conn.execute("UPDATE native_withdrawals SET state='sending',reason='sending',sending_at=?"
-                                   " WHERE id=? AND state='prepared' AND owner_pid=? AND owner_start=?",
-                                   (now, operation, pid, start)).rowcount
-            if changed != 1:
-                raise StoreError("withdraw_conflict")
+    def begin_withdrawal(self, operation: str, *, now: float, pid: int, start: str,
+                         budget: float | None = None) -> None:
+        timeout = int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        try:
+            if budget is not None:
+                self._conn.execute(f"PRAGMA busy_timeout={max(0, min(timeout, int(budget * 1000)))}")
+            with self._transaction() as conn:
+                self._require_withdrawals()
+                changed = conn.execute("UPDATE native_withdrawals SET state='sending',reason='sending',sending_at=?"
+                                       " WHERE id=? AND state='prepared' AND owner_pid=? AND owner_start=?",
+                                       (now, operation, pid, start)).rowcount
+                if changed != 1:
+                    raise StoreError("withdraw_conflict")
+        finally:
+            self._conn.execute(f"PRAGMA busy_timeout={timeout}")
 
     def finish_withdrawal(self, operation: str, *, thread: str, item: str, state: str, reason: str,
                           version: str, now: float) -> None:
         if state not in {"deleted", "absent", "not_attempted", "refused", "unknown"}:
             raise StoreError("withdraw_invalid_result")
         with self._transaction() as conn:
+            self._require_withdrawals()
             changed = conn.execute("UPDATE native_withdrawals SET state=?,reason=?,server_version=?,finished_at=?"
                                    " WHERE id=? AND thread_id=? AND item_id=? AND state IN ('prepared','sending')",
                                    (state, reason, version, now, operation, thread, item)).rowcount
             if changed != 1:
-                raise StoreError("withdraw_conflict")
+                raise StoreError("withdraw_record_conflict")
 
     def recover_withdrawals(self, *, now: float, proc_root: Path = procfs.DEFAULT_PROC) -> None:
-        rows = self._conn.execute("SELECT id,owner_pid,owner_start,state FROM native_withdrawals"
+        self._require_withdrawals()
+        rows = self._conn.execute("SELECT id,owner_pid,owner_start,owner_pid_namespace,state,created_at FROM native_withdrawals"
                                   " WHERE state IN ('prepared','sending')").fetchall()
         for row in rows:
-            info = procfs.read_process(row["owner_pid"], proc_root)
-            if info is not None and info.start_ticks == row["owner_start"]:
+            timed_out = now - row["created_at"] > WITHDRAWAL_RECOVERY_SECONDS
+            if not timed_out and self._withdrawal_owner_status(row, proc_root) != "gone":
                 continue
             state = "unknown" if row["state"] == "sending" else "not_attempted"
+            reason = "owner_timeout" if timed_out else "owner_gone"
             with self._transaction() as conn:
-                conn.execute("UPDATE native_withdrawals SET state=?,reason='owner_gone',finished_at=? WHERE id=? AND state=?",
-                             (state, now, row["id"], row["state"]))
+                self._require_withdrawals()
+                conn.execute("UPDATE native_withdrawals SET state=?,reason=?,finished_at=? WHERE id=? AND state=?",
+                             (state, reason, now, row["id"], row["state"]))
 
-    def withdrawals(self, task_id: str) -> list[dict[str, Any]]:
+    @staticmethod
+    def _withdrawal_owner_status(row: sqlite3.Row, proc_root: Path) -> str:
+        if row["state"] not in {"prepared", "sending"}:
+            return "finished"
+        namespace = row["owner_pid_namespace"]
+        if namespace is not None and namespace != procfs.pid_namespace(proc_root):
+            return "namespace_unverified"
+        info = procfs.read_process(row["owner_pid"], proc_root)
+        return "alive" if info is not None and info.start_ticks == row["owner_start"] else "gone"
+
+    def withdrawals(self, task_id: str, *, proc_root: Path = procfs.DEFAULT_PROC) -> list[dict[str, Any]]:
         # 展示只取安全列，root/进程/原始请求不离开业务层。
-        return [dict(row) for row in self._conn.execute(
-            "SELECT id,attempt_seq,state,reason,server_version,created_at,sending_at,finished_at FROM native_withdrawals"
+        if not self.withdrawals_readable:
+            return []
+        return [{"id": row["id"], "attemptSeq": row["attempt_seq"], "state": row["state"], "reason": row["reason"],
+                 "serverVersion": row["server_version"], "createdAt": row["created_at"],
+                 "sendingAt": row["sending_at"], "finishedAt": row["finished_at"],
+                 "ownerStatus": self._withdrawal_owner_status(row, proc_root)} for row in self._conn.execute(
+            "SELECT id,attempt_seq,state,reason,server_version,created_at,sending_at,finished_at,"
+            "owner_pid,owner_start,owner_pid_namespace FROM native_withdrawals"
             " WHERE task_id=? ORDER BY created_at,rowid", (task_id,))]
 
     def transition_delivery(
@@ -1111,6 +1178,7 @@ class Store:
                 " ORDER BY COALESCE(closed_at, accepted_at) DESC LIMIT -1 OFFSET ?)",
                 (MAX_FINISHED_TASKS,),
             ).rowcount
-            conn.execute("DELETE FROM native_withdrawals WHERE state NOT IN ('prepared','sending','unknown')"
-                         " AND task_id NOT IN (SELECT id FROM tasks)")
+            if self.withdrawals_readable:
+                conn.execute("DELETE FROM native_withdrawals WHERE state NOT IN ('prepared','sending','unknown')"
+                             " AND task_id NOT IN (SELECT id FROM tasks)")
         return int(expired) + int(overflow)

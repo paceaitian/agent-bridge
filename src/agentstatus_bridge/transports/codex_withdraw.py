@@ -45,7 +45,7 @@ class QueueDeleteClient:
         self.version, self.clock = version, clock
 
     def delete(self, home: Path, *, thread: str, item: str, root_identity: str,
-               before_send: Callable[[], None], sqlite_home: Path | None = None) -> DeleteResult:
+               before_send: Callable[[float], None], sqlite_home: Path | None = None) -> DeleteResult:
         deadline = self.clock() + DELETE_SECONDS
         client: BoundedConnection | None = None
         sending, version = False, "unknown"
@@ -68,8 +68,17 @@ class QueueDeleteClient:
             request = client._encode({"id": 2, "method": "thread/queue/delete", "params": {
                 "threadId": thread, "queuedSubmissionId": item,
             }})
-            before_send()  # 必须先持久化sending并提交，才可开始发送帧；回调不能持有跨I/O事务
-            sending = True
+            remaining = client._remaining(deadline)
+            try:
+                before_send(remaining)  # 回调据剩余预算限账本忙等；提交后才可发帧
+            except Exception as error:
+                reason = "boundary_store_busy" if getattr(error, "code", None) == "store_busy" else "boundary_record_failed"
+                return DeleteResult("not_attempted", reason, version)
+            client._remaining(deadline)  # 落账慢而尚未发帧时，不冒称写后 unknown
+            def mark_sending() -> None:
+                nonlocal sending
+                sending = True
+            client.on_write_start = mark_sending  # 编帧/设超时也可能用尽预算，直到实际sendall入口才算可能写出
             client._send_frame(1, request, deadline)
             response = client.response(2, deadline)
             if "error" in response:
@@ -89,4 +98,5 @@ class QueueDeleteClient:
             return DeleteResult("unknown" if sending else "not_attempted", "transport_error", version)
         finally:
             if client is not None:
+                client.on_write_start = None
                 client.close()

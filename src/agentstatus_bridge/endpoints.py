@@ -365,6 +365,23 @@ def _codex_source_parent(value: object) -> str | None:
     return parent.lower() if isinstance(parent, str) and re.fullmatch(_UUID, parent.lower()) else None
 
 
+def _codex_source_parent_not_needed(value: object) -> bool:
+    """§73.6：已知内部/记忆任务不补父边；不能把 review/compact/Other 的空字段也当证明。"""
+    if not isinstance(value, str) or not value.startswith("{"):
+        return False
+    try:
+        data = json.loads(value)
+    except ValueError:
+        return False
+    return (isinstance(data, dict) and len(data) == 1 and
+            ((isinstance(data.get("internal"), str) and data["internal"] in _CODEX_INTERNAL_WITHOUT_PARENT)
+             or data.get("subagent") == "memory_consolidation"))  # 带字段的将来变体不可哈希，也照常补查
+
+
+# 0.162.1 的 InternalSessionSource 只有这两个变体（protocol.rs:2929，snake_case）；新变体照常补查（§73.7）
+_CODEX_INTERNAL_WITHOUT_PARENT = frozenset({"memory_consolidation", "guardian"})
+
+
 @dataclass(frozen=True)
 class CodexThreadClasses:
     """状态库给出的分类：thread → root/subagent、thread_spawn 子代理 → 父 thread，以及库是否不可用。"""
@@ -374,6 +391,8 @@ class CodexThreadClasses:
     # 编号最大的库打不开或查询出错，或者一个库都没有（DESIGN §53.3.6）；旧库可读但查不到行不能掩盖它
     unavailable: bool = False
     sql_checked: bool = False
+    present: frozenset[str] = frozenset()
+    parent_not_needed: frozenset[str] = frozenset()
 
 
 def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThreadClasses:
@@ -400,6 +419,7 @@ def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThr
     remaining = set(threads)
     kinds: dict[str, str] = {}
     parents: dict[str, str] = {}
+    parent_not_needed: set[str] = set()
     newest_failed = False
     for position, (_, name) in enumerate(reversed(candidates)):
         if not remaining:
@@ -432,30 +452,48 @@ def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThr
             kind = _codex_source_kind(source)
             if kind is not None:
                 kinds[thread_id.lower()] = kind
+                if _codex_source_parent_not_needed(source):
+                    parent_not_needed.add(thread_id.lower())
                 parent = _codex_source_parent(source)
                 if parent is not None:
                     parents[thread_id.lower()] = parent
-    return CodexThreadClasses(kinds, parents, newest_failed, sql_checked=True)
+    return CodexThreadClasses(kinds, parents, newest_failed, sql_checked=True, present=frozenset(threads - remaining),
+                              parent_not_needed=frozenset(parent_not_needed))
 
 
 def _classify_codex_threads(
     sources: DiscoverySources, threads: set[str], processes: Mapping[int, CodexProcess] | None = None,
+    preferred: Collection[str] = (),
 ) -> CodexThreadClasses:
-    """§69：只向实际持有者查native；未知回SQL，明确关系冲突不被旧库洗白。"""
+    """§73：SQL已能回答kind/parent时不初始化native；只有缺证据才补查当前持有者。"""
+    sql = _sql_codex_threads(sources, threads)
+    needed = {thread for thread in threads if thread not in sql.kinds or
+              sql.kinds[thread] == "subagent" and thread not in sql.parents and thread not in sql.parent_not_needed}
+    priority = set(preferred) & threads
+    for _ in range(8):
+        priority |= {sql.parents[thread] for thread in tuple(priority) if sql.parents.get(thread) in threads}
     holders = {
         thread: tuple(sorted((pid, process.info.start_ticks) for pid, process in (processes or {}).items()
                              if process.app_server and thread in process.holdings))
-        for thread in threads
+        for thread in needed
     }
     holders = {key: value for key, value in holders.items() if value}
-    batch = sources.native_metadata.read(sources.codex_home, holders)
+    batch = sources.native_metadata.read(sources.codex_home, holders, preferred=priority, absent=threads - sql.present)
     kinds: dict[str, str] = {}
     parents: dict[str, str] = {}
     conflicts = 0
+    # 初扫不替代网络后的再证明；但每个pid只复验一次，不按记录数重复遍历fd。
+    fresh_processes: dict[int, tuple[str, frozenset[str]] | None] = {}
+    def fresh_holder(pid: int, start: str, thread: str) -> bool:
+        if pid not in fresh_processes:
+            info = procfs.read_process(pid, sources.proc_root)
+            fresh_processes[pid] = None if info is None else (
+                info.start_ticks, frozenset().union(*codex_holdings(pid, sources.proc_root, sources.codex_home)))
+        proof = fresh_processes[pid]
+        return proof is not None and proof[0] == start and thread in proof[1]
     for thread, value in batch.records.items():
         fresh = bool(holders.get(thread)) and all(
-            (info := procfs.read_process(pid, sources.proc_root)) is not None and info.start_ticks == start
-            and thread in set().union(*codex_holdings(pid, sources.proc_root, sources.codex_home))
+            fresh_holder(pid, start, thread)
             for pid, start in holders.get(thread, ())
         )
         if not fresh:
@@ -467,14 +505,16 @@ def _classify_codex_threads(
             kinds[thread] = value.kind
             if value.parent is not None:
                 parents[thread] = value.parent
-    missing = threads - kinds.keys()
-    sql = _sql_codex_threads(sources, missing)
+    fallback = (sources.native_metadata.attempted & threads) - kinds.keys()
     sources.native_report = {
         "state": batch.reason, "serverVersion": batch.server_version,
-        "confirmed": len(kinds) - conflicts, "conflicts": conflicts, "sqlFallback": len(missing),
+        "confirmed": len(kinds) - conflicts, "conflicts": conflicts,
+        "sqlAnswered": len(threads - needed), "sqlFallback": len(fallback),
         "sqlState": "unavailable" if sql.unavailable else "available" if sql.sql_checked else "not_queried",
     }
-    return CodexThreadClasses({**sql.kinds, **kinds}, {**sql.parents, **parents}, sql.unavailable, sql.sql_checked)
+    return CodexThreadClasses({**sql.kinds, **kinds},
+                              {**{key: value for key, value in sql.parents.items() if key not in kinds}, **parents},
+                              sql.unavailable, sql.sql_checked, sql.present, sql.parent_not_needed)
 
 
 @dataclass(frozen=True)
@@ -573,7 +613,9 @@ def _discover_codex(
             thread for process in processes.values() if process.app_server for thread in process.holdings
         } | {thread for members in titled.values() for process, _ in members for thread in process.holdings}
     # 所有需要分类的 thread 合并成一次查询（包括只有一个 thread 的，Codex §45.48 第二轮 R01）
-    classes = _classify_codex_threads(sources, legacy_threads | bindable_pool, processes)
+    preferred = {thread for thread in bindable_pool for pane in panes.values()
+                 if pane.thread_prefix is not None and thread.startswith(pane.thread_prefix)}
+    classes = _classify_codex_threads(sources, legacy_threads | bindable_pool, processes, preferred)
     endpoints: list[Endpoint] = []
     for members in legacy:
         for process, pane in members:
@@ -941,7 +983,9 @@ def codex_title_report(sources: DiscoverySources | None = None) -> dict[str, obj
     short = sum(1 for pane in seen.values() if pane.thread_prefix is not None and len(pane.thread_prefix) < OBSERVER_HOOK_PREFIX_MIN)
     not_parsed = sum(1 for pane in seen.values() if pane.thread_prefix is None and pane.title_has_uuid)
     held = {thread for process in processes.values() if process.app_server for thread in process.holdings}
-    classes = _classify_codex_threads(config, held, processes)
+    preferred = {thread for thread in held for pane in seen.values()
+                 if pane.thread_prefix is not None and thread.startswith(pane.thread_prefix)}
+    classes = _classify_codex_threads(config, held, processes, preferred)
     return {
         "daemonMode": True,
         "withThreadId": with_id,
@@ -1338,12 +1382,58 @@ def _grok_class(tokens: list[str], home: Path, system_dir: Path) -> str | None:
     return "bypass"
 
 
+CLAUDE_SYSTEM_DIR = Path("/etc/claude-code")
+# 官方 CLI reference 明确用于 print/非交互的标志；sdk-url 为任务书指定的 SDK 防呆（§73.6）。
+_CLAUDE_HEADLESS_FLAGS = frozenset({
+    "-p", "--print", "--sdk-url", "--input-format", "--output-format", "--permission-prompt-tool",
+    "--permission-prompts", "--include-partial-messages", "--forward-subagent-text", "--include-hook-events",
+    "--prompt-suggestions", "--replay-user-messages",
+    "--append-subagent-system-prompt", "--append-subagent-system-prompt-file", "--init", "--init-only",
+    "--maintenance", "--max-budget-usd", "--max-turns", "--no-session-persistence", "--json-schema",
+})
+
+
+def _claude_headless(tokens: list[str], names: set[str]) -> bool:
+    """非交互证据：官方 print 专用标志，或含 p 的布尔短选项合写（`-pc` = `-p -c`，§73.7）；误判只会少声明 bypass。"""
+    return bool(names & _CLAUDE_HEADLESS_FLAGS) or any(
+        len(token) > 2 and token[0] == "-" and token[1:].isalpha() and "p" in token[1:] for token in tokens)
+
+
+def _claude_class(tokens: list[str], *, interactive: bool, complete: bool, system_dir: Path) -> str | None:
+    # argv 没读全时被截掉的尾部可能有末项模式或 --restricted 改判：与 Codex/Grok 同一规则，不声明（§58.8、§73.7）
+    if not complete:
+        return None
+    # 不看 -- 后的字面参数；模式取最后一次，含 name=value。只比较启动参数，不读配置内容。
+    tokens = tokens[:tokens.index("--")] if "--" in tokens else tokens
+    mode = None
+    names = {token.partition("=")[0] for token in tokens}
+    for index, token in enumerate(tokens):
+        name, separator, inline = token.partition("=")
+        if name == "--permission-mode":
+            mode = inline if separator else (tokens[index + 1] if index + 1 < len(tokens) else "")
+    danger = "--dangerously-skip-permissions" in names
+    if mode == "plan":
+        requested = ("bypass" if interactive and not _claude_headless(tokens, names) and
+                     (danger or "--allow-dangerously-skip-permissions" in names) else None)
+    elif danger and mode not in {None, "bypassPermissions"}:
+        requested = None  # 官方未给冲突优先级，不用 danger 提前冒称 bypass
+    elif danger or mode == "bypassPermissions":
+        requested = "bypass"
+    else:
+        requested = "prompting" if mode in {"default", "manual", "acceptEdits", "auto", "dontAsk"} else None
+    if requested == "bypass" and ("--restricted" in names or any(
+            _present(system_dir / name) for name in ("managed-settings.json", "managed-settings.d"))):
+        return None
+    return requested
+
+
 def permission_class(
     caller: Caller,
     *,
     proc_root: Path = procfs.DEFAULT_PROC,
     codex_config: Path | None = None,
     grok_dir: Path | None = None,
+    claude_system_dir: Path | None = None,
 ) -> str | None:
     """如实判断发送方权限类别：bypass / prompting / None（不知道）。
 
@@ -1366,15 +1456,8 @@ def permission_class(
         return None if caller.agent_env or caller.endpoint is not None else "bypass"
     tokens, complete = _argv_tokens(agent.pid, proc_root)
     if agent.comm == "claude":
-        if "--dangerously-skip-permissions" in tokens:
-            return "bypass"
-        for index, token in enumerate(tokens):
-            name, separator, inline = token.partition("=")
-            if name != "--permission-mode":
-                continue
-            mode = inline if separator else (tokens[index + 1] if index + 1 < len(tokens) else "")
-            return "bypass" if mode == "bypassPermissions" else "prompting"
-        return None
+        return _claude_class(tokens, interactive=complete and agent.tty_nr != 0, complete=complete,
+                             system_dir=claude_system_dir or CLAUDE_SYSTEM_DIR)
     if agent.comm == "codex":
         if codex_app_server(tokens) or not complete:
             # 命令行没读全时被截掉的部分可能有改判的参数（如提示词后的 --approve-for-me），不声明（DESIGN §58.8）
