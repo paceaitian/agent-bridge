@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 from bridge_support import FakeProc, ProductionSocketUse
 from test_bridge_codex_rpc import FakeDaemon, THREAD, ITEM
-from agentstatus_bridge import cli, codex_metadata, endpoints
+from agentstatus_bridge import cli, codex_metadata, doctor, endpoints
 from agentstatus_bridge.platforms.linux import process as procfs
 from agentstatus_bridge.codex_metadata import MetadataCache, MAX_CACHED
 from agentstatus_bridge.transports import codex_native, local_codex
@@ -63,7 +63,7 @@ class NativeDaemon(FakeDaemon):
         initialize = self._read_json(connection)
         if initialize is None:
             return
-        self._send_json(connection, {"id": 1, "result": self.init or {
+        self._send_json(connection, {"id": 1, "result": self.init if self.init is not None else {
             "userAgent": f"codex-tui/{self.version} (fixture)", "codexHome": str(self.home), "extra": CANARY,
         }})
         if self._read_json(connection) is None:
@@ -119,11 +119,64 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(daemon.methods(), ["initialize", "initialized", "thread/read"])
         self.assertNotIn(CANARY, repr(result))
 
-    def test_server_version_not_cli_version_is_gate(self):
+    def test_server_version_is_recorded_without_membership_gate(self):
+        for version in ("0.162.1", "0.163.0", "99.99.99", "not-a-version"):
+            with self.subTest(version=version), TemporaryDirectory() as tmp:
+                daemon = NativeDaemon(Path(tmp), version=version)
+                try:
+                    result = self.read(daemon)
+                    expected = version if version != "not-a-version" else "unknown"
+                    self.assertEqual(result, NativeBatch({THREAD: ThreadMetadata("root")}, "ok", expected))
+                    self.assertEqual(daemon.methods(), ["initialize", "initialized", "thread/read"])
+                    self.assertEqual(daemon.received[0]["params"]["clientInfo"]["version"], "0.162.1")
+                    self.assertEqual(daemon.received[2]["params"], {"threadId": THREAD, "includeTurns": False})
+                finally:
+                    daemon.close()
+
+    def test_missing_server_version_is_unknown_but_initialize_shape_is_required(self):
+        for init, reason in (({"codexHome": str(self.root / "codex")}, "ok"),
+                             (["invalid"], "initialize_failed"), (False, "initialize_failed"),
+                             ({}, "home_mismatch")):
+            with self.subTest(init=init), TemporaryDirectory() as tmp:
+                if reason == "ok":
+                    init = {"codexHome": str(Path(tmp) / "codex")}
+                daemon = NativeDaemon(Path(tmp), init=init)
+                try:
+                    result = self.read(daemon)
+                    self.assertEqual(result.reason, reason)
+                    self.assertEqual(result.server_version, "unknown")
+                    self.assertEqual(result.records, {THREAD: ThreadMetadata("root")} if reason == "ok" else {})
+                    self.assertEqual(daemon.methods(), ["initialize", "initialized", "thread/read"]
+                                     if reason == "ok" else ["initialize"])
+                finally:
+                    daemon.close()
+
+    def test_cli_version_unavailable_still_does_not_connect(self):
+        daemon = self.daemon()
+        with patch.object(codex_native, "BoundedConnection") as connection:
+            self.assertEqual(self.read(daemon, version=None), NativeBatch(reason="version_unavailable"))
+        connection.assert_not_called()
+        self.assertEqual(daemon.methods(), [])
+
+    def test_new_server_native_report_and_doctor_are_ok(self):
         daemon = self.daemon(version="0.163.0")
-        result = self.read(daemon)
-        self.assertEqual(result.reason, "version_unverified")
-        self.assertEqual(daemon.methods(), ["initialize"])
+        proc = FakeProc(self.root / "proc")
+        proc.add(os.getpid(), comm="codex", argv=("codex", "app-server"),
+                 fds=(str(daemon.home / "thread-writer-locks" / f"{THREAD}.lock"),))
+        sources = endpoints.DiscoverySources(proc_root=proc.root, codex_home=daemon.home,
+            codex_sqlite_home=daemon.home, panes=lambda: {}, titles=lambda: {},
+            native_metadata=MetadataCache(ReadBatchClient(lambda _: "0.162.1")))
+        report = endpoints.codex_title_report(sources)
+        self.assertEqual(report["nativeMetadata"], sources.native_report)
+        self.assertEqual(sources.native_report["state"], "ok")
+        self.assertEqual(sources.native_report["serverVersion"], "0.163.0")
+        self.assertEqual(sources.native_report["confirmed"], 1)
+        self.assertEqual(sources.native_report["sqlFallback"], 0)
+        self.assertEqual(sources.native_report["sqlState"], "unavailable")
+        lines = doctor.thread_title_lines(report)
+        self.assertTrue(any(line.startswith("Codex 原生元数据：ok；确认 1") for line in lines))
+        self.assertNotIn("version_unverified", repr(report) + repr(lines))
+        self.assertNotIn(CANARY, repr(report) + repr(lines))
 
     def test_each_requested_id_must_belong_to_socket_peer(self):
         daemon = self.daemon()

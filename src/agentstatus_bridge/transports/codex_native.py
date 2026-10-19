@@ -13,7 +13,6 @@ from . import local_codex
 from .codex_rpc import CLIENT_NAME, parse_server_version
 from .websocket import WebSocket, _Closed, _Timeout
 
-VERIFIED_VERSIONS = frozenset({"0.162.1"})
 READ_SECONDS = 1.0
 MAX_IDS = 32
 MAX_RECEIVE_BYTES = 4 * 1024 * 1024
@@ -121,8 +120,6 @@ class BoundedConnection(WebSocket):
         if not isinstance(result, dict):
             raise NativeFailure("initialize_failed")
         self.server_version = parse_server_version(result.get("userAgent"))
-        if self.server_version not in VERIFIED_VERSIONS:
-            raise NativeFailure("version_unverified")
         home = result.get("codexHome")
         if not isinstance(home, str) or not self._platform.home_equal(home, self.home):
             raise NativeFailure("home_mismatch")

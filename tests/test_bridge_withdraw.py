@@ -72,11 +72,56 @@ class DeleteProtocolTests(unittest.TestCase):
         result, _ = self.run_delete({"id": 7, "result": {"deleted": True}})
         self.assertEqual(result.state, "unknown")
 
-    def test_version_gate_never_enters_send_boundary(self):
-        result, daemon = self.run_delete({"result": {"deleted": True}}, version="0.160.0")
-        self.assertEqual((result.state, result.reason), ("not_attempted", "version_unverified"))
+    def test_server_version_is_recorded_without_blocking_delete(self):
+        for version in ("0.160.0", "0.163.0", "99.99.99", "not-a-version"):
+            for deleted in (True, False):
+                with self.subTest(version=version, deleted=deleted), TemporaryDirectory() as tmp:
+                    daemon = NativeDaemon(Path(tmp), version=version,
+                        replies=lambda _, deleted=deleted: {"result": {"deleted": deleted}})
+                    boundaries = []
+                    try:
+                        result = QueueDeleteClient(lambda _: "0.162.1").delete(daemon.home,
+                            thread=THREAD, item=ITEM.lower(), root_identity=local_codex.platform().root_identity(daemon.home),
+                            before_send=lambda budget: boundaries.append("sending"))
+                        state = "deleted" if deleted else "absent"
+                        expected = version if version != "not-a-version" else "unknown"
+                        self.assertEqual(result, DeleteResult(state, state, expected))
+                        self.assertEqual(boundaries, ["sending"])
+                        self.assertEqual(daemon.methods(), ["initialize", "initialized", "thread/queue/delete"])
+                        self.assertEqual(daemon.received[0]["params"]["clientInfo"]["version"], "0.162.1")
+                        self.assertTrue(daemon.received[0]["params"]["capabilities"]["experimentalApi"])
+                        self.assertEqual(daemon.received[2]["params"], {"threadId": THREAD, "queuedSubmissionId": ITEM.lower()})
+                    finally:
+                        daemon.close()
+
+    def test_invalid_initialize_still_never_enters_send_boundary(self):
+        for init, reason in ((["invalid"], "initialize_failed"),
+                             ({"userAgent": "codex-tui/0.163.0", "codexHome": 42}, "home_mismatch"),
+                             ({"userAgent": "codex-tui/0.163.0", "codexHome": str(self.root / "other")}, "home_mismatch")):
+            with self.subTest(reason=reason, init=init), TemporaryDirectory() as tmp:
+                daemon = NativeDaemon(Path(tmp), init=init)
+                boundaries = []
+                try:
+                    result = QueueDeleteClient(lambda _: "0.162.1").delete(daemon.home,
+                        thread=THREAD, item=ITEM.lower(), root_identity=local_codex.platform().root_identity(daemon.home),
+                        before_send=lambda budget: boundaries.append("sending"))
+                    self.assertEqual((result.state, result.reason), ("not_attempted", reason))
+                    self.assertEqual(boundaries, [])
+                    self.assertEqual(daemon.methods(), ["initialize"])
+                finally:
+                    daemon.close()
+
+    def test_cli_version_unavailable_still_does_not_connect_or_send(self):
+        daemon = NativeDaemon(self.root)
+        self.addCleanup(daemon.close)
+        with patch.object(codex_withdraw, "BoundedConnection") as connection:
+            result = QueueDeleteClient(lambda _: None).delete(daemon.home,
+                thread=THREAD, item=ITEM.lower(), root_identity=local_codex.platform().root_identity(daemon.home),
+                before_send=lambda budget: self.boundaries.append("sending"))
+        self.assertEqual(result, DeleteResult("not_attempted", "version_unavailable"))
+        connection.assert_not_called()
         self.assertEqual(self.boundaries, [])
-        self.assertEqual(daemon.methods(), ["initialize"])
+        self.assertEqual(daemon.methods(), [])
 
     def test_errors_do_not_claim_original_undelivered(self):
         rows = ((-32601, "missing", "refused"), (-32600, "thread not found: fixture", "refused"),

@@ -1130,17 +1130,24 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true")
     status.set_defaults(handler=cmd_status)
 
-    report = commands.add_parser("report", help="汇报自己承接的任务")
+    report = commands.add_parser(
+        "report",
+        help="汇报自己承接的任务",
+        description=(
+            "汇报自己承接的任务。--result/--blocked/--failed/--approve/--changes 会给发起方发结果回执（会叫醒对方；发起时加了 --no-notify 的除外）；"
+            "--ack/--progress 只记进账本，不通知、不叫醒发起方。需要发起方或用户处理时用 --blocked。"
+        ),
+    )
     report.add_argument("task")
     report.add_argument("--attempt", type=int)
     kinds = report.add_mutually_exclusive_group(required=True)
-    kinds.add_argument("--ack", action="store_true", help="开始处理")
-    kinds.add_argument("--progress", action="store_true", help="进展")
-    kinds.add_argument("--result", action="store_true", help="完成并提交结果")
-    kinds.add_argument("--blocked", action="store_true", help="受阻，需要发起方或用户处理")
-    kinds.add_argument("--failed", action="store_true", help="无法完成")
-    kinds.add_argument("--approve", action="store_true", help="复核通过")
-    kinds.add_argument("--changes", action="store_true", help="复核要求修改")
+    kinds.add_argument("--ack", action="store_true", help="开始处理（只记账，不通知发起方）")
+    kinds.add_argument("--progress", action="store_true", help="进展（只记账，不通知发起方；需要对方处理请用 --blocked）")
+    kinds.add_argument("--result", action="store_true", help="完成并提交结果（通知发起方；复核流程先交给复核方）")
+    kinds.add_argument("--blocked", action="store_true", help="受阻，需要发起方或用户处理（通知发起方）")
+    kinds.add_argument("--failed", action="store_true", help="无法完成（通知发起方）")
+    kinds.add_argument("--approve", action="store_true", help="复核通过（通知发起方）")
+    kinds.add_argument("--changes", action="store_true", help="复核要求修改（通知发起方）")
     report.add_argument("--note", help="一句话说明")
     report.add_argument("--file", action="append", default=[], help="结果文件（记录 sha256）")
     report.add_argument("--commit", help="结果提交")

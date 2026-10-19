@@ -79,6 +79,8 @@ def native_priority(attempt: Attempt) -> str:
 DISCOVERY_MIN_INTERVAL_SECONDS = 2.0
 # 目标连续缺席这么久才判定不在，容忍短暂的发现失败
 TARGET_GONE_GRACE_SECONDS = 15.0
+# 不可判定的空发现只限制本 worker 驻留；消息仍 PENDING，后续 CLI 可再拉起（§79）。
+DISCOVERY_PARK_SECONDS = 600.0
 # Claude 直接接收不发回执，只有 hold/拒收会很快回执：写入后短暂驻留即可
 WRITTEN_WATCH_SECONDS = 60.0
 # held 等对方会话批准：默认 dialogExpiry 5 分钟加余量
@@ -173,14 +175,24 @@ def needs_worker(store: Store, now: float, *, reminders: bool = True) -> bool:
     """是否还有需要 worker 驻留的事情：排队待发、发送中、等待回执、观察消费或等发起方提醒到期。
 
     reminders=False 时不扫描提醒：worker 自己用按修订号缓存的结果代替。
+    CLI 不排除停泊的 PENDING；停泊仅在 Dispatcher 的进程内有效（§79）。
     """
+    return _needs_worker(store, now, reminders=reminders)
+
+
+def _needs_worker(
+    store: Store, now: float, *, reminders: bool,
+    pending_required: Callable[[Attempt], bool] | None = None,
+) -> bool:
+    """共享扫描；只有 worker 传入驻留过滤器，SENDING 和观察窗口从不被过滤。"""
     for attempt in store.attempts_in((Delivery.PENDING, Delivery.SENDING)):
         if attempt.delivery is Delivery.SENDING:
             return True
         task = store.get_task(attempt.task_id)
         # 结束回执在任务结束（或结束前已暂停）后才排队，照样要发（DESIGN §45.31.5）
         if task is not None and (attempt.is_closure or (not task.finished and not task.paused)):
-            return True
+            if pending_required is None or pending_required(attempt):
+                return True
     # 观察窗口判断在 SQL 里做：没人汇报的 Claude 回执会一直停在 WRITTEN，不能每秒把这些历史行连正文读一遍（DESIGN §45.29）
     if store.has_recent_delivery(Delivery.WRITTEN, after=now - WRITTEN_WATCH_SECONDS):
         return True
@@ -232,6 +244,11 @@ class Dispatcher:
     # 测试补丁替换不掉，于是「字段确实由 device_name 求值」这条接线没有守卫（独立审计 F-E）
     device: str = field(default_factory=lambda: device_name())
     log: LogFn = _no_log
+    # None（Linux 默认）不是完整空发现的证明；与 W2 同名回调兼容。
+    empty_discovery_complete: Callable[[], bool] | None = None
+    monotonic: Callable[[], float] = field(default_factory=lambda: time.monotonic)
+    _discovery_wait_since: dict[str, float] = field(default_factory=dict)
+    _parked_pending: set[str] = field(default_factory=set)
     _missing_since: dict[str, float] = field(default_factory=dict)
     # 原生通道已有结果、本地记账失败的尝试：只重试记账，绝不重新外调
     _unrecorded: dict[str, tuple[DeliveryOutcome, dict[str, object]]] = field(default_factory=dict)
@@ -275,6 +292,10 @@ class Dispatcher:
             except Exception as error:
                 self._reminder_scan_failed(error)
         pending = self.store.attempts_in((Delivery.PENDING,))
+        pending_ids = {attempt.id for attempt in pending}
+        for attempt_id in tuple(self._discovery_wait_since):
+            if attempt_id not in pending_ids:
+                self._clear_discovery_wait(attempt_id)
         if pending:
             endpoints = self.endpoints()
             for attempt in pending:
@@ -445,20 +466,42 @@ class Dispatcher:
             self._replay_replies.pop(0)
 
     def _fail(self, attempt: Attempt, reason: str, now: float) -> str:
+        self._clear_discovery_wait(attempt.id)
         if self.store.transition_delivery(
             attempt.id, expected=(Delivery.PENDING,), new=Delivery.FAILED, reason=reason, now=now
         ):
             self.log("delivery_failed", {"task": short(attempt.task_id), "attempt": attempt.seq, "reason": reason})
         return "failed"
 
+    def _clear_discovery_wait(self, attempt_id: str) -> None:
+        self._discovery_wait_since.pop(attempt_id, None)
+        self._parked_pending.discard(attempt_id)
+
+    def _pending_requires_worker(self, attempt: Attempt) -> bool:
+        first = self._discovery_wait_since.get(attempt.id)
+        if first is None:
+            return True  # 新 PENDING 或其他等待原因，不继承旧尝试的停泊。
+        elapsed = self.monotonic() - first
+        if elapsed < DISCOVERY_PARK_SECONDS:
+            return True
+        if attempt.id not in self._parked_pending:
+            self._parked_pending.add(attempt.id)
+            self.log("pending_parked", {
+                "task": short(attempt.task_id), "attempt": attempt.seq,
+                "waitSeconds": int(elapsed),
+            })
+        return False
+
     def dispatch(self, attempt: Attempt, endpoints: list[Endpoint]) -> str:
         """尝试发送一条排队消息，返回 sent / waiting / failed / skipped。"""
         task = self.store.get_task(attempt.task_id)
         # 只有结束回执不受任务结束/暂停限制；其余发送条件（目标消失、权限）完全照旧（DESIGN §45.31.5）
         if task is None or ((task.finished or task.paused) and not attempt.is_closure):
+            self._clear_discovery_wait(attempt.id)
             return "skipped"
         now = self.clock()
         if self._reminder_outdated(task, attempt, now):
+            self._clear_discovery_wait(attempt.id)
             return "skipped"
         # ADAPTERS 覆盖全部 Provider（守卫见 test_bridge_endpoints），漏成员就该是 KeyError 而不是静默放行
         if not ADAPTERS[attempt.target.provider].inbox:
@@ -469,13 +512,16 @@ class Dispatcher:
         if problem is not None:
             return self._fail(attempt, f"target_{problem}", now)
         if live is None:
-            if not endpoints:
+            if not endpoints and not (self.empty_discovery_complete and self.empty_discovery_complete()):
+                self._discovery_wait_since.setdefault(attempt.id, self.monotonic())
                 return "waiting"  # 整体发现失败（tmux/proc 不可用），不据此判定目标不在
+            self._clear_discovery_wait(attempt.id)
             first = self._missing_since.setdefault(attempt.id, now)
             if now - first < TARGET_GONE_GRACE_SECONDS:
                 return "waiting"
             self._missing_since.pop(attempt.id, None)
             return self._fail(attempt, "target_gone", now)
+        self._clear_discovery_wait(attempt.id)
         self._missing_since.pop(attempt.id, None)
         blocking = live.blocking_issues
         if blocking:
@@ -748,7 +794,9 @@ class Dispatcher:
     def has_live_work(self) -> bool:
         """worker 是否需要继续驻留。"""
         pending_local = self._unrecorded or self._replay_receipts or self._replay_replies
-        if pending_local or needs_worker(self.store, self.clock(), reminders=False):
+        if pending_local or _needs_worker(
+            self.store, self.clock(), reminders=False, pending_required=self._pending_requires_worker,
+        ):
             return True
         if self._reminder_scan_errors >= REMINDER_MAX_SCAN_ERRORS:
             return False  # 提醒扫描持续出错：不再为提醒驻留
