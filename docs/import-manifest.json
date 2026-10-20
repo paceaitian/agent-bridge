@@ -1,9 +1,9 @@
 {
   "files": {
     "scripts/build-bridge.py": "203a645199aee2318dc2cbdeeaa5f3c41d1de5c2583f01324580d489a04513f2",
-    "scripts/mirror-bridge.py": "f4ab5ee75050c7d267e4e7c23ef4bec3792b1b9d3a0b43aba231d40b947e1845",
+    "scripts/mirror-bridge.py": "8e41160fbdbc2c65ea1e11d30355f589187cf308f2d1c4d4463ef83b12323aad",
     "scripts/verify-bridge-windows.py": "9b1bca1ab5baddab8959e55f1e35dc18bfb91ba650dd2aa9f49aa34820f28574",
-    "scripts/windows/W1-gate-run.py": "010261295249a0382525d4768ffc6d6c54c5861b04098ade32d2c4d3b19eb4de",
+    "scripts/windows/W1-gate-run.py": "50a911b5321225099e312e0e7385641afd68f6c1cb2737fad717a576311c8305",
     "scripts/windows/W1-gate.ps1": "d75bf4cb95fd2c8a2eeb0f89a7829083fb8c9cf5c3e866068663e5c6c93a65f3",
     "scripts/windows/w1_gate_native.py": "9a1bc8f0e527b9cef501e4c3823b0d40e5abe9e23c103ccd3a2f7bf592eb84ce",
     "src/agentstatus_bridge/__init__.py": "edb968899c92dd0fda8c64c4cfeabafdecd133ed7ff79bcbf63fafb88fc405d8",
@@ -93,8 +93,9 @@
     "tests/bridge_platform_guard.py": "b829705366aab6113decca871f94a5c6303794def41368e25b55f0275da94f9d",
     "tests/bridge_short_socket.py": "778113b3c60d28124b1c844c05058b47c10e50d4fb398f82c415d0d942d8eaf4",
     "tests/bridge_short_socket_guard.py": "9899ab8efee387ca96dc095352985e1b5174e720d68906bbb8745b6db19f67a9",
+    "tests/bridge_sqlite_fixture.py": "89252153ff6edcac76e97f70d239dbe07a4b17c41a0bd6ed38b05385a63d86f0",
     "tests/bridge_support.py": "b1f79b9fe535709908374d0205bec2e6b99439f2faaf32953a9d478c85c1732d",
-    "tests/bridge_winapi.py": "93f33ae9371957e6a50673f43d3928f5ae4582e96f96d76de32b596a5e2d1261",
+    "tests/bridge_winapi.py": "be5d42025e6eef6c030facfd4931248005a93e2011fc85ad918f9848eeef4305",
     "tests/bridge_winapi_sdk.py": "42be8b35cffd480a757ce34523c845238f3f6dec6578d86629ad3b1442787443",
     "tests/fixtures/bridge-linux-w1-golden.json": "1fcbbc98bc198e1f6b0837e45b438a632165440ff30bb1b64821b93408b5aa5f",
     "tests/fixtures/codex_title_vectors.json": "2ab2df0bf2d7f7305259ac48e503e222f714e13650afdeede1b6ad68667f762b",
@@ -108,7 +109,7 @@
     "tests/test_bridge_discovery_park.py": "1697241055667afa921eeef4565ea1530cb7f8bcca54ab964c86720cef6ab34e",
     "tests/test_bridge_dispatch.py": "0f2691026b243342038363f8c3ee9d5fd6eef986b8d470720ded79fecc0be811",
     "tests/test_bridge_endpoints.py": "eaac0be7ddaad6685bbf4f552f612315ef5622f24a276fbcb2c7f8f819a92dae",
-    "tests/test_bridge_gate_artifacts.py": "ea7213d10b521c371d4eeac1dde7af6e2c53069ee9638c923b18d0de2e22f86f",
+    "tests/test_bridge_gate_artifacts.py": "623d4c7112ba742f23ce975ae2733ae86ee552e1ca48ca0516a734102c5535ef",
     "tests/test_bridge_hints.py": "29b6cef21d3c9d82822c015eca4dbc778a2a23049525a93457b5c8a8f17d2dd4",
     "tests/test_bridge_labels.py": "30d4865ae9f8e0670980b8496dfbeec640979f5640da7cd3f66dfe5a2cb4c61c",
     "tests/test_bridge_layout.py": "1b889377e269bf1ea3707e298dce22991dfff3ff7b63f099243d15f9d6c061f2",
@@ -125,12 +126,12 @@
     "tests/test_bridge_store.py": "8fea704a20c653a17c53515c26014518e1d2788194a9cf51cc422286a22060c3",
     "tests/test_bridge_summary.py": "540b0c4c846a490a36f470ecc69be7ccdd72de8e043317a03cec0375f51ee7b7",
     "tests/test_bridge_transports.py": "a341d432d080c487bbcdf53fb5bfe05f595f263d726ec060f5b94b1869cffea7",
-    "tests/test_bridge_windows.py": "a34ed7bcaca143ab0012020f18c86517ec513401d87bd8b22ceaf38a057c3022",
-    "tests/test_bridge_windows_boundaries.py": "892366d4f9d6b69c7ed480de1ab82f2f40728cbf2ca37b576251880be695de3a",
-    "tests/test_bridge_windows_callers.py": "98e4b99d8c75a40237e56a686b721984230ead96905aba612a6198d0ec81b26d",
+    "tests/test_bridge_windows.py": "82e8a3648b2eee904b5c7750d0fdaa28e9d9a293feb9f622316b22ca691fe60e",
+    "tests/test_bridge_windows_boundaries.py": "fdb40bb8f682bf0d4b5ea6809c92eea4eeef6bb336bc457f1f0ead26ebba2388",
+    "tests/test_bridge_windows_callers.py": "09d5672d290190f629564dc4db5e7e1898ad9213dc0f675553ed00b532136487",
     "tests/test_bridge_windows_codex.py": "f8366774007006d81514a34021ca0ab7588bffea61287948b93235c1cb1fedb8",
-    "tests/test_bridge_windows_delivery.py": "05005bdad1fd035599690c5a53c341bf17faf1b53355e422516793386edc340d",
-    "tests/test_bridge_windows_discovery.py": "3cd3d7f798b7e4b5725b1bff55820230b527eaf6ca0edf32a8a494e5b556329f",
+    "tests/test_bridge_windows_delivery.py": "77aec53cf8c95c0d0709fd59ee8573ff4e2c7bd293cd049af5d2947b31ceef1b",
+    "tests/test_bridge_windows_discovery.py": "75ff851b7a8470e179adde0a363724e31ad01d397371bf21fafb1d178e5d4965",
     "tests/test_bridge_windows_light.py": "8f006c76c3a9c7d9386eaf7dcdb31001b865648880546b4e6f6d9b45614be98a",
     "tests/test_bridge_windows_native.py": "677e55568342c2f79c420a41ac34d2e97c331b40cee799e72b68d44b1cf96d28",
     "tests/test_bridge_windows_replace.py": "82a479ec779677e6446b5379b52c22df7d4bce5ca85aca2bdc6122e49dcc4e72",
@@ -140,7 +141,7 @@
     "tests/test_bridge_worker.py": "ccadd78fe7a8bc0d315581d37fbd0738e23dd84dfdda28b61ba4072601fb0a55"
   },
   "source": {
-    "commit": "48ad95fccee732d7ef3a1a63cb2549129ab1c75d",
+    "commit": "e8e227d5d356355d22c0ddfd98b74c5376fdd644",
     "repository": "agentstatus"
   }
 }

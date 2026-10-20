@@ -49,7 +49,7 @@ class GateTests(unittest.TestCase):
         node=next(x for x in TREE.body if isinstance(x,ast.FunctionDef) and x.name=='warmup_stdlib')
         self.assertFalse(any(isinstance(x,(ast.Import,ast.ImportFrom)) for x in ast.walk(node)))
         calls=[ast.unparse(x.func) for x in ast.walk(node) if isinstance(x,ast.Call)]
-        self.assertEqual(set(calls),{'subprocess.Popen','proc.wait','proc.poll','proc.kill',"getattr(proc, '_handle').Close",'getattr','warmup_native','str','allowed.add','allowed.discard'})
+        self.assertEqual(set(calls),{'subprocess.Popen','proc.wait','proc.poll','proc.kill',"getattr(proc, '_handle').Close",'getattr','warmup_native','str','allowed.add','allowed.discard','AssertionError'})
 
     def test_ready_read_shares_delete_closes_and_keeps_other_errors(self):
         k=Mock();k.CreateFileW.return_value=2**40+7;k.CloseHandle.return_value=1

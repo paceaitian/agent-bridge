@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
 import time
 import unittest
 from unittest.mock import patch, Mock
@@ -242,7 +243,8 @@ class CallerTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(),b'bad-json')
 
     def test_alias_linux_rejection_no_old_help_changes(self):
-        with using_platform(make_platform('linux')),patch.object(cli,'_refresh_summary',side_effect=AssertionError('no Linux alias IO')):
+        # This rejection precedes backend I/O, including on a Windows test host.
+        with using_platform(SimpleNamespace(name='linux')),patch.object(cli,'_refresh_summary',side_effect=AssertionError('no Linux alias IO')):
             for command in (('list',),('set','work',uuid(1)),('rm','work')):
                 code,out,err=self.run_cli('alias',*command)
                 self.assertEqual((code,out),(3,''))
@@ -285,7 +287,7 @@ class CallerTests(unittest.TestCase):
             # A bare registered name or Claude env never proves its root.
             self.chain();self.k.processes[200]=(0,134362090000012230,self.k.sid,False,'claude.exe')
             self.reject(C.identify(pid=100,environ={'CLAUDE_SESSION_ID':uuid(2)},terminal=True))
-        with using_platform(make_platform('linux')):
+        with using_platform(SimpleNamespace(name='linux')):
             self.assertTrue(can_notify(claude))
             self.assertEqual(receipt_options(claude,no_notify=True),{})
             self.assertEqual(receipt_options(claude,no_notify=False),{})

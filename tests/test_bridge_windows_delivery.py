@@ -1,5 +1,5 @@
 """W2-4 SDK/codec/local-SQL evidence only, never a real Windows provider."""
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import closing, redirect_stdout, redirect_stderr
 from dataclasses import replace
 import io
 import json
@@ -349,7 +349,7 @@ class DeliveryTests(unittest.TestCase):
 
     def test_sql_names_alias_across_generation_and_send_one_snapshot(self):
         path=self.sql([(uuid(1),'cli')])
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.execute('UPDATE threads SET name=?,cwd=?',('原生任务',r'C:\private\project'))
         with self.scope():
             result=D.discover(self.p.transport)
@@ -391,7 +391,7 @@ class DeliveryTests(unittest.TestCase):
 
     def test_legacy_names_use_native_without_reading_first_message_title(self):
         path=self.sql([(uuid(1),'cli')])
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.execute("UPDATE threads SET history_mode='legacy',name='stale',cwd='private/full/path'")
         self.k.metadata[uuid(1)]={'id':uuid(1),'source':'cli','name':'Native legacy name','cwd':'C:\\private\\leaf'}
         trace=[];connect=sqlite3.connect
@@ -404,7 +404,7 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(sum(m['method']=='thread/read' for m in self.k.messages),1)
             self.assertFalse(any('title' in s.lower() or 'preview' in s.lower() for s in trace))
             self.assertNotIn('private',json.dumps(result.document()))
-        with sqlite3.connect(path) as db:db.execute("UPDATE threads SET history_mode='future'")
+        with closing(sqlite3.connect(path)) as db, db:db.execute("UPDATE threads SET history_mode='future'")
         with self.scope():
             result=D.discover(self.p.transport)
             self.assertEqual(result.document()['peers'][0]['target'],'codex@Native legacy name')
@@ -412,7 +412,7 @@ class DeliveryTests(unittest.TestCase):
     def test_incomplete_name_budget_does_not_invent_name_uniqueness(self):
         self.k.loaded=[uuid(1),uuid(2)]
         path=self.sql([(t,'cli') for t in self.k.loaded])
-        with sqlite3.connect(path) as db:db.execute("UPDATE threads SET history_mode='legacy',name='untrusted-sql'")
+        with closing(sqlite3.connect(path)) as db, db:db.execute("UPDATE threads SET history_mode='legacy',name='untrusted-sql'")
         self.k.metadata[uuid(2)]={'id':uuid(2),'source':'cli','name':'Known name'}
         with self.scope(),patch.object(D,'MAX_IDS',1):
             result=D.discover(self.p.transport)
@@ -472,7 +472,7 @@ class DeliveryTests(unittest.TestCase):
                 reviewer=None,target=target.ref,body='fixture',refs=[],now=1000)
             attempt=replace(attempt,provider_ref=uuid(900),options={'codexDataRoot':target.ref.data_root})
             path=self.home/'queue_1.sqlite'
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.executescript('CREATE TABLE queued_items(id TEXT PRIMARY KEY,input TEXT);')
                 db.execute('INSERT INTO queued_items VALUES (?,?)',(uuid(900),'DO_NOT_READ'))
             trace=[];original=sqlite3.connect;calls=[]
@@ -485,7 +485,7 @@ class DeliveryTests(unittest.TestCase):
             self.assertTrue(trace[-1].startswith('SELECT COUNT(*) FROM queued_items WHERE id = '))
             self.assertIn('PRAGMA query_only=ON',trace)
             self.assertFalse(any('input' in s for s in trace))
-            with sqlite3.connect(path) as db:db.execute('DELETE FROM queued_items')
+            with closing(sqlite3.connect(path)) as db, db:db.execute('DELETE FROM queued_items')
             self.assertIs(Q.state(attempt),Consumption.LEFT_QUEUE)
             self.assertIs(Q.state(replace(attempt,options={})),Consumption.UNKNOWN)
             self.assertIs(Q.state(replace(attempt,options={'codexDataRoot':'b'*64})),Consumption.UNKNOWN)
@@ -1047,7 +1047,7 @@ class AuditTests(unittest.TestCase):
 
     def test_windows_unattributed_hint_does_not_change_linux_text(self):
         args=SimpleNamespace(json=True,json_errors=True)
-        for platform in (self.p,make_platform('linux')):
+        for platform in (self.p,SimpleNamespace(name='linux')):
             with using_platform(platform),redirect_stdout(io.StringIO()) as out,redirect_stderr(io.StringIO()) as err:
                 cli._report_error(args,'caller_unattributed')
             message=json.loads(out.getvalue())['reasonText']
@@ -1068,7 +1068,7 @@ class AuditTests(unittest.TestCase):
                 self.assertIn('alias_name_',err)
                 self.assertIn('alias_name_',out)
                 self.assertFalse((self.state/'target-aliases/codex.json').exists())
-        with using_platform(make_platform('linux')):
+        with using_platform(SimpleNamespace(name='linux')):
             code,out,err=self.run_cli('alias','list','--json')
             self.assertEqual(code,3)
             self.assertIn('alias_platform_unsupported',out)
@@ -1131,7 +1131,7 @@ class AuditTests(unittest.TestCase):
             self.assertFalse(any(m['method']=='thread/read' for m in self.k.messages))
             self.assertEqual(self.deliver(result.endpoint(result.select(uuid(1)))).delivery,Delivery.QUEUED)
             queue=self.home/'queue_1.sqlite'
-            with sqlite3.connect(queue) as db:
+            with closing(sqlite3.connect(queue)) as db, db:
                 db.execute('CREATE TABLE queued_items(id TEXT PRIMARY KEY)')
                 db.execute('INSERT INTO queued_items VALUES (?)',(uuid(900),))
             self.k.files[str(queue)]={'aces':aces}
@@ -1222,7 +1222,7 @@ class AuditTests(unittest.TestCase):
         own, read = (0, 0, 0x1f01ff, self.k.sid), (0, 0x10, 0x120089, other)
         state = self.sql([(uuid(1), 'cli')])
         queue = self.home/'queue_1.sqlite'
-        with sqlite3.connect(queue) as db:
+        with closing(sqlite3.connect(queue)) as db, db:
             db.execute('CREATE TABLE queued_items(id TEXT PRIMARY KEY)')
             db.execute('INSERT INTO queued_items VALUES (?)', (uuid(900),))
         for db_path in (state, queue):
@@ -1239,7 +1239,7 @@ class AuditTests(unittest.TestCase):
                 reviewer=None, target=target.ref, body='fixture', refs=[], now=1000)
             attempt = replace(attempt, provider_ref=uuid(900), options={'codexDataRoot':target.ref.data_root})
             self.assertIs(Q.state(attempt), Consumption.STILL_QUEUED)
-            with sqlite3.connect(queue) as db: db.execute('DELETE FROM queued_items')
+            with closing(sqlite3.connect(queue)) as db, db: db.execute('DELETE FROM queued_items')
             self.assertIs(Q.state(attempt), Consumption.LEFT_QUEUE)
             self.k.files[str(state)]['aces'] = [own, (0, 8, 0x12008b, other)]
             self.k.files[str(queue)]['aces'] = [own, (0, 8, 0x12008b, other)]

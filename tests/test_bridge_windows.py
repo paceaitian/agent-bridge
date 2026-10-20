@@ -68,6 +68,20 @@ class WindowsTests(unittest.TestCase):
         for value in ('bad\0path','x'*32767):
             with self.assertRaises(OSError): A.wide(value)
 
+    def test_fake_file_io_preserves_binary_bytes_and_releases_descriptor(self):
+        leaf = self.root / 'binary-fixture'
+        payload = b'{"n":1}\n{"n":2}\r\n\x1a\x00\xff'
+        self.p.files.atomic_write(self.root, payload, name=leaf.name, prefix='.binary.')
+        self.assertEqual(leaf.read_bytes(), payload, 'CRT text conversion corrupted fake WriteFile')
+        handle = self.k.api.open_file(str(leaf), read_data=True)
+        fd = self.k.handles[handle]['fd']
+        try:
+            self.assertEqual(self.k.api.read(handle, 4096), payload)
+        finally:
+            self.k.api.close(handle)
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+
     def test_sdk_high_handles_cross_both_argument_and_result_marshalling(self):
         self.k.next_handle=2**40+4
         h=self.k.api.open_file(str(self.root),directory=True)

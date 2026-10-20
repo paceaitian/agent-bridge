@@ -50,7 +50,8 @@ def warmup_stdlib(root):
     with subprocess.Popen([sys.executable,'-I','-B','-S','-c','pass'],stdin=subprocess.DEVNULL,
                           stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,close_fds=True) as proc:
         try:
-            assert proc.wait(timeout=10)==0
+            if proc.wait(timeout=10) != 0:
+                raise AssertionError('warmup_process_failed')
         except BaseException:
             # Only the process created by this Popen, never a PID lookup.
             if proc.poll() is None:proc.kill()
@@ -81,10 +82,12 @@ def read_fixture_frame(stream):
     # At most eight one-byte fragments; EOF must fail, never spin indefinitely.
     for _ in range(8):
         part=stream.recv(min(2,8-len(data)))
-        assert part, 'fixture_eof_before_frame'
+        if not part:
+            raise AssertionError('fixture_eof_before_frame')
         data+=part
         if len(data)==8:break
-    assert data==b'abc\nhalf'
+    if data != b'abc\nhalf':
+        raise AssertionError('fixture_frame_invalid')
     return data
 
 

@@ -1,5 +1,5 @@
 """§77.17: SDK/Fake product paths only; no Windows qualification claim."""
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from dataclasses import replace
 import io
 import json
@@ -53,10 +53,13 @@ class BoundaryTests(unittest.TestCase):
                     except OSError as exc: error = exc
                     if external:
                         self.assertIsNone(error)
-                        self.assertFalse(leaf.exists())
                     else:
                         self.assertEqual(getattr(error, 'winerror', None), 32)
                         self.assertTrue(leaf.exists())
+                # DeleteFileW may defer removal until the last shared handle
+                # closes. Do not require POSIX unlink timing inside the lease.
+                if external:
+                    self.assertFalse(leaf.exists())
                 moved.unlink(missing_ok=True)
                 leaf.unlink(missing_ok=True)
                 self.assertEqual(self.k.handles, {})
@@ -159,14 +162,14 @@ class BoundaryTests(unittest.TestCase):
             store.begin_send(attempt.id, now=10, pid=100, start_ticks='fixture')
             store.finish_send(attempt.id, delivery=Delivery.QUEUED, reason='fixture', provider_ref='id', detail={}, now=11)
         path = self.state / DB_NAME
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.execute('ALTER TABLE tasks DROP COLUMN options')
             db.execute('ALTER TABLE attempts DROP COLUMN options')
             db.execute('DROP TABLE native_withdrawals')
         with self.scope(), patch.object(cli, '_revive_worker', side_effect=AssertionError('wait worker')),\
                 patch.object(D, 'discover', side_effect=AssertionError('wait daemon')):
             for version in (0, 1):
-                with sqlite3.connect(path) as db: db.execute('PRAGMA user_version='+str(version))
+                with closing(sqlite3.connect(path)) as db, db: db.execute('PRAGMA user_version='+str(version))
                 before = path.read_bytes()
                 error = None
                 try:
@@ -185,7 +188,7 @@ class BoundaryTests(unittest.TestCase):
                 self.assertIsNone(error)
                 self.assertEqual(self.run_cli('wait', task.id, '--until', 'sent', '--json')[0], 0)
                 self.assertEqual(path.read_bytes(), before)
-            with sqlite3.connect(path) as db: db.execute('PRAGMA user_version='+str(SCHEMA_VERSION+1))
+            with closing(sqlite3.connect(path)) as db, db: db.execute('PRAGMA user_version='+str(SCHEMA_VERSION+1))
             with self.assertRaises(StoreError) as caught:
                 with L.open_store(): pass
             self.assertEqual(caught.exception.code, 'schema_too_new')

@@ -1,5 +1,5 @@
 """W2-2 real WS+SQLite on SDK Fake Win32. No real provider or private home."""
-from contextlib import contextmanager, redirect_stdout, redirect_stderr
+from contextlib import closing, contextmanager, redirect_stdout, redirect_stderr
 from dataclasses import replace
 import io
 import json
@@ -7,11 +7,13 @@ import os
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import time
 import unittest
 from unittest.mock import patch
 
 import bridge_support
+from bridge_sqlite_fixture import require_closed_connections
 from bridge_short_socket import short_root
 from bridge_platform_guard import windows_fixture
 from test_bridge_windows_codex import DaemonKernel
@@ -82,6 +84,7 @@ class DiscoveryTests(unittest.TestCase):
         self.rebuild()
         self.addCleanup(lambda: self.assertEqual(self.k.handles, {}))
         self.addCleanup(lambda: self.assertEqual(self.k.ws_count, 0))
+        require_closed_connections(self)
 
     def rebuild(self):
         self.k = LoadedKernel(self.root, self.home)
@@ -110,7 +113,7 @@ class DiscoveryTests(unittest.TestCase):
         root = root or self.home
         root.mkdir(exist_ok=True)
         path = root/'state_5.sqlite'
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             db.executescript("CREATE TABLE threads(id TEXT PRIMARY KEY,source TEXT,name TEXT,cwd TEXT,history_mode TEXT DEFAULT 'paginated');"
                              'CREATE TABLE thread_spawn_edges(child_thread_id TEXT PRIMARY KEY,parent_thread_id TEXT);')
             db.executemany('INSERT INTO threads(id,source) VALUES (?,?)', rows)
@@ -157,7 +160,7 @@ class DiscoveryTests(unittest.TestCase):
         helpers = {r: uuid(n) for r, n in zip('ABC', (0xa2, 0xb2, 0xc2))}
         self.k.loaded = sorted([*roles.values(), *helpers.values()])
         path = self.sql([(t, 'vscode') for t in roles.values()])
-        with sqlite3.connect(path) as db:
+        with closing(sqlite3.connect(path)) as db, db:
             for role, thread in roles.items():
                 db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?',
                            ('title '+role, 'C:\\w25\\projects\\'+role, thread))
@@ -487,14 +490,16 @@ class DiscoveryTests(unittest.TestCase):
             self.assertIn(D.NO_PANE_WARNING,out.getvalue())
             for json_mode in (True,False):
                 out=io.StringIO()
-                with redirect_stdout(out),patch.object(D,'discover',side_effect=AssertionError('status must stay local')):
+                with redirect_stdout(out),patch.object(D,'discover',side_effect=AssertionError('status must stay local')),\
+                        patch.object(cli, '_ensure_worker', return_value=False):
                     self.assertEqual(cli.main(['status',task.id]+(['--json'] if json_mode else [])),0)
                 self.assertIn('可能没有窗口在显示',out.getvalue())
                 self.assertIn('codex resume',out.getvalue())
             attempts=store.attempts(task.id)
             self.assertIsNone(views._no_pane_warning([replace(attempts[0],target=replace(attempts[0].target,pane='%2'))]))
             self.assertIsNone(views._no_pane_warning([replace(attempts[0],target=replace(attempts[0].target,provider=Provider.CLAUDE))]))
-            with using_platform(make_platform('linux')):
+            # Shared view policy only: no host-specific Linux backend is needed.
+            with using_platform(SimpleNamespace(name='linux')):
                 self.assertNotIn('targetWindowWarning',views._task_document(store,task))
             self.assertEqual(self.k.messages,[])
 

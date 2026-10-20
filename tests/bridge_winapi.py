@@ -14,6 +14,34 @@ from agentstatus_bridge.platforms.windows.api import WinApi
 from bridge_winapi_sdk import SDK
 
 
+def fixture_fd(root, path, disposition):
+    """Real fixture storage; sharing/ACL policy is enforced by Kernel, not CRT.
+
+    Windows os.open defaults to text mode and omits FILE_SHARE_DELETE. Either
+    would silently add host restrictions not present in our modeled CreateFileW.
+    Only a regular leaf below this test's private root may use the native shim.
+    """
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise AssertionError('fixture_file_outside_root')
+    if os.name != 'nt':
+        return os.open(path, os.O_RDWR | (os.O_CREAT if disposition in (1, 4) else 0)
+                       | (os.O_EXCL if disposition == 1 else 0), 0o600)
+    import msvcrt
+    native = C.WinDLL('kernel32', use_last_error=True)
+    native.CreateFileW.argtypes = [C.c_wchar_p, S.U32, S.U32, S.P, S.U32, S.U32, S.H]
+    native.CreateFileW.restype = S.H
+    native.CloseHandle.argtypes = [S.H]
+    native.CloseHandle.restype = S.I32
+    handle = native.CreateFileW(str(path), 0xc0000000, 7, None, disposition, 0x200000, None)
+    if handle == S.INVALID_HANDLE_VALUE:
+        raise C.WinError(C.get_last_error())
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY)
+    except BaseException:
+        native.CloseHandle(handle)
+        raise
+
+
 def put(pointer, kind, value):
     C.cast(pointer, C.POINTER(kind)).contents.value = value
 
@@ -107,7 +135,8 @@ class Kernel:
     def record(self, handle):
         # Unknown/truncated handles are API contract violations, not incidental
         # dict KeyErrors. Unexpected fixture errors retain their original type.
-        assert handle in self.handles, 'unknown or truncated HANDLE/SOCKET'
+        if handle not in self.handles:
+            raise AssertionError('unknown or truncated HANDLE/SOCKET')
         return self.handles[handle]
 
     def buffer(self, value):
@@ -119,7 +148,8 @@ class Kernel:
         return 0
 
     def CloseHandle(self, handle):
-        assert handle in self.handles, 'double close or truncated HANDLE'
+        if handle not in self.handles:
+            raise AssertionError('double close or truncated HANDLE')
         record = self.handles.pop(handle)
         if 'fd' in record:
             os.close(record['fd'])
@@ -315,7 +345,7 @@ class Kernel:
             self.error = 80
             return S.INVALID_HANDLE_VALUE
         existed = p.exists()
-        fd = os.open(p, os.O_RDWR | (os.O_CREAT if disposition in (1, 4) else 0) | (os.O_EXCL if disposition == 1 else 0), 0o600)
+        fd = fixture_fd(self.root, p, disposition)
         if not existed: self.files[str(p)] = {'private': True, 'protected': True}
         return self.alloc('file', path=str(p), fd=fd, access=access, sharing=sharing)
     def GetFileInformationByHandle(self, handle, out):
