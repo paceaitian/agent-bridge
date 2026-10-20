@@ -20,6 +20,7 @@ import uuid
 
 from . import envelope
 from .platforms import process as procfs
+from .platforms.factory import get_platform
 from .endpoints import ADAPTERS
 from .ids import short
 from .naming import command_name
@@ -49,6 +50,7 @@ from .store import Store, StoreError
 from .transports import DeliveryContext, DeliveryOutcome, Transport
 from .transports.claude_peer import Receipt, parse_receipt, parse_reply
 from .platforms.transport_codec import encode_address
+from .notification_policy import can_notify, wire_ref
 from .transports.codex_queue import queue_item_state
 
 # 原生调度提示按消息种类选（DESIGN §45.42）。取消忙时扣留之后，「对方什么时候读它」不再由
@@ -237,6 +239,10 @@ class Dispatcher:
     clock: Callable[[], float] = time.time
     proc_root: Path = procfs.DEFAULT_PROC
     queue_state: Callable[[str], Consumption] = queue_item_state
+    attempt_queue_state: Callable[[Attempt], Consumption] | None = None
+    empty_discovery_complete: Callable[[], bool] | None = None
+    pending_ready: Callable[[set[str]], bool] | None = None
+    pending_observe: Callable[[int], None] | None = None
     # 对外命令名：与 device 同理要 lambda 晚绑定，否则类定义时就固化，测试补丁替换不掉（DESIGN §45.36）
     command: str = field(default_factory=lambda: command_name())
     # 发送方所在设备：本机投递一律填本机名，进消息头 `device=`（DESIGN §45.35）。
@@ -244,8 +250,6 @@ class Dispatcher:
     # 测试补丁替换不掉，于是「字段确实由 device_name 求值」这条接线没有守卫（独立审计 F-E）
     device: str = field(default_factory=lambda: device_name())
     log: LogFn = _no_log
-    # None（Linux 默认）不是完整空发现的证明；与 W2 同名回调兼容。
-    empty_discovery_complete: Callable[[], bool] | None = None
     monotonic: Callable[[], float] = field(default_factory=lambda: time.monotonic)
     _discovery_wait_since: dict[str, float] = field(default_factory=dict)
     _parked_pending: set[str] = field(default_factory=set)
@@ -296,16 +300,21 @@ class Dispatcher:
         for attempt_id in tuple(self._discovery_wait_since):
             if attempt_id not in pending_ids:
                 self._clear_discovery_wait(attempt_id)
-        if pending:
-            endpoints = self.endpoints()
-            for attempt in pending:
-                outcome = self.dispatch(attempt, endpoints)
-                if outcome == "sent":
-                    summary.sent += 1
-                elif outcome == "waiting":
-                    summary.waiting += 1
-                elif outcome == "failed":
-                    summary.failed += 1
+        ready = self.pending_ready is None or self.pending_ready({a.id for a in pending})
+        if pending and ready:
+            try:
+                endpoints = self.endpoints(fresh=self.pending_ready is not None)
+                for attempt in pending:
+                    outcome = self.dispatch(attempt, endpoints)
+                    if outcome == "sent":
+                        summary.sent += 1
+                    elif outcome == "waiting":
+                        summary.waiting += 1
+                    elif outcome == "failed":
+                        summary.failed += 1
+            finally:
+                if self.pending_observe is not None:
+                    self.pending_observe(summary.sent)
         self.reconcile_consumption()
         return summary
 
@@ -364,6 +373,8 @@ class Dispatcher:
         with self.store.transaction():
             task = self.store.get_task(task_id)
             if task is None or task.origin is None:
+                return False
+            if not can_notify(task.origin):
                 return False
             attempts = self.store.attempts(task_id)
             reminder = pending_reminder(task, attempts)
@@ -500,6 +511,8 @@ class Dispatcher:
             self._clear_discovery_wait(attempt.id)
             return "skipped"
         now = self.clock()
+        if get_platform().name == 'windows' and attempt.target.provider is not Provider.CODEX:
+            return self._fail(attempt, 'windows_provider_not_enabled', now)
         if self._reminder_outdated(task, attempt, now):
             self._clear_discovery_wait(attempt.id)
             return "skipped"
@@ -523,6 +536,9 @@ class Dispatcher:
             return self._fail(attempt, "target_gone", now)
         self._clear_discovery_wait(attempt.id)
         self._missing_since.pop(attempt.id, None)
+        if get_platform().name == 'windows' and (
+                not attempt.target.data_root or live.ref.data_root != attempt.target.data_root):
+            return self._fail(attempt, 'target_root_changed', now)
         blocking = live.blocking_issues
         if blocking:
             return self._fail(attempt, f"target_{blocking[0]}", now)
@@ -538,17 +554,22 @@ class Dispatcher:
         transport = self.transports.get(provider)
         if transport is None:
             return "waiting"
-        me = procfs.read_process(os.getpid())
+        if get_platform().name == 'windows':
+            record = get_platform().process.read(os.getpid()).record
+            identity = (record.identity.pid, record.identity.stored_generation()) if record is not None else None
+        else:
+            me = procfs.read_process(os.getpid())
+            identity = (me.pid, me.start_ticks) if me is not None else None
         native_message = message_uuid(attempt.message_id)
-        if me is None or not self._claim(
+        if identity is None or not self._claim(
             attempt,
             now=now,
-            pid=me.pid,
-            start_ticks=me.start_ticks,
+            pid=identity[0],
+            start_ticks=identity[1],
             provider_ref=native_message if provider is Provider.CLAUDE else None,
         ):
             return "skipped"
-        sender = attempt.sender
+        sender = wire_ref(attempt.sender) if attempt.sender is not None else None
         try:
             text = envelope.render(
                 task, attempt, sender=sender.token() if sender else "user", device=self.device, command=self.command
@@ -566,6 +587,7 @@ class Dispatcher:
                 sender_class=attempt.sender_class,
                 reply_to=self.reply_address if provider is Provider.CLAUDE else None,
                 priority=native_priority(attempt),
+                before_send=(lambda: self._windows_boundary(attempt)) if get_platform().name == 'windows' else None,
             )
         except Exception as error:
             # 尚未外调：可证明未发送，不能让记录停在发送中
@@ -616,6 +638,14 @@ class Dispatcher:
             },
         )
         return "failed" if outcome.delivery is Delivery.FAILED else "sent"
+
+    def _windows_boundary(self, attempt: Attempt) -> None:
+        with self.store.transaction():
+            current = self.store.get_attempt(attempt.id)
+            if current is None or current.delivery is not Delivery.SENDING:
+                raise StoreError('boundary_record_failed')
+            self.store.add_event(attempt.task_id, 'native_send_boundary', now=self.clock(),
+                                 attempt_seq=attempt.seq, detail={'provider': 'codex'})
 
     # ---- 回执与回复 ----
 
@@ -784,7 +814,7 @@ class Dispatcher:
         for attempt in self.store.attempts_in((Delivery.QUEUED,), delivered_since=now - CONSUMPTION_WATCH_SECONDS):
             if attempt.provider_ref is None or attempt.consumption is Consumption.LEFT_QUEUE:
                 continue
-            state = self.queue_state(attempt.provider_ref)
+            state = self.attempt_queue_state(attempt) if self.attempt_queue_state is not None else self.queue_state(attempt.provider_ref)
             if state is not Consumption.UNKNOWN and self.store.set_consumption(attempt.id, state, now=now):
                 self.log(
                     "consumption",

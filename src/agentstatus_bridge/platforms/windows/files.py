@@ -1,8 +1,9 @@
-"""Windows F：本地NTFS、创建即DACL、根和祖先句柄租约；无chmod退路。"""
+"""Windows F：本地NTFS、创建即DACL、根租约及本人自有对象权限恢复。"""
 from __future__ import annotations
 from contextlib import contextmanager, ExitStack
 from collections.abc import Iterator
 import hashlib
+import logging
 import ntpath
 import os
 from pathlib import Path
@@ -13,6 +14,8 @@ import uuid
 
 from ..path_values import STATE_DIR_ENV, BINDING_ENV, DEVICE_ENV, DEVICE_UNSAFE, DEVICE_CHARS
 from ..policy import CLAUDE_SYSTEM_DIRS
+
+ACL_OBSERVATION = 'acl-repair.json'
 
 
 def local_path(path: Path) -> Path:
@@ -30,9 +33,109 @@ def local_path(path: Path) -> Path:
 class WindowsPaths:
     def __init__(self, api: Any) -> None:
         self.api = api
+        self.acl_repaired = False
+        self._recording_repair = False
+
+    def ensure_private(self, handle: int, path: Path, *, protected: bool = False) -> None:
+        """Only owned state, never external Codex/SQL/pipe permissions."""
+        try:
+            self.api.check_private(handle, protected=protected)
+            return
+        except OSError as error:
+            if error.args != ('windows_acl_untrusted',):
+                raise
+        before = self.api.file_info(handle)  # rejects reparse before mutation
+        if before.attributes & 0x10 or before.links != 1:
+            raise OSError('windows_file_untrusted')
+        self.api.check_owner(handle)
+        with self.api.owned(self.api.open_file(str(path), metadata_only=True, write_dac=True)) as repair:
+            after = self.api.file_info(repair)
+            if ((after.volume, after.index_high, after.index_low, after.links, after.attributes)
+                    != (before.volume, before.index_high, before.index_low, 1, before.attributes)):
+                raise OSError('windows_file_untrusted')
+            self.api.check_ntfs(repair)
+            self.api.repair_private(repair)
+        self._record_repair(path)
+
+    def _private_directory(self, handle: int, path: Path) -> int:
+        """Takes ownership of handle, returning the verified replacement lease.
+
+        Inheritable ACEs may propagate into existing unprotected children.
+        Metadata-only access is not an exclusive sharing barrier (MS-FSA).
+        Reacquire normal data access after repair; check FileId at both reopens.
+        """
+        current: int | None = handle
+        try:
+            try:
+                self.api.check_private(handle, protected=True)
+                return handle
+            except OSError as error:
+                if error.args != ('windows_acl_untrusted',):
+                    raise
+            self.api.check_owner(handle)
+            def identity(h: int) -> tuple[int, int, int]:
+                info = self.api.file_info(h)
+                if not info.attributes & 0x10 or info.links != 1:
+                    raise OSError('windows_directory_required')
+                self.api.check_ntfs(h)
+                return int(info.volume), int(info.index_high), int(info.index_low)
+            before = identity(handle)
+            self.api.close(handle)
+            current = None
+            with self.api.owned(self.api.open_file(str(path), directory=True, write_dac=True, sharing=7,
+                                                  metadata_only=True)) as repair:
+                if identity(repair) != before:
+                    raise OSError('windows_file_untrusted')
+                self.api.repair_private(repair, inherit=True)
+            current = self.api.open_file(str(path), directory=True)
+            assert current is not None
+            if identity(current) != before:
+                raise OSError('windows_file_untrusted')
+            self.api.check_private(current, protected=True)
+            self._record_repair(path)
+            return current
+        except BaseException:
+            if current is not None:
+                self.api.close(current)
+            raise
+
+    def _record_repair(self, path: Path) -> None:
+        self.acl_repaired = True
+        logging.getLogger(__name__).warning('windows_private_acl_repaired')
+        # Content-free, persistent observation; never asserts the old bytes were
+        # trustworthy. Non-state fixture paths only set the process observation.
+        if (not self._recording_repair and path.is_relative_to(self.state_dir())
+                and path != self.state_dir() / ACL_OBSERVATION):
+            self._recording_repair = True
+            try:
+                self.atomic_write(self.state_dir(), b'{"previousAclUntrusted":true}\n',
+                                  name=ACL_OBSERVATION, prefix='.acl.')
+            finally:
+                self._recording_repair = False
+
+    def acl_observation(self) -> bool:
+        if self.acl_repaired:
+            return True
+        try:
+            self.validate_file(self.state_dir() / ACL_OBSERVATION)
+            return True  # observation marker, never an authorization source
+        except OSError:
+            return False
 
     def state_base(self) -> Path:
         return Path(self.api.local_app_data())
+
+    def open_private_file(self, path: Path, **options: Any) -> int:
+        """Owner has metadata rights even if the old ACL denies data IO."""
+        try:
+            return self.api.open_file(str(path), **options)
+        except OSError as error:
+            if getattr(error, 'winerror', None) != 5:
+                raise
+        with self.api.owned(self.api.open_file(str(path), metadata_only=True)) as metadata:
+            self.ensure_private(metadata, path)
+        # Always reacquire normal data access, never use metadata as a data pin.
+        return self.api.open_file(str(path), **options)
 
     def state_dir(self) -> Path:
         return local_path(Path(os.environ[STATE_DIR_ENV]) if STATE_DIR_ENV in os.environ
@@ -51,32 +154,69 @@ class WindowsPaths:
         raise OSError('windows_uid_not_applicable')
 
     def codex_home(self) -> Path:
-        raise OSError('windows_provider_not_enabled')
-    grok_home = claude_sessions_dir = codex_home
+        value = os.environ.get('CODEX_HOME')
+        return local_path(Path(value) if value is not None else Path.home() / '.codex')
 
-    def codex_sqlite_home(self) -> None:
-        return None
+    def grok_home(self) -> Path:
+        raise OSError('windows_provider_not_enabled')
+    claude_sessions_dir = grok_home
+
+    def codex_sqlite_home(self) -> Path | None:
+        value = os.environ.get('CODEX_SQLITE_HOME')
+        return local_path(Path(value)) if value is not None else None
 
     @contextmanager
-    def lease(self, path: Path, *, create: bool = False) -> Iterator[None]:
+    def external_directory(self, path: Path) -> Iterator[tuple[int, int, int]]:
+        """Retain an existing external chain's identities without blocking rename.
+
+        Never create, follow a reparse component, or repair external permissions.
+        AB_STATE_DIR continues to use the separate private lease contract.
+        """
         path = local_path(path)
-        # Every path component is pinned without delete sharing; no reparse shortcuts.
         with ExitStack() as stack:
+            identity = (0, 0, 0)
             for component in (*reversed(path.parents), path):
-                try:
-                    handle = self.api.open_file(str(component), directory=True)
-                except OSError as error:
-                    if not create or getattr(error, 'winerror', None) not in (2, 3):
-                        raise
-                    self.api.create_directory(str(component))
-                    handle = self.api.open_file(str(component), directory=True)
+                handle = self.api.open_file(str(component), directory=True)
                 stack.callback(self.api.close, handle)
                 info = self.api.file_info(handle)
                 if not info.attributes & 0x10:
                     raise OSError('windows_directory_required')
                 self.api.check_ntfs(handle)
-                if component == path:
-                    self.api.check_private(handle, protected=True)
+                identity = int(info.volume), int(info.index_high), int(info.index_low)
+            yield identity
+
+    @contextmanager
+    def lease(self, path: Path, *, create: bool = False, external: bool = False) -> Iterator[None]:
+        if external and create:
+            raise OSError('external_creation_forbidden')
+        path = local_path(path)
+        # Keep handle ownership/identity checks; share deletion, no reparse shortcuts.
+        with ExitStack() as stack:
+            for component in (*reversed(path.parents), path):
+                try:
+                    handle = self.api.open_file(str(component), directory=True)
+                except OSError as error:
+                    code = getattr(error, 'winerror', None)
+                    if code == 5 and component == path and not external:
+                        metadata = self.api.open_file(str(path), directory=True, metadata_only=True)
+                        healed = self._private_directory(metadata, path)  # takes ownership
+                        self.api.close(healed)
+                    elif create and code in (2, 3):
+                        self.api.create_directory(str(component))
+                    else:
+                        raise
+                    handle = self.api.open_file(str(component), directory=True)
+                try:
+                    info = self.api.file_info(handle)
+                    if not info.attributes & 0x10:
+                        raise OSError('windows_directory_required')
+                    self.api.check_ntfs(handle)
+                except BaseException:
+                    self.api.close(handle)
+                    raise
+                if component == path and not external:
+                    handle = self._private_directory(handle, path)
+                stack.callback(self.api.close, handle)
             yield
 
     def ensure_private_dir(self, path: Path) -> Path:
@@ -86,22 +226,32 @@ class WindowsPaths:
     def validate_file(self, path: Path) -> tuple[int, int, int]:
         return self._validate_file(path, af_unix=False)
 
-    def validate_socket(self, path: Path) -> tuple[int, int, int]:
-        return self._validate_file(path, af_unix=True)
+    def validate_socket(self, path: Path, *, external: bool = False) -> tuple[int, int, int]:
+        return self._validate_file(path, af_unix=True, external=external)
 
-    def _validate_file(self, path: Path, *, af_unix: bool) -> tuple[int, int, int]:
-        with self.lease(path.parent), self.api.owned(self.api.open_file(str(local_path(path)))) as handle:
-            self.api.check_private(handle)
+    def _validate_file(self, path: Path, *, af_unix: bool, external: bool = False) -> tuple[int, int, int]:
+        with self.lease(path.parent, external=external), self.api.owned(
+                self.api.open_file(str(local_path(path)), sharing=7 if external else 3)) as handle:
             info = self.api.file_info(handle, af_unix=af_unix)
-            if info.attributes & 0x10 or info.links != 1:
+            # Codex rendezvous files are authenticated by their exact tag and
+            # kernel peer, not by Codex's evolving file ACL/owner/link policy.
+            if info.attributes & 0x10 or (not external and info.links != 1):
                 raise OSError('windows_file_untrusted')
+            if external:
+                pass
+            elif af_unix:
+                self.api.check_private(handle)
+            else:
+                self.ensure_private(handle, path)
             return int(info.volume), int(info.index_high), int(info.index_low)
 
     def prepare_database(self, path: Path) -> None:
         with self.lease(path.parent, create=True):
-            with self.api.owned(self.api.open_file(str(path), create=True, write=True)) as handle:
-                self.api.check_private(handle)
-                self.api.file_info(handle)
+            with self.api.owned(self.open_private_file(path, create=True, write=True)) as handle:
+                info = self.api.file_info(handle)
+                if info.attributes & 0x10 or info.links != 1:
+                    raise OSError('windows_file_untrusted')
+                self.ensure_private(handle, path)
             self.validate_database(path)
 
     def validate_database(self, path: Path) -> None:
@@ -125,7 +275,18 @@ class WindowsPaths:
             except OSError as error:
                 if getattr(error, 'winerror', None) not in (2, 3):
                     raise
-            self.atomic_write(path.parent, (old if len(old) <= limit else b'') + payload, name=path.name, prefix='.log.')
+            if len(old) > limit:
+                rotated = path.with_name(path.name + '.1')
+                try:
+                    self.validate_file(rotated)
+                except OSError as error:
+                    if getattr(error, 'winerror', None) not in (2, 3):
+                        raise
+                # Rename retains the entire old log, not the bounded read above.
+                # If rotation fails the original is intact; never truncate it.
+                self.api.replace(str(path), str(rotated))
+                old = b''
+            self.atomic_write(path.parent, old + payload, name=path.name, prefix='.log.')
 
     def atomic_write(self, directory: Path, payload: bytes, *, name: str, prefix: str) -> None:
         if Path(name).name != name or ntpath.basename(name) != name or any(c in name+prefix for c in ':\\/\0'):
@@ -133,7 +294,13 @@ class WindowsPaths:
         with self.lease(directory, create=True):
             target = directory / name
             try:
-                self.validate_file(target)
+                # Replacement never consumes old bytes or writes through links.
+                # The private parent authorizes replacement; retain type/link
+                # guards, not the owner or ACL of the bytes being replaced.
+                with self.api.owned(self.api.open_file(str(target))) as old:
+                    info = self.api.file_info(old)
+                    if info.attributes & 0x10 or info.links != 1:
+                        raise OSError('windows_file_untrusted')
             except OSError as error:
                 if getattr(error, 'winerror', None) not in (2, 3):
                     raise
@@ -175,18 +342,21 @@ class WindowsPaths:
         try:
             values = []
             for path in (home, sqlite_home or home):
-                with self.lease(path), self.api.owned(self.api.open_file(str(path), directory=True)) as handle:
-                    info = self.api.file_info(handle)
-                    values.append(f'{info.volume}:{info.index_high}:{info.index_low}')
+                with self.external_directory(path) as identity:
+                    values.append(':'.join(str(part) for part in identity))
             return hashlib.sha256(b'W1:windows:v1\0' + self.api.current_token().sid + b'\0' + '\0'.join(values).encode()).hexdigest()
         except OSError:
             return None
 
     def home_equal(self, reported: str, expected: Path) -> bool:
-        return False  # W2 must choose provider data-root contract
+        try:
+            with self.external_directory(Path(reported)) as actual, self.external_directory(expected) as wanted:
+                return actual == wanted
+        except OSError:
+            return False
 
-    def socket_identity(self, target: Path) -> tuple[str, int, int, int]:
-        volume, high, low = self.validate_socket(target)
+    def socket_identity(self, target: Path, *, external: bool = False) -> tuple[str, int, int, int]:
+        volume, high, low = self.validate_socket(target, external=external)
         return 'windows-file-id', volume, high, low
 
     def which(self, name: str) -> str | None:

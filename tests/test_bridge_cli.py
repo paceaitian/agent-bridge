@@ -52,6 +52,45 @@ USER = Caller(None, None)
 
 
 class CliTests(unittest.TestCase):
+    def test_linux_empty_reviewer_and_local_controls_keep_legacy_behavior(self) -> None:
+        code,out,err=self.run_cli('send','--to','codex@impl','--review-by','',
+                                  '-m','fixture','--no-wait','--json')
+        self.assertEqual(code,0,err)
+        task_id=json.loads(out)['id']
+        with self.store() as store:
+            task=store.get_task(task_id)
+            self.assertIs(task.flow,Flow.HANDOFF)
+            self.assertIsNone(task.reviewer)
+        # Linux pause/cancel historically do not ask caller identity. Keep this
+        # contract in this Windows-only patch; future tightening is separate.
+        self.caller=as_agent(REVIEW)
+        with patch.object(cli,'identify_caller',side_effect=AssertionError('Linux control sampled caller')):
+            self.assertEqual(self.run_cli('pause',task_id)[0],0)
+            self.assertEqual(self.run_cli('cancel',task_id)[0],0)
+        with self.store() as store:
+            self.assertTrue(store.get_task(task_id).paused)
+            self.assertIs(store.attempts(task_id)[0].delivery,Delivery.CANCELLED)
+
+    def test_linux_file_replaces_invalid_utf8_before_ledger(self) -> None:
+        path = self.state.parent / 'body-utf8.txt'
+        path.write_bytes(b'hello\xff\xe9')
+        code, out, err = self.run_cli('send', '--to', 'codex@impl', '--file', str(path), '--no-wait', '--json')
+        self.assertEqual(code, 0, err)
+        with self.store() as store:
+            self.assertEqual(store.attempts(json.loads(out)['id'])[0].body, 'hello\ufffd\ufffd')
+        self.assertNotIn('message_invalid_utf8', err)
+
+    def test_linux_stdin_reads_text_not_raw_buffer(self) -> None:
+        from io import BytesIO, TextIOWrapper
+        # Text and bytes intentionally disagree; Linux follows stdin's decoder.
+        for options in (['-m', '-'], []):
+            with TextIOWrapper(BytesIO(b'caf\xe9'), encoding='cp1252') as stream, patch.object(sys, 'stdin', stream):
+                code, out, err = self.run_cli('send', '--to', 'codex@impl', *options, '--no-wait', '--json')
+            self.assertEqual(code, 0, err)
+            with self.store() as store:
+                self.assertEqual(store.attempts(json.loads(out)['id'])[0].body, 'café')
+            self.assertNotIn('message_invalid_utf8', err)
+
     def setUp(self) -> None:
         self._tmp = TemporaryDirectory()
         self.state = Path(self._tmp.name) / "bridge"
@@ -609,6 +648,17 @@ class CliTests(unittest.TestCase):
             self.assertEqual(store.archived_risk_count(), 1)
         code, out, _ = self.run_cli("tasks", "--json")
         self.assertEqual([item["id"] for item in json.loads(out)["tasks"]], [task_id])
+
+    def test_wait_revives_linux_worker_on_first_and_tenth_round(self) -> None:
+        task_id = self.send()
+        now = [0.0]
+        def tick(_seconds):now[0] += 1
+        with (patch.object(cli, '_revive_worker') as revive,
+              patch.object(cli.time, 'monotonic', side_effect=lambda:now[0]),
+              patch.object(cli.time, 'sleep', side_effect=tick)):
+            code, _, _ = self.run_cli('wait', task_id, '--timeout', '11')
+        self.assertEqual(code, cli.EXIT_TIMEOUT)
+        self.assertGreaterEqual(revive.call_count, 2)
 
     def test_wait_returns_unknown_delivery_immediately(self) -> None:
         task_id = self.send()

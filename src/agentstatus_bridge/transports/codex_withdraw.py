@@ -53,11 +53,11 @@ class QueueDeleteClient:
             if native_id(thread) != thread or native_id(item) != item:
                 return DeleteResult("not_attempted", "invalid_target")
             backend = local_codex.platform()
+            if not backend.supported:
+                return DeleteResult('not_attempted', 'windows_provider_not_enabled')
             if backend.root_identity(home, sqlite_home) != root_identity:
                 return DeleteResult("not_attempted", "root_mismatch")
-            cli = self.version(min(3.0, max(0.001, deadline - self.clock())))
-            if cli is None:
-                return DeleteResult("not_attempted", "version_unavailable")
+            cli = self.version(min(3.0, max(0.001, deadline - self.clock()))) or "unknown"
             client = BoundedConnection(home, min(deadline, self.clock() + 3.0), self.clock)
             client.close_deadline = deadline
             client.initialize(cli, min(deadline, self.clock() + 3.0), experimental=True)

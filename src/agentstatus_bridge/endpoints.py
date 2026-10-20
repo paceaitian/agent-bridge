@@ -859,6 +859,9 @@ _AGENT_ENV_MARKERS = tuple(marker for adapter in ADAPTERS.values() for marker in
 
 def discover(sources: DiscoverySources | None = None) -> list[Endpoint]:
     """发现当前可交接的端点，按 provider 与 tmux 会话名排序。"""
+    if sources is None and get_platform().name == 'windows':
+        from .platforms.windows.commands import endpoints  # layout: allow Windows无mux的命令作用域发现
+        return endpoints()
     if sources is None and get_platform().discovery is not Capability.VERIFIED:
         return []
     config = sources or DiscoverySources()
@@ -989,23 +992,7 @@ def resolve_target(selector: str, endpoints: list[Endpoint]) -> Endpoint:
     raise ResolveError("target_not_found")
 
 
-@dataclass(frozen=True)
-class Caller:
-    """命令调用者：所在的 agent 会话（若能匹配）、可见的 agent 祖先进程，以及是否有 agent 环境迹象。"""
-
-    endpoint: Endpoint | None
-    agent_process: procfs.ProcessInfo | None
-    via: str | None = None  # ancestry / environment
-    agent_env: bool = False
-    # subagent（§45.48 R3）；platform_unverified（Windows W1未开放caller资格）。
-    rejection: str | None = None
-
-    @property
-    def is_user_shell(self) -> bool:
-        """既无 agent 祖先进程也无 agent 环境变量：用户直接在终端/SSH 中运行。"""
-        if self.rejection == 'platform_unverified':
-            return False
-        return self.agent_process is None and not self.agent_env
+from .caller_values import Caller
 
 
 def identify_caller(
@@ -1032,7 +1019,9 @@ def identify_caller(
     最近的 codex 祖先是 app-server（Codex 托管 daemon）时另走 `_codex_daemon_caller`（DESIGN §53.4）。
     """
     if get_platform().name == 'windows':
-        return Caller(None,None,rejection='platform_unverified')
+        from .platforms.windows.caller import identify  # layout: allow Windows专用调用者，Linux不导入
+        from .platforms.windows.commands import caller  # layout: allow 复用本命令资格，不重复连接
+        return caller() or identify(pid=pid, environ=environ)
     env = os.environ if environ is None else environ
     chain = procfs.ancestry(pid if pid is not None else os.getpid(), proc_root)
     agent_env = any(env.get(name) for name in _AGENT_ENV_MARKERS)

@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import time
 
-from ..platforms.transport_types import LocalFailure
+from ..platforms.transport_types import LocalFailure, WINDOWS_READ_SECONDS
 from . import local_codex
 from .codex_rpc import CLIENT_NAME, parse_server_version
 from .websocket import WebSocket, _Closed, _Timeout
@@ -28,6 +28,50 @@ class NativeFailure(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+def daemon_diagnostic(home: Callable[[], Path]) -> dict[str, object]:
+    """W2-1 doctor only: one bounded initialize, no metadata or provider writes.
+
+    Platform scope is explicit; versions are observations. Linux discovery never
+    calls this function. Raw paths, errors and token identifiers do not escape.
+    """
+    backend = local_codex.platform()
+    result: dict[str, object] = {
+        'cliVersion': 'unknown', 'serverVersion': 'unknown', 'rendezvous': 'af_unix_control',
+        'peerVerified': False, 'reachable': False, 'reason': 'read_unavailable',
+        'logonType': 'UNKNOWN', 'sessionZero': None, 'sameLogon': None, 'sameSession': None,
+        'logoutRisk': 'unknown', 'providerWrites': False,
+    }
+    version = backend.codex_cli_version() or 'unknown'
+    result['cliVersion'] = version
+    with backend.codex_read_scope(version):
+        client: BoundedConnection | None = None
+        try:
+            deadline = time.monotonic() + WINDOWS_READ_SECONDS
+            client = BoundedConnection(home(), deadline, time.monotonic)
+            result['peerVerified'] = True
+            client.initialize(version, deadline, experimental=True)
+            result['reachable'], result['reason'] = True, 'verified'
+            try:
+                result.update(backend.logon_info(client._socket))
+            except OSError:
+                pass  # diagnostics cannot turn same-LUID into an authentication gate
+            if result['logonType'] in {'INTERACTIVE', 'REMOTE_INTERACTIVE'}:
+                result['logoutRisk'] = 'desktop_logout_may_stop_shared_backend_inferred'
+            elif result['logonType'] != 'UNKNOWN':
+                result['logoutRisk'] = 'not_established'
+        except NativeFailure as error:
+            result['reason'] = error.reason
+        except (_Timeout, TimeoutError):
+            result['reason'] = 'deadline'
+        except (OSError, _Closed, ValueError):
+            result['reason'] = 'read_unavailable'
+        finally:
+            if client is not None:
+                result['serverVersion'] = client.server_version
+                client.close()
+    return result
 
 
 @dataclass(frozen=True)
@@ -163,9 +207,7 @@ class ReadBatchClient:
             failure = local_codex.platform().resolve(local_codex.platform().control_socket_path(home))
             if isinstance(failure, LocalFailure):
                 return NativeBatch(reason=failure.reason)
-            cli = self.version(max(0.001, deadline - self.clock()))
-            if cli is None:
-                return NativeBatch(reason="version_unavailable")
+            cli = self.version(max(0.001, deadline - self.clock())) or "unknown"
             if self.clock() >= deadline:
                 return NativeBatch(reason="deadline")
             client = BoundedConnection(home, deadline, self.clock)

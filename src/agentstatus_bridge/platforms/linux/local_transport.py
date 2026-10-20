@@ -1,5 +1,6 @@
 """Linux T：Codex 与 Claude 共用本地流原语，原安全检查分支不合并。"""
 from pathlib import Path
+import logging
 import os
 import socket
 import stat
@@ -16,18 +17,32 @@ class LinuxPlatform(UnsupportedPlatform):
 
     def __init__(self, files: PathsAndIdentityBackend | None = None) -> None:
         self.files = files if files is not None else LinuxPaths()
+        self._permission_observations: set[tuple[bool, bool | None, bool | None]] = set()
     def resolve(self, link: Path) -> Path | LocalFailure:
         if not os.path.lexists(link):
             return LocalFailure("socket_missing")
         try:
             target = Path(os.path.realpath(link, strict=True))
-            value, parent = target.stat(), target.parent.stat()
+            value = target.stat()
         except OSError:
             return LocalFailure("socket_missing")
         uid = os.getuid()
-        if (not stat.S_ISSOCK(value.st_mode) or value.st_uid != uid or value.st_mode & 0o077
-                or parent.st_uid != uid or stat.S_IMODE(parent.st_mode) != 0o700):
+        if not stat.S_ISSOCK(value.st_mode) or value.st_uid != uid:
             return LocalFailure("socket_rejected")
+        # Upstream's Unix client does not reject socket/parent permissions.
+        # Keep addressing proof; permissions are bounded content-free observations.
+        try:
+            parent = target.parent.stat()
+            parent_owned, parent_private = parent.st_uid == uid, stat.S_IMODE(parent.st_mode) == 0o700
+        except OSError:
+            parent_owned, parent_private = None, None
+        observation = (not bool(value.st_mode & 0o077), parent_owned, parent_private)
+        if observation != (True, True, True) and observation not in self._permission_observations:
+            logging.getLogger(__name__).debug(
+                "codex_socket_permissions_observed socketPrivate=%s parentOwned=%s parentPrivate=%s",
+                *observation,
+            )
+            self._permission_observations.add(observation)
         return target
 
     def new_stream(self) -> socket.socket:

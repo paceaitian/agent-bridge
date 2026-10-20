@@ -13,6 +13,7 @@ from .labels import next_step, reason_text
 from .model import HANDED_OVER, Attempt, Delivery, Role, Task, TaskView, describe
 from .store import MAX_ATTEMPTS_PER_TASK
 from .summary import attention_at, attention_token, classify
+from .notification_policy import can_notify, wire_ref
 
 REMIND_AFTER_SECONDS = 30 * 60.0
 # 提醒记在 notice 尝试的 options 上：尝试不按条数裁剪，比每任务有上限的事件时间线更适合去重
@@ -65,7 +66,8 @@ def attention_declined(task: Task, attempts: list[Attempt], view: TaskView) -> b
 
 def reminder_candidate(task: Task) -> bool:
     """只看任务字段的预筛：不满足就不必读尝试（worker 每秒都要判定，Opus 审计 F3）。"""
-    return not task.finished and not task.paused and task.origin is not None and task.notify_origin
+    return (not task.finished and not task.paused and task.origin is not None and task.notify_origin
+            and can_notify(task.origin))
 
 
 def pending_reminder(task: Task, attempts: list[Attempt]) -> PendingReminder | None:
@@ -114,7 +116,7 @@ def reminder_body(task: Task, attempts: list[Attempt], view: TaskView, *, comman
 
     `command` 由 worker 传它启动时解析好的入口名（DESIGN §45.36）：提醒是发给发起方照抄的。
     """
-    receiver = view.current.target.display() if view.current is not None else "对方"
+    receiver = wire_ref(view.current.target).display() if view.current is not None else "对方"
     minutes = int(REMIND_AFTER_SECONDS // 60)
     lines = [f"提醒：这项任务已超过 {minutes} 分钟没有处理——{reason_text(view.reason, command=command)}（{receiver}）。"]
     step = next_step(task, attempts, ref=short(task.id), command=command)

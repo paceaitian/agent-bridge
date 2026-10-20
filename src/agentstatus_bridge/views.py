@@ -39,6 +39,15 @@ from .model import (
 )
 from .naming import command_name
 from .store import Store
+from .platforms.factory import get_platform
+
+
+def _no_pane_warning(attempts: list[Attempt]) -> str | None:
+    if get_platform().name == 'windows' and any(
+            a.target.provider is Provider.CODEX and a.target.pane is None for a in attempts):
+        from .platforms.windows.codex_discovery import NO_PANE_WARNING  # layout: allow Windows展示独立告警，无发现IO
+        return NO_PANE_WARNING
+    return None
 
 
 def _age(timestamp: float | None, now: float) -> str:
@@ -190,6 +199,11 @@ def _task_document(
     }
     if events:
         document["events"] = store.events(task.id)
+    warning = _no_pane_warning(attempts)
+    if warning is not None:
+        document['targetWindowWarning'] = warning
+    if get_platform().name == 'windows' and task.options.get('receiptMode') == 'poll_only':
+        document['receiptMode'] = 'poll_only'
     return document
 
 
@@ -231,6 +245,11 @@ def _print_task(
     flow = "交接" if task.flow is Flow.HANDOFF else f"实现 → 复核（{task.reviewer.display() if task.reviewer else '?'}）"
     origin = task.origin.display() if task.origin else "用户"
     print(f"流程：{flow}；发起：{origin}；创建于 {_age(task.created_at, now)}")
+    if get_platform().name == 'windows' and task.options.get('receiptMode') == 'poll_only':
+        print('回执方式：poll_only；用 status / wait 读取，不推送通知。')
+    warning = _no_pane_warning(attempts)
+    if warning is not None:
+        print(warning)
     for attempt in attempts:
         delivery = DELIVERY_LABELS[attempt.delivery]
         if attempt.delivery_reason and attempt.delivery is not Delivery.PENDING:

@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import bridge_support
+from bridge_short_socket import short_root
 from bridge_platform_guard import ProductionSocketUse, windows_fixture
 from bridge_winapi import Kernel, put
 from bridge_winapi_sdk import assert_file_layout
@@ -20,8 +21,9 @@ from agentstatus_bridge.transports.codex_rpc import queue_add
 
 class StreamTests(unittest.TestCase):
     def setUp(self):
+        bridge_support.bridge_short_socket_guard.isolate(self)
         assert_file_layout(self,A.FILE_INFORMATION)
-        self.tmp=TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.tmp=short_root();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.k=Kernel(self.root)
         self.p=make_platform('windows',win_api=self.k.api)
         self.expected=ProcessIdentity('windows',100,'win-filetime','134362090001712230')

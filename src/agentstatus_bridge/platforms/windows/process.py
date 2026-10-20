@@ -1,8 +1,19 @@
 """Windows P：查询权限、同handle代际/token，UNKNOWN不投影成Linux的False。"""
 from typing import Any
+from dataclasses import dataclass
 from collections.abc import Iterator
 from contextlib import contextmanager
 from ..types import Capability, Presence, ProcessIdentity, ProcessRead, ProcessRecord, ProcessSnapshot, SampleState
+
+
+@dataclass(frozen=True)
+class Ancestry:
+    records: tuple[ProcessRecord, ...]
+    termination: str
+
+
+def _name(record: ProcessRecord) -> str:
+    return record.comm.lower().removesuffix('.exe')
 
 
 class WindowsProcess:
@@ -82,6 +93,31 @@ class WindowsProcess:
     def snapshot(self) -> ProcessSnapshot:
         # W1 does not turn a process table into provider discovery.
         return ProcessSnapshot(SampleState.UNVERIFIED)
+
+    def trace(self, pid: int, limit: int = 64) -> Ancestry:
+        """Caller-only evidence; preserve the verified prefix, never bridge a gap.
+
+        ancestry() retains W1's complete-chain projection for older consumers.
+        Neither a truncated prefix nor an empty chain means a user shell.
+        """
+        rows: list[ProcessRecord] = []
+        seen: set[int] = set()
+        with self.generation_scan():
+            while pid > 0:
+                if pid in seen:
+                    return Ancestry(tuple(rows), 'cycle')
+                if len(rows) >= min(64, max(0, limit)):
+                    return Ancestry(tuple(rows), 'limit')
+                seen.add(pid)
+                read = self.read(pid)
+                if read.state is not Presence.CURRENT or read.record is None:
+                    return Ancestry(tuple(rows), read.reason or 'process_unverified')
+                row = read.record
+                if rows and int(row.identity.generation_value) > int(rows[-1].identity.generation_value):
+                    return Ancestry(tuple(rows), 'parent_reused')
+                rows.append(row)
+                pid = row.parent_pid
+        return Ancestry(tuple(rows), 'root')
 
     def pid_namespace(self) -> None:
         return None

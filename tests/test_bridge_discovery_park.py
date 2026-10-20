@@ -373,6 +373,20 @@ class DiscoveryParkTests(unittest.TestCase):
         self.assertEqual(self.store.get_attempt(reminder.id).delivery, Delivery.QUEUED)
         self.assertEqual(len(self.transport.calls), 1)
 
+    def test_pending_cleanup_runs_even_when_backoff_is_not_ready(self):
+        _, attempt = self.task()
+        self.run_once()
+        self.advance(600)
+        self.assertFalse(self.dispatcher.has_live_work())
+        self.store.transition_delivery(attempt.id, expected=(Delivery.PENDING,),
+                                       new=Delivery.CANCELLED, reason='synthetic', now=self.wall)
+        self.task()
+        self.dispatcher.pending_ready = lambda _ids: False
+        self.run_once()
+        self.assertEqual(self.dispatcher._discovery_wait_since, {})
+        self.assertEqual(self.dispatcher._parked_pending, set())
+        self.assertEqual(self.transport.calls, [])
+
     def test_real_worker_loop_exits_after_park_plus_idle(self):
         for complete in (None, lambda: False):
             with self.subTest(completeness='linux_none' if complete is None else 'incomplete_false'):
@@ -380,8 +394,9 @@ class DiscoveryParkTests(unittest.TestCase):
                 _, attempt = self.task()
 
                 def create(**kwargs):
+                    kwargs['empty_discovery_complete'] = complete
                     return Dispatcher(**kwargs, clock=lambda: self.wall,
-                                      monotonic=lambda: self.mono, empty_discovery_complete=complete)
+                                      monotonic=lambda: self.mono)
 
                 def sleep(seconds):
                     self.advance(seconds)

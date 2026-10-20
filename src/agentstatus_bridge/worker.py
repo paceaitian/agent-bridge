@@ -81,6 +81,13 @@ def worker_running(root: Path | None = None) -> bool:
     try:
         lifecycle.try_lock(fd, shared=True)
     except BlockingIOError:
+        if get_platform().name == 'windows':
+            from .platforms.windows.worker_identity import verify  # layout: allow Windows锁还须验证其属主代际/镜像
+            from .platforms.windows.files import WindowsPaths  # layout: allow 仅Windows窄原语
+            files = get_platform().files
+            if not isinstance(files, WindowsPaths):
+                raise OSError('worker_identity_unverified')
+            verify(files, path.parent)
         return True
     else:
         lifecycle.unlock(fd)
@@ -104,8 +111,6 @@ def wait_for_worker(root: Path | None = None, *, timeout: float = 2.0) -> bool:
 
 def ensure_worker(root: Path | None = None) -> bool:
     """确保后台 worker 在运行；需要时以独立会话拉起，返回是否新启动。"""
-    if get_platform().name == 'windows':
-        return False
     directory = root or state_dir()
     if worker_running(directory):
         return False
@@ -121,7 +126,8 @@ def ensure_worker(root: Path | None = None) -> bool:
 def default_transports() -> dict[Provider, Transport]:
     """各 provider 的投递通道；只读 provider（适配器 inbox=False）不在其中（DESIGN §45.34）。"""
     if get_platform().name == 'windows':
-        return {}
+        from .platforms.windows.codex_delivery import CodexTransport  # layout: allow Windows只有RPC Codex，无Claude listener
+        return {Provider.CODEX: CodexTransport()}
     transports: dict[Provider, Transport] = {
         Provider.CODEX: CodexQueueTransport(),
         Provider.CLAUDE: ClaudePeerTransport(),
@@ -165,8 +171,6 @@ def run_worker(
     单轮异常只记日志并退避重试，连续失败过多才退出，不让排队静默停摆（DESIGN §45.6）。
     """
     platform = get_platform()
-    if platform.name == 'windows':
-        return 9
     lifecycle = platform.lifecycle
     directory = root or state_dir()
     lock_fd = lifecycle.open_lock(_lock_path(directory))
@@ -182,6 +186,12 @@ def run_worker(
     previous = lifecycle.install_stop(_stop)
     log = WorkerLog(directory / LOG_NAME)
     try:
+        if platform.name == 'windows':
+            from .platforms.windows.worker_identity import register  # layout: allow 持锁后发布本代启动回执
+            from .platforms.windows.files import WindowsPaths  # layout: allow 私有回执只用已选择的F
+            if not isinstance(platform.files, WindowsPaths):
+                raise OSError('worker_identity_unverified')
+            register(platform.files, directory)
         # 先开账本再绑收件箱：账本失败时不在 Claude socket 目录留下残留
         try:
             opened = Store.open(directory)
@@ -189,7 +199,7 @@ def run_worker(
             log("store_error", {"code": error.code})
             raise
         with opened as store:
-            inbox = _open_inbox(inbox_directory)
+            inbox = None if platform.name == 'windows' else _open_inbox(inbox_directory)
             try:
                 pruned = store.prune(now=time.time())
             except StoreError as error:
@@ -202,11 +212,31 @@ def run_worker(
             # 水位取实际发布的快照：发布之后才提交的修订不能记作已发布（3A-F03）
             summary_seen = None if started is None else (started.ledger_id, started.revision)
             summary_failures = 1 if summary_pending else 0
-            sources = DiscoverySources(native_metadata=MetadataCache())
+            sources = None if platform.name == 'windows' else DiscoverySources(native_metadata=MetadataCache())
+            attempt_queue_state = None
+            empty_complete = None
+            selected_discover = discover_fn
+            pending_backoff = None
+            if platform.name == 'windows':
+                from .platforms.windows.pending_backoff import PendingBackoff  # layout: allow Windows待投递独立退避
+                pending_backoff = PendingBackoff()
+                from .platforms.windows.codex_consumption import state  # layout: allow Windows存在性必须同成功投递根
+                from .platforms.windows.codex_discovery import WorkerDiscovery  # layout: allow 完整空集合不是发现失败
+                from .platforms.windows.local_transport import WindowsPlatform  # layout: allow W2专用认证后端
+                attempt_queue_state = state
+                if selected_discover is None:
+                    if not isinstance(platform.transport, WindowsPlatform):
+                        raise OSError('windows_provider_not_enabled')
+                    selected_discover = sampling = WorkerDiscovery(platform.transport)
+                    empty_complete = sampling.complete
             dispatcher = Dispatcher(
                 store=store,
-                discover=discover_fn or (lambda: discover(sources)),
+                discover=selected_discover or (lambda: discover(sources)),
                 transports=transports or default_transports(),
+                attempt_queue_state=attempt_queue_state,
+                empty_discovery_complete=empty_complete,
+                pending_ready=pending_backoff.ready if pending_backoff else None,
+                pending_observe=pending_backoff.observe if pending_backoff else None,
                 reply_address=inbox.address if inbox is not None else None,
                 command=command_name(),
                 log=log,

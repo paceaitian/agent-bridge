@@ -24,6 +24,26 @@ class FILETIME(C.Structure):
     _fields_ = [('dwLowDateTime', U32), ('dwHighDateTime', U32)]
 
 
+class LUID(C.Structure):
+    _fields_ = [('LowPart', U32), ('HighPart', I32)]
+
+
+class TOKEN_STATISTICS(C.Structure):
+    _fields_ = [('TokenId', LUID), ('AuthenticationId', LUID), ('ExpirationTime', C.c_int64),
+                ('TokenType', I32), ('ImpersonationLevel', I32), ('DynamicCharged', U32),
+                ('DynamicAvailable', U32), ('GroupCount', U32), ('PrivilegeCount', U32), ('ModifiedId', LUID)]
+
+
+class LSA_UNICODE_STRING(C.Structure):
+    _fields_ = [('Length', U16), ('MaximumLength', U16), ('Buffer', P)]
+
+
+class SECURITY_LOGON_SESSION_PREFIX(C.Structure):
+    _fields_ = [('Size', U32), ('LogonId', LUID), ('UserName', LSA_UNICODE_STRING),
+                ('LogonDomain', LSA_UNICODE_STRING), ('AuthenticationPackage', LSA_UNICODE_STRING),
+                ('LogonType', U32), ('Session', U32)]
+
+
 class BY_HANDLE_FILE_INFORMATION(C.Structure):
     _fields_ = [('dwFileAttributes', U32), ('ftCreationTime', FILETIME),
                 ('ftLastAccessTime', FILETIME), ('ftLastWriteTime', FILETIME),
@@ -90,6 +110,7 @@ SDK = {
         'OpenProcess': (H, [U32, I32, U32]),
         'CloseHandle': (I32, [H]),
         'GetProcessTimes': (I32, [H, P, P, P, P]),
+        'QueryFullProcessImageNameW': (I32, [H, U32, P, P]),
         'GetExitCodeProcess': (I32, [H, P]),
         'CreateToolhelp32Snapshot': (H, [U32, U32]),
         'Process32FirstW': (I32, [H, P]),
@@ -131,10 +152,13 @@ SDK = {
         'ConvertStringSecurityDescriptorToSecurityDescriptorW': (I32, [P, U32, P, P]),
         'GetSecurityInfo': (U32, [H, U32, U32, P, P, P, P, P]),
         'GetSecurityDescriptorControl': (I32, [P, P, P]),
+        'GetSecurityDescriptorDacl': (I32, [P, P, P, P]),
+        'SetSecurityInfo': (U32, [H, U32, U32, P, P, P, P]),
         'GetAce': (I32, [P, U32, P]),
     },
     'shell32': {'SHGetKnownFolderPath': (I32, [P, U32, H, P])},
     'ole32': {'CoTaskMemFree': (None, [P])},
+    'secur32': {'LsaGetLogonSessionData': (I32, [P, P]), 'LsaFreeReturnBuffer': (I32, [P])},
     'ws2_32': {
         'WSAStartup': (I32, [U16, P]), 'WSACleanup': (I32, []),
         'WSAGetLastError': (I32, []),

@@ -57,6 +57,8 @@ class Fn:
         fault = self.kernel.faults.get(self.name)
         if fault is not None:
             self.kernel.error = fault
+            if self.name in {'SetSecurityInfo', 'GetSecurityInfo'}:
+                return fault
             if self.name in {'WSAIoctl','connect','send','recv','select','getsockopt','ioctlsocket'}:
                 self.kernel.ws_error=fault
                 return -1
@@ -88,7 +90,11 @@ class Kernel:
         self.pending = {}
         self.exited = set()
         self.drive_type = 3
+        self.logons = {}  # pid -> (AuthenticationId, SessionId, SECURITY_LOGON_TYPE)
+        self.images = {}  # explicit executable paths for process image API tests
+        self.lsa_allocations = set()
         self.acls, self.descriptors = {}, {}
+        self.descriptor_acls = {}
         libraries = {name: SimpleNamespace(**{f: Fn(self, f, prototype) for f, prototype in functions.items()})
                      for name, functions in SDK.items()}
         self.api = WinApi(libraries, lambda: self.error)
@@ -136,32 +142,116 @@ class Kernel:
     def GetExitCodeProcess(self, handle, out):
         put(out, S.U32, 259)
         return 1
+    def QueryFullProcessImageNameW(self, handle, flags, output, size):
+        assert flags == 0
+        pid = self.record(handle)['pid']
+        if pid not in self.images:
+            return self.fail(5)
+        raw = self.images[pid].encode('utf-16-le', 'surrogatepass')
+        capacity = C.cast(size, C.POINTER(S.U32)).contents.value
+        if len(raw)//2 >= capacity:
+            return self.fail(122)
+        C.memmove(output, raw+b'\0\0', len(raw)+2)
+        put(size, S.U32, len(raw)//2)
+        return 1
     def OpenProcessToken(self, handle, access, out):
         assert access == 8
         pid = handle if handle == self.current else self.record(handle)['pid']
         put(out, S.H, self.alloc('token', pid=pid))
         return 1
     def GetTokenInformation(self, handle, kind, buf, size, needed):
-        fact = self.processes[self.record(handle)['pid']]
+        pid = self.record(handle)['pid']
+        fact = self.processes[pid]
         if kind == 1:
             put(needed, S.U32, 16)
             if not buf: return self.fail(122)
             ptr = self.buffer(C.create_string_buffer(fact[2]))
             put(buf, S.P, ptr)
+        elif kind == 10:
+            assert size == C.sizeof(S.TOKEN_STATISTICS)
+            value = C.cast(buf, C.POINTER(S.TOKEN_STATISTICS)).contents
+            luid, _, _ = self.logons.get(pid, (123, 1, 2))
+            value.TokenId.LowPart = 999  # must compare AuthenticationId, not TokenId
+            value.AuthenticationId.LowPart = luid & 0xffffffff
+            value.AuthenticationId.HighPart = luid >> 32
+            put(needed, S.U32, C.sizeof(value))
+        elif kind == 12:
+            assert size == 4
+            put(needed, S.U32, 4)
+            put(buf, S.U32, self.logons.get(pid, (123, 1, 2))[1])
         else:
             assert kind == 20 and size == 4
             put(needed, S.U32, 4)
             put(buf, S.U32, int(fact[3]))
         return 1
+    def LsaGetLogonSessionData(self, luid_pointer, out):
+        luid = C.cast(luid_pointer, C.POINTER(S.LUID)).contents
+        number = (luid.HighPart << 32) | luid.LowPart
+        _, session, kind = next((v for v in self.logons.values() if v[0] == number), (123, 1, 2))
+        row = S.SECURITY_LOGON_SESSION_PREFIX()
+        row.Size, row.LogonId = C.sizeof(row), luid
+        row.LogonType, row.Session = kind, session
+        row.UserName.Buffer = row.LogonDomain.Buffer = row.AuthenticationPackage.Buffer = 1
+        address = self.buffer(row)
+        self.lsa_allocations.add(address)
+        put(out, S.P, address)
+        return 0
+    def LsaFreeReturnBuffer(self, pointer):
+        assert pointer in self.lsa_allocations
+        self.lsa_allocations.remove(pointer)
+        return 0
     def IsValidSid(self, ptr): return 1 if ptr else 0
     def GetLengthSid(self, ptr): return 8 + C.string_at(ptr, 2)[1] * 4
     def ConvertSidToStringSidW(self, sid, out):
         put(out, S.P, self.buffer(S.wide('S-1-5-42')))
         return 1
     def ConvertStringSecurityDescriptorToSecurityDescriptorW(self, string, revision, out, size):
-        assert text(string) == 'O:S-1-5-42D:P(A;OICI;FA;;;S-1-5-42)(A;OICI;FA;;;SY)'
-        put(out, S.P, self.buffer(C.create_string_buffer(64)))
+        value = text(string)
+        assert value in {'O:S-1-5-42D:P(A;OICI;FA;;;S-1-5-42)(A;OICI;FA;;;SY)',
+                         'O:S-1-5-42D:P(A;;FA;;;S-1-5-42)(A;;FA;;;SY)'}
+        flags = 3 if 'OICI' in value else 0
+        entries = [(0, flags, 0x1f01ff, self.sid), (0, flags, 0x1f01ff, bytes.fromhex('010100000000000512000000'))]
+        raw = b''.join(struct.pack('<BBHI', k, f, 8+len(s), m)+s for k,f,m,s in entries)
+        acl = self.buffer(C.create_string_buffer(struct.pack('<BBHHH',2,0,8+len(raw),2,0)+raw))
+        sd = self.buffer(C.create_string_buffer(64))
+        self.descriptor_acls[sd] = acl
+        put(out, S.P, sd)
         return 1
+    def GetSecurityDescriptorDacl(self, descriptor, present, dacl, defaulted):
+        put(present, S.I32, 1);put(defaulted, S.I32, 0)
+        put(dacl, S.P, self.descriptor_acls[descriptor])
+        return 1
+    def SetSecurityInfo(self, handle, kind, flags, owner, group, dacl, sacl):
+        record = self.record(handle)
+        assert record['access'] & 0x40000, 'WRITE_DAC required'
+        assert (kind, flags, owner, group, sacl) == (1, 0x80000004, None, None, None)
+        revision, _, size, count, _ = struct.unpack('<BBHHH', C.string_at(dacl,8))
+        assert revision == 2 and dacl and 8 <= size <= 1024
+        entries, offset = [], 8
+        for _ in range(count):
+            k,f,n,m = struct.unpack('<BBHI', C.string_at(dacl+offset,8))
+            entries.append((k,f,m,C.string_at(dacl+offset+8,n-8)))
+            offset += n
+        assert offset == size
+        meta = self.files.setdefault(record['path'], {})
+        meta.update(aces=entries, protected=True, private=True, deny_data=False)
+        if record['kind'] == 'directory':
+            parent = Path(record['path'])
+            # Model inheritable ACEs on known private fixture objects, including
+            # hardlink aliases. Never enumerate an external directory tree.
+            for name, child in list(self.files.items()):
+                path = Path(name)
+                if path == parent or not path.is_relative_to(parent) or child.get('protected', True):
+                    continue
+                inherited = [(k, (f | 0x10) if path.is_dir() else 0x10, m, s)
+                             for k, f, m, s in entries if f & (2 if path.is_dir() else 1)]
+                explicit = [ace for ace in child.get('aces', []) if not ace[1] & 0x10]
+                child['aces'] = explicit + inherited
+                if path.is_file():
+                    for alias, other in list(self.files.items()):
+                        if alias != name and Path(alias).is_file() and os.path.samefile(path, alias):
+                            other['aces'] = list(child['aces'])
+        return 0
     def LocalFree(self, pointer): return 0
     def CoTaskMemFree(self, pointer): pass
     def SHGetKnownFolderPath(self, folder, flags, token, out):
@@ -200,8 +290,22 @@ class Kernel:
             assert flags & 0x40000000 and flags & 0x1f0000 == 0x110000
             return self.alloc('pipe',path=text(path))
         self._attributes(sa)
-        assert sharing == 3 and flags & 0x200000, 'no directory pin/reparse guard'
+        assert sharing in (0,3,7) and flags & 0x200000, 'no directory pin/reparse guard'
         p = Path(text(path))
+        # Owner metadata rights do not imply FILE_LIST_DIRECTORY/data access.
+        if self.files.get(str(p),{}).get('deny_data') and access & 0xc0000001:
+            self.error=5
+            return S.INVALID_HANDLE_VALUE
+        def data_access(mask):
+            return ((1 if mask & 0xb0000021 else 0) | (2 if mask & 0x50000006 else 0)
+                    | (4 if mask & 0x10010000 else 0))
+        wanted = data_access(access)
+        for record in self.handles.values():
+            existing = data_access(record.get('access', 0))
+            if (record.get('path') == str(p) and wanted and existing
+                    and (wanted & ~record.get('sharing', 0) or existing & ~sharing)):
+                self.error=32
+                return S.INVALID_HANDLE_VALUE
         if not p.exists() and disposition == 3:
             self.error = 2
             return S.INVALID_HANDLE_VALUE
@@ -246,6 +350,9 @@ class Kernel:
         meta = self.files.get(self.record(handle)['path'], {})
         sid = meta.get('owner', self.sid)
         put(owner, S.P, self.buffer(C.create_string_buffer(sid)))
+        if flags == 1:
+            put(descriptor, S.P, self.buffer(C.create_string_buffer(64)))
+            return 0
         default_sid = self.sid if meta.get('private', True) else bytes.fromhex('010100000000000100000000')
         entries = meta.get('aces', [(0, 3, 0x1f01ff, default_sid)])
         if entries is None:
@@ -306,16 +413,26 @@ class Kernel:
     def MoveFileExW(self, source, dest, flags):
         source, dest = text(source), text(dest)
         assert flags == 9
+        # Conservative MoveFileExW target model from third-party NTFS reports:
+        # even FILE_SHARE_DELETE does not permit replacing an occupied target.
+        if any(row.get('path') == dest for row in self.handles.values()):
+            return self.fail(5)
         # NTFS share checking excludes metadata-only handles (READ_CONTROL).
         for row in self.handles.values():
-            if (row.get('path') in (source, dest) and row.get('access', 0) & 0xF0010027
+            if (row.get('path') == source and row.get('access', 0) & 0xF0010027
                     and not row.get('sharing', 0) & 4):
                 return self.fail(32)
         os.replace(source, dest)
         self.files[dest] = self.files.pop(source, {})
         return 1
     def DeleteFileW(self, path):
-        Path(text(path)).unlink()
+        path = text(path)
+        for row in self.handles.values():
+            if (row.get('path') == path and row.get('access', 0) & 0xF0010027
+                    and not row.get('sharing', 0) & 4):
+                return self.fail(32)
+        Path(path).unlink()
+        self.files.pop(path, None)
         return 1
     def IsProcessInJob(self, process, job, out):
         put(out, S.I32, int(self.in_job))
@@ -378,6 +495,12 @@ class Kernel:
         return 1
     GetNamedPipeClientProcessId=GetNamedPipeServerProcessId
     def ReadFile(self, handle, buf, size, count, overlap):
+        record = self.record(handle)
+        if record['kind'] == 'file':
+            assert overlap is None and record['access'] & 1
+            data = os.read(record['fd'], size)
+            C.memmove(buf, data, len(data)); put(count, S.U32, len(data))
+            return 1
         if self.io_pending:
             self.pending[handle]=(overlap,buf,count,size)
             return self.fail(997)

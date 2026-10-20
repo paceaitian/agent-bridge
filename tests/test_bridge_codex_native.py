@@ -151,12 +151,12 @@ class NativeTests(unittest.TestCase):
                 finally:
                     daemon.close()
 
-    def test_cli_version_unavailable_still_does_not_connect(self):
+    def test_cli_version_unknown_initializes_and_reads(self):
         daemon = self.daemon()
-        with patch.object(codex_native, "BoundedConnection") as connection:
-            self.assertEqual(self.read(daemon, version=None), NativeBatch(reason="version_unavailable"))
-        connection.assert_not_called()
-        self.assertEqual(daemon.methods(), [])
+        self.assertEqual(self.read(daemon, version=None),
+                         NativeBatch({THREAD: ThreadMetadata("root")}, "ok", "0.162.1"))
+        self.assertEqual(daemon.received[0]["params"]["clientInfo"]["version"], "unknown")
+        self.assertEqual(daemon.methods(), ["initialize", "initialized", "thread/read"])
 
     def test_new_server_native_report_and_doctor_are_ok(self):
         daemon = self.daemon(version="0.163.0")

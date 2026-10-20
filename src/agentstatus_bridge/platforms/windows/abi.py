@@ -23,6 +23,26 @@ class FILETIME(C.Structure):
         return (int(self.high) << 32) | int(self.low)
 
 
+class LUID(C.Structure):
+    _fields_ = [('low', DWORD), ('high', C.c_int32)]
+
+
+class TOKEN_STATISTICS(C.Structure):
+    _fields_ = [('token', LUID), ('authentication', LUID), ('expiration', C.c_int64),
+                ('kind', C.c_int32), ('impersonation', C.c_int32), ('charged', DWORD),
+                ('available', DWORD), ('groups', DWORD), ('privileges', DWORD), ('modified', LUID)]
+
+
+class LSA_STRING(C.Structure):
+    _fields_ = [('length', WORD), ('maximum', WORD), ('buffer', PTR)]
+
+
+class LOGON_PREFIX(C.Structure):
+    # Only this numeric prefix is read, never dereference user/domain/auth strings.
+    _fields_ = [('size', DWORD), ('id', LUID), ('user', LSA_STRING),
+                ('domain', LSA_STRING), ('auth', LSA_STRING), ('kind', DWORD), ('session', DWORD)]
+
+
 class SECURITY_ATTRIBUTES(C.Structure):
     _fields_ = [('length', DWORD), ('descriptor', PTR), ('inherit', BOOL)]
 
@@ -72,11 +92,12 @@ def wide(value: str) -> C.Array:
     return (WCHAR * (len(raw) // 2)).from_buffer_copy(raw)
 
 
-def read_wide(value: C.Array) -> str:
-    units = list(value)
-    if 0 in units:
-        units = units[:units.index(0)]
-    return b''.join(int(u).to_bytes(2, 'little') for u in units).decode('utf-16-le', 'surrogatepass')
+def read_wide(value: C.Array, length: int | None = None) -> str:
+    count = len(value) if length is None else length
+    if not 0 <= count <= len(value):
+        raise ValueError('wide_length_invalid')
+    raw = C.string_at(C.addressof(value), count * C.sizeof(WCHAR))
+    return raw.decode('utf-16-le', 'surrogatepass').partition('\0')[0]
 
 
 # 每个实际调用都显式声明；不依赖ctypes默认c_int，尤其HANDLE/SOCKET。
@@ -85,6 +106,7 @@ SIGNATURES = {
         'GetCurrentProcess': (HANDLE, []), 'GetCurrentProcessId': (DWORD, []),
         'OpenProcess': (HANDLE, [DWORD, BOOL, DWORD]), 'CloseHandle': (BOOL, [HANDLE]),
         'GetProcessTimes': (BOOL, [HANDLE, PTR, PTR, PTR, PTR]),
+        'QueryFullProcessImageNameW': (BOOL, [HANDLE, DWORD, PTR, PTR]),
         'GetExitCodeProcess': (BOOL, [HANDLE, PTR]),
         'CreateToolhelp32Snapshot': (HANDLE, [DWORD, DWORD]),
         'Process32FirstW': (BOOL, [HANDLE, PTR]), 'Process32NextW': (BOOL, [HANDLE, PTR]),
@@ -122,10 +144,14 @@ SIGNATURES = {
         'ConvertStringSecurityDescriptorToSecurityDescriptorW': (BOOL, [PTR, DWORD, PTR, PTR]),
         'GetSecurityInfo': (DWORD, [HANDLE, DWORD, DWORD, PTR, PTR, PTR, PTR, PTR]),
         'GetSecurityDescriptorControl': (BOOL, [PTR, PTR, PTR]),
+        'GetSecurityDescriptorDacl': (BOOL, [PTR, PTR, PTR, PTR]),
+        'SetSecurityInfo': (DWORD, [HANDLE, DWORD, DWORD, PTR, PTR, PTR, PTR]),
         'GetAce': (BOOL, [PTR, DWORD, PTR]),
     },
     'shell32': {'SHGetKnownFolderPath': (C.c_int32, [PTR, DWORD, HANDLE, PTR])},
     'ole32': {'CoTaskMemFree': (None, [PTR])},
+    'secur32': {'LsaGetLogonSessionData': (C.c_int32, [PTR, PTR]),
+               'LsaFreeReturnBuffer': (C.c_int32, [PTR])},
     'ws2_32': {
         'WSAStartup': (C.c_int32, [WORD, PTR]), 'WSACleanup': (C.c_int32, []),
         'WSAGetLastError': (C.c_int32, []),

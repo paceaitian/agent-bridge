@@ -111,17 +111,16 @@ class DeleteProtocolTests(unittest.TestCase):
                 finally:
                     daemon.close()
 
-    def test_cli_version_unavailable_still_does_not_connect_or_send(self):
-        daemon = NativeDaemon(self.root)
+    def test_cli_version_unknown_initializes_and_deletes(self):
+        daemon = NativeDaemon(self.root, replies=lambda _: {"result": {"deleted": True}})
         self.addCleanup(daemon.close)
-        with patch.object(codex_withdraw, "BoundedConnection") as connection:
-            result = QueueDeleteClient(lambda _: None).delete(daemon.home,
-                thread=THREAD, item=ITEM.lower(), root_identity=local_codex.platform().root_identity(daemon.home),
-                before_send=lambda budget: self.boundaries.append("sending"))
-        self.assertEqual(result, DeleteResult("not_attempted", "version_unavailable"))
-        connection.assert_not_called()
-        self.assertEqual(self.boundaries, [])
-        self.assertEqual(daemon.methods(), [])
+        result = QueueDeleteClient(lambda _: None).delete(daemon.home,
+            thread=THREAD, item=ITEM.lower(), root_identity=local_codex.platform().root_identity(daemon.home),
+            before_send=lambda budget: self.boundaries.append("sending"))
+        self.assertEqual(result, DeleteResult("deleted", "deleted", "0.162.1"))
+        self.assertEqual(daemon.received[0]["params"]["clientInfo"]["version"], "unknown")
+        self.assertEqual(self.boundaries, ["sending"])
+        self.assertEqual(daemon.methods(), ["initialize", "initialized", "thread/queue/delete"])
 
     def test_errors_do_not_claim_original_undelivered(self):
         rows = ((-32601, "missing", "refused"), (-32600, "thread not found: fixture", "refused"),

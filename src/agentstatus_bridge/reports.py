@@ -38,6 +38,7 @@ from .model import (
 from .labels import next_step
 from .paths import codex_home as default_codex_home
 from .store import MAX_BODY_BYTES, MAX_FILES, Store, StoreError
+from .notification_policy import can_notify, wire_ref
 
 MAX_NOTE_CHARS = 4000
 MAX_HASH_BYTES = 256 * 1024 * 1024
@@ -153,7 +154,7 @@ def _fit_body(lines: list[str], tail: str) -> str:
 
 def review_request_body(implement: Attempt, result: dict[str, object]) -> str:
     """复核请求：固定结果在前，原始任务要求在后。"""
-    lines = [f"请复核 {implement.target.display()} 完成的这项工作。", "", "【结果】"]
+    lines = [f"请复核 {wire_ref(implement.target).display()} 完成的这项工作。", "", "【结果】"]
     lines.extend(_describe_result(result) or ["（对方未附说明）"])
     lines.extend(["", "【原始任务要求】"])
     return _fit_body(lines, implement.body.rstrip())
@@ -164,7 +165,7 @@ def notice_body(
 ) -> str:
     """回告发起方的结果通知；next_text 是写入后任务阶段对应的下一步（DESIGN §45.28.2）。"""
     title = f"「{task.title}」" if task.title else ""
-    lines = [f"你发起的任务{title}{REPORT_LABELS[kind]}（{attempt.target.display()}）。"]
+    lines = [f"你发起的任务{title}{REPORT_LABELS[kind]}（{wire_ref(attempt.target).display()}）。"]
     lines.extend(_describe_result(result))
     if next_text:
         lines.append(f"下一步：{next_text}")
@@ -211,6 +212,15 @@ def _attribute(
     if caller.rejection == "subagent":
         # Codex 子代理不能代替根会话汇报：与根会话自己的汇报撞 result_already_submitted（DESIGN §45.48 R3）
         raise ReportError("reporter_is_subagent")
+    if get_platform().name == 'windows':
+        if caller.rejection is not None or (caller.endpoint is None and not caller.is_user_shell):
+            raise ReportError('caller_unattributed')
+        if caller.endpoint is not None:
+            if not caller.endpoint.ref.same_session(attempt.target):
+                raise ReportError('reporter_mismatch')
+            # Current authenticated loaded-root attribution already proves the
+            # caller's daemon generation. Historical daemon death is not revocation.
+            return 'agent'
     if caller.endpoint is not None and caller.endpoint.ref.native_id == UNRESOLVED_NATIVE_ID:
         # 认不出是哪个 thread 不是身份（§45.48 R5）：按未归属报，不说成「不是收件会话」
         raise ReportError("reporter_unattributed")
@@ -336,6 +346,8 @@ def apply_report(
             and current_task.flow is Flow.REVIEW
             and current_task.reviewer is not None
         ):
+            if not can_notify(current_task.reviewer):
+                raise ReportError('target_no_inbox')  # rolls back result and auto-review together
             followups.append(
                 store.add_attempt(
                     task.id,
@@ -354,6 +366,7 @@ def apply_report(
             kind in (ReportKind.RESULT, ReportKind.BLOCKED, ReportKind.FAILED, ReportKind.APPROVE, ReportKind.CHANGES)
             and current_task.origin is not None
             and current_task.notify_origin
+            and can_notify(current_task.origin)
             and not current_task.origin.same_session(attempt.target)
         ):
             # 发起方最容易忘的是收尾：按本次写入后的阶段写明下一步（验收/返工/关闭），事务内读得到刚写入的状态
@@ -371,6 +384,10 @@ def apply_report(
                     sender_class=caller_class,
                 )
             )
+        elif (current_task.origin is not None and not can_notify(current_task.origin)
+              and kind in (ReportKind.RESULT, ReportKind.BLOCKED, ReportKind.FAILED, ReportKind.APPROVE, ReportKind.CHANGES)):
+            store.add_event(task.id, 'notification_skipped', now=now, attempt_seq=attempt.seq,
+                            detail={'reason': 'poll_only', 'route': 'result'})
     refreshed = store.get_task(task.id)
     updated = store.get_attempt(attempt.id)
     if refreshed is None or updated is None:

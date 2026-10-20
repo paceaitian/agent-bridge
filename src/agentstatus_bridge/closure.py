@@ -20,6 +20,7 @@ from .model import (
 )
 from .naming import command_name
 from .store import Store, StoreError
+from .notification_policy import can_notify
 
 ACCEPTED = "accepted"
 CLOSED = "closed"
@@ -65,6 +66,7 @@ def delivered_endpoint(attempt: Attempt) -> EndpointRef:
         pane=pane if isinstance(pane, str) else None,
         label=target.label,
         server_pid=server if isinstance(server, int) and not isinstance(server, bool) else None,
+        data_root=target.data_root,
     )
 
 
@@ -115,6 +117,10 @@ def queue_closures(
     queued: list[Attempt] = []
     skipped: list[tuple[Recipient, str]] = []
     for recipient in closure_recipients(task, attempts):
+        if not can_notify(recipient.target):
+            store.add_event(task.id, 'notification_skipped', now=now, attempt_seq=recipient.source.seq,
+                            detail={'reason': 'target_no_inbox', 'route': state})
+            continue
         options: dict[str, Any] = {
             NOTICE_KIND_OPTION: CLOSURE_KIND,
             CLOSURE_STATE_OPTION: state,

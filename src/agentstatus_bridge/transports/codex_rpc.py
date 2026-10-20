@@ -173,6 +173,8 @@ def queue_add(
     clock: Callable[[], float] | None = None,
 ) -> RpcFallback | RpcResult:
     """经 daemon 发一条 `thread/queue/add`；见模块说明里的边界。"""
+    if not local_codex.platform().supported:
+        return RpcResult(Delivery.FAILED, 'windows_provider_not_enabled', UNKNOWN_VERSION)
     now = clock or time.monotonic
     try:
         target = resolve_socket(link)

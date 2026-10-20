@@ -10,6 +10,11 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = ('test_bridge_windows', 'test_bridge_windows_streams',
+           'test_bridge_windows_codex',
+           'test_bridge_windows_discovery',
+           'test_bridge_windows_callers',
+           'test_bridge_windows_delivery',
+           'test_bridge_windows_boundaries',
            'test_bridge_registration', 'test_bridge_labels', 'test_bridge_hints',
            'test_bridge_windows_native')
 

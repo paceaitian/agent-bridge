@@ -156,6 +156,8 @@ class EndpointRef:
     label: str | None = None
     # 所在 tmux server 的 PID：observer 的 Codex 会话键含它（DESIGN §45.14）；旧记录没有
     server_pid: int | None = None
+    # Windows only: bound CODEX_HOME/SQL file identity, never a label or path.
+    data_root: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """序列化为账本字段。"""
@@ -169,6 +171,8 @@ class EndpointRef:
         }
         if self.server_pid is not None:
             data["tmuxServerPid"] = self.server_pid
+        if self.data_root is not None:
+            data['dataRoot'] = self.data_root
         return data
 
     def to_json(self) -> str:
@@ -206,6 +210,8 @@ class EndpointRef:
             pane=pane if isinstance(pane, str) else None,
             label=label if isinstance(label, str) else None,
             server_pid=server if isinstance(server, int) and not isinstance(server, bool) and server > 0 else None,
+            data_root=data.get('dataRoot') if isinstance(data.get('dataRoot'), str)
+            and re.fullmatch(r'[0-9a-f]{64}', data['dataRoot']) else None,
         )
 
     @classmethod
@@ -238,6 +244,7 @@ class EndpointRef:
             self.provider is other.provider
             and self.native_id == other.native_id
             and self.native_id != UNRESOLVED_NATIVE_ID
+            and self.data_root == other.data_root
         )
 
 

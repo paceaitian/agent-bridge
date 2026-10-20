@@ -1,9 +1,22 @@
 """未获资格的T不产生连接或listener。"""
 from pathlib import Path
+from contextlib import contextmanager
+from collections.abc import Iterator
 from .transport_types import ByteStream, LocalFailure, Inbox
 
 class UnsupportedPlatform:
     supported = False
+    def codex_cli_version(self) -> str | None:
+        return None
+
+    @contextmanager
+    def codex_read_scope(self, version: str) -> Iterator[None]:
+        raise OSError('platform_unsupported')
+        yield
+
+    def logon_info(self, stream: ByteStream) -> dict[str, object]:
+        return {'logonType': 'UNKNOWN'}
+
     def control_socket_path(self, home: Path) -> Path:
         return home / "app-server-control" / "app-server-control.sock"
 

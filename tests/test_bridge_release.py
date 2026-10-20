@@ -132,8 +132,9 @@ class ReleaseTests(unittest.TestCase):
 
     def test_ci_selection_covers_fake_and_native_without_linux_suite(self):
         ci=load('verify-bridge-windows')
-        self.assertEqual(set(ci.MODULES),{'test_bridge_windows','test_bridge_windows_streams',
-            'test_bridge_registration','test_bridge_labels','test_bridge_hints','test_bridge_windows_native'})
+        self.assertEqual(set(ci.MODULES),{'test_bridge_windows','test_bridge_windows_streams','test_bridge_windows_codex','test_bridge_windows_discovery',
+            'test_bridge_registration','test_bridge_labels','test_bridge_hints','test_bridge_windows_native','test_bridge_windows_callers',
+            'test_bridge_windows_delivery','test_bridge_windows_boundaries'})
         for name in ci.MODULES:self.assertTrue((ROOT/'tests'/f'{name}.py').is_file())
         native=(ROOT/'tests/test_bridge_windows_native.py').read_text()
         self.assertIn('if api.token(api.k.GetCurrentProcess()).elevated:',native)

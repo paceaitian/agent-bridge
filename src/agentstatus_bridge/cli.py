@@ -71,6 +71,7 @@ from .closure import ACCEPTED, CLOSED, ClosureOutcome, queue_closures
 from .dispatch import needs_worker, select_generation
 from .doctor import collect_checks, print_checks
 from .views import (
+    _no_pane_warning,
     _NO_HINT,
     _TargetHint,
     _age,
@@ -86,6 +87,7 @@ from .worker import ensure_worker, run_worker, wait_for_worker, worker_running
 from .transports import local_codex
 from .transports.codex_queue import cli_version
 from .transports.codex_withdraw import QueueDeleteClient
+from .notification_policy import can_notify, receipt_options
 
 EXIT_OK = 0
 EXIT_TARGET = 2
@@ -191,6 +193,8 @@ def _check_sender(caller: Caller) -> None:
 
 
 def _check_target(endpoint: Endpoint, *, allow_shared: bool) -> None:
+    if not can_notify(endpoint.ref):
+        raise CliError('target_no_inbox')
     blocking = endpoint.blocking_issues
     if blocking:
         raise CliError(f"target_{blocking[0]}")
@@ -199,6 +203,9 @@ def _check_target(endpoint: Endpoint, *, allow_shared: bool) -> None:
 
 
 def _resolve(selector: str, endpoints: list[Endpoint]) -> Endpoint:
+    if get_platform().name == 'windows':
+        from .platforms.windows.commands import resolve  # layout: allow Windows完整loaded名称解析，不改变Linux选择器
+        return resolve(selector)
     try:
         return resolve_target(selector, endpoints)
     except ResolveError as error:
@@ -392,12 +399,25 @@ def _read_body(args: argparse.Namespace) -> str:
             raise CliError("file_unreadable") from error
         if data is None:
             raise CliError("message_too_large")
+        if get_platform().name == 'windows':
+            return _windows_body(data)
         return data.decode("utf-8", errors="replace")
     if args.message == "-" or (args.message is None and not sys.stdin.isatty()):
+        if get_platform().name == 'windows':
+            return _windows_body(sys.stdin.buffer.read(MAX_BODY_BYTES + 1))
         return sys.stdin.read(MAX_BODY_BYTES + 1)
     if args.message is None:
         raise CliError("empty_message")
     return args.message
+
+
+def _windows_body(data: bytes) -> str:
+    if len(data) > MAX_BODY_BYTES:
+        raise CliError('message_too_large')
+    try:
+        return data.decode('utf-8', errors='strict')
+    except UnicodeDecodeError as error:
+        raise CliError('message_invalid_utf8') from error
 
 
 def _wait_first_delivery(store: Store, task_id: str, timeout: float) -> Attempt | None:
@@ -439,6 +459,10 @@ def cmd_send(args: argparse.Namespace) -> int:
         if reviewer.ref.same_session(target.ref):
             raise CliError("reviewer_is_target")
     origin = caller.endpoint.ref if caller.endpoint is not None else None
+    try:
+        receipts = receipt_options(origin, no_notify=args.no_notify)
+    except ValueError as error:
+        raise CliError(str(error)) from error
     origin_class = permission_class(caller)
     first_line = body.strip().splitlines()[0] if body.strip() else ""
     title = (args.title or first_line)[:60]
@@ -455,7 +479,7 @@ def cmd_send(args: argparse.Namespace) -> int:
                 body=body,
                 refs=refs,
                 now=now,
-                task_options={"notify": not args.no_notify, "allowShared": bool(args.allow_shared)},
+                task_options={"notify": not args.no_notify, "allowShared": bool(args.allow_shared), **receipts},
                 attempt_options={"allowShared": bool(args.allow_shared)},
             )
         except StoreError as error:
@@ -476,6 +500,11 @@ def cmd_send(args: argparse.Namespace) -> int:
             _print_json(document)
         else:
             print(f"任务 {short(task.id)} 已交给 {target.ref.display()}：{DELIVERY_LABELS[current.delivery]}")
+            warning = _no_pane_warning([current])
+            if warning is not None:
+                print(warning)
+            if receipts.get('receiptMode') == 'poll_only':
+                print('回执方式：poll_only；用 status / wait 读取，不推送通知。')
             if current.delivery is Delivery.PENDING:
                 # 不再按忙闲扣留（§45.42）：还是 PENDING 只说明 worker 还没轮到它
                 if worker_up:
@@ -539,7 +568,11 @@ def cmd_tasks(args: argparse.Namespace) -> int:
 
 def _task(store: Store, reference: str) -> Task:
     try:
-        return store.resolve_task(reference)
+        task = store.resolve_task(reference)
+        if get_platform().name == 'windows':
+            from .platforms.windows.commands import check_task  # layout: allow 本地读后、业务变更前的Windows能力核对
+            check_task(task, store.attempts(task.id))
+        return task
     except StoreError as error:
         raise CliError(error.code, _exit_for_store_error(error.code)) from error
 
@@ -576,6 +609,8 @@ def cmd_report(args: argparse.Namespace) -> int:
     endpoints = discover()
     caller = identify_caller(endpoints)
     with _open_store() as store:
+        if get_platform().name == 'windows':
+            _task(store, args.task)  # Windows root/capability check before apply_report's transaction
         try:
             outcome = apply_report(
                 store,
@@ -613,9 +648,13 @@ def cmd_report(args: argparse.Namespace) -> int:
 def cmd_wait(args: argparse.Namespace) -> int:
     deadline = time.monotonic() + args.timeout
     rounds = 0
-    with _open_store() as store:
+    opener = _open_store
+    if get_platform().name == 'windows':
+        from .platforms.windows.local_store import open_store  # layout: allow Windows wait只读，不配置/迁移账本
+        opener = open_store
+    with opener() as store:
         while True:
-            if rounds % 10 == 0:
+            if rounds % 10 == 0 and get_platform().name != 'windows':
                 _revive_worker(store, time.time())
             rounds += 1
             task = _task(store, args.task)
@@ -658,8 +697,11 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
 
 def cmd_pause(args: argparse.Namespace) -> int:
+    caller = identify_caller(discover()) if get_platform().name == 'windows' else None
     with _open_store() as store:
         task = _task(store, args.task)
+        if caller is not None and not _may_decide(caller, task):
+            raise CliError('accept_not_allowed')
         if task.finished:
             raise CliError("task_finished")
         store.update_task(task.id, now=time.time(), event="paused", control="paused")
@@ -668,8 +710,11 @@ def cmd_pause(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    caller = identify_caller(discover()) if get_platform().name == 'windows' else None
     with _open_store() as store:
         task = _task(store, args.task)
+        if caller is not None and not _may_decide(caller, task):
+            raise CliError('accept_not_allowed')
         if task.finished:
             raise CliError("task_finished")
         if not task.paused:
@@ -688,9 +733,12 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
+    caller = identify_caller(discover()) if get_platform().name == 'windows' else None
     now = time.time()
     with _open_store() as store:
         task = _task(store, args.task)
+        if caller is not None and not _may_decide(caller, task):
+            raise CliError('accept_not_allowed')
         cancelled = 0
         for attempt in store.attempts(task.id):
             if store.transition_delivery(
@@ -713,7 +761,8 @@ def _may_decide(caller: Caller, task: Task) -> bool:
 def _closure_decider(caller: Caller) -> tuple[EndpointRef | None, str]:
     """结束回执以谁的名义发出：决定者所在会话（用户在终端时为空）与正文里的显示名。"""
     if caller.endpoint is not None:
-        return caller.endpoint.ref, caller.endpoint.ref.display()
+        from .notification_policy import wire_ref  # layout: allow Windows自动通知不携原生label，Linux原样
+        return caller.endpoint.ref, wire_ref(caller.endpoint.ref).display()
     return None, "用户"
 
 
@@ -961,6 +1010,8 @@ def _retry_in_transaction(
         if live is not None:
             _check_target(live, allow_shared=allow_shared)
             target_ref = live.ref
+        elif get_platform().name == 'windows':
+            raise CliError('target_not_found', EXIT_TARGET)
     # 先作废再追加：全局尝试槽有上限，别让即将作废的回执占着位置（Codex 复审 F01）。
     # 返工意味着「这个结果不作数」，还没发出的通知随之作废；已经发出去的不追，那是对方已经看到的事实。
     # **不再额外排除结束回执**：结束回执只在 accept/close 的事务里与 accepted_at/closed_at 同写，
@@ -993,7 +1044,12 @@ def _retry_in_transaction(
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
-    return run_worker(once=args.once)
+    try:
+        return run_worker(once=args.once)
+    except OSError as error:
+        if get_platform().name != 'windows':
+            raise
+        raise CliError('worker_identity_unverified', EXIT_STORE) from error
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -1014,7 +1070,6 @@ def _refresh_summary(*, force: bool = False, revive: bool = False) -> summary.Pu
 
     revive：命令结束后若还有待办（含未到期的发起方提醒）而 worker 不在（崩溃、重启），顺手拉起（DESIGN §45.28.3）。
     """
-    revive = revive and get_platform().name != 'windows'
     try:
         root = state_dir()
         if get_platform().name == 'windows':
@@ -1091,12 +1146,15 @@ def cmd_summary(args: argparse.Namespace) -> int:
 
 
 def _report_error(args: argparse.Namespace, code: str) -> None:
-    print(f"{command_name()}: {reason_text(code)} [{code}]", file=sys.stderr)
+    message = reason_text(code)
+    if code == 'caller_unattributed' and get_platform().name == 'windows':
+        message += '；Windows 仅支持已认出的 Codex 根会话发起；Claude 发起尚未开放，终端手动发起不提供资格，--manual 不能绕过'
+    print(f"{command_name()}: {message} [{code}]", file=sys.stderr)
     if getattr(args, "json_errors", False) and getattr(args, "json", False):
-        _print_json({"ok": False, "code": code, "reasonText": reason_text(code)})
+        _print_json({"ok": False, "code": code, "reasonText": message})
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     prog = command_name()
     parser = argparse.ArgumentParser(prog=prog, description="AgentStatus 协作桥：在本机 agent 会话之间交接任务")
     parser.add_argument("--version", action="version", version=f"{prog} {__version__}")
@@ -1210,14 +1268,43 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="检查协作桥运行环境")
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(handler=cmd_doctor)
+    try:
+        include_alias = include_alias or get_platform().name == 'windows'
+    except ValueError:
+        pass  # main maps platform_unsupported, including help-free invocations
+    if not include_alias:
+        return parser  # Linux legacy help/errors remain byte-for-byte unchanged
+    aliases = commands.add_parser('alias', help='Windows 本地目标别名（不开放投递）')
+    actions = aliases.add_subparsers(dest='alias_action', required=True)
+    for action in ('set', 'list', 'rm'):
+        sub = actions.add_parser(action)
+        if action != 'list':
+            sub.add_argument('name')
+        if action == 'set':
+            sub.add_argument('target')
+        sub.add_argument('--json', action='store_true')
+        sub.set_defaults(json_errors=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        windows = get_platform().name == 'windows'
+    except ValueError:
+        windows = False
+    if windows:
+        from .platforms.windows.stdio import output_scope  # layout: allow Windows入口编码；Linux输出字节原样
+        with output_scope():
+            return _main(argv)
+    return _main(argv)
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
     """命令入口；错误以固定原因码和可读说明输出到 stderr。"""
     global _worker_ensured
     _worker_ensured = False
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser(include_alias=bool(raw and raw[0] == 'alias')).parse_args(raw)
     try:
         platform = get_platform()
     except ValueError as error:
@@ -1226,21 +1313,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         _report_error(args, 'platform_unsupported')
         return EXIT_REJECTED
     with using_platform(platform):
+        if platform.name == 'windows' and args.command != 'alias':
+            from .platforms.windows.commands import scope  # layout: allow 命令级资格先于任何账本写入
+            from .transports.codex_native import NativeFailure  # layout: allow 固定原因投影，不透传原始错误
+            try:
+                with scope(args):
+                    return _run_command(args)
+            except NativeFailure as error:
+                _report_error(args, error.reason)
+                if error.reason in {'target_ambiguous','target_changed','target_names_unverified','target_not_found'}:
+                    print('目标未发送；请刷新 peers，用 codex@id:<完整UUID> 或 owner 别名消歧。', file=sys.stderr)
+                if error.reason == 'windows_provider_not_enabled':
+                    return EXIT_NOT_ENABLED
+                return EXIT_TARGET if error.reason.startswith(('target_', 'alias_')) else EXIT_REJECTED
         return _run_command(args)
 
 
 def _run_command(args: argparse.Namespace) -> int:
+    if args.command == 'alias':
+        if get_platform().name != 'windows':
+            _report_error(args, 'alias_platform_unsupported')
+            return EXIT_REJECTED
+        from .platforms.windows.alias_command import run, AliasError  # layout: allow Windows本地别名，不开账本
+        try:
+            return run(args)
+        except AliasError as error:
+            _report_error(args, error.code)
+            return error.exit_code
     if get_platform().name == 'windows':
-        # Before body/ref reads, ledger/summary, caller sampling, or finally/revive.
-        if args.command not in {'doctor', 'tasks', 'status', 'summary', 'peers'}:
-            _report_error(args, 'windows_provider_not_enabled')
-            return EXIT_NOT_ENABLED
+        # main's Windows scope has already checked capability and attribution.
         if args.command == 'peers':
-            value = {'peers': [], 'discovery': 'unverified', 'providerEnabled': False}
-            _print_json(value) if args.json else print('Windows 会话发现未验证；未开放投递。')
+            from .platforms.windows import codex_discovery  # layout: allow Windows只读候选，Linux路径与构造不加载
+            from .platforms.windows.local_transport import WindowsPlatform  # layout: allow 已选择后端的窄能力
+            backend = get_platform().transport
+            result = codex_discovery.discover(backend) if isinstance(backend, WindowsPlatform) else codex_discovery.Discovery()
+            _print_json(result.document()) if args.json else codex_discovery.print_peers(result)
             return EXIT_OK
     # 任一调用前后补查摘要：提交后未发布（进程被杀、锁超时）的窗口由下一次调用收敛；worker 与 summary 自行处理
-    refresh = args.command not in {"worker", "summary"}
+    refresh = args.command not in {"worker", "summary"} and not (get_platform().name == 'windows' and args.command == 'wait')
     if refresh:
         _refresh_summary()
     try:

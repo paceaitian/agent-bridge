@@ -1,9 +1,11 @@
-"""Windows L：LockFileEx原语；生产spawn仍关闭，fixture显式使用自己的入口。"""
+"""Windows L：LockFileEx、带代际/镜像回执的W2 worker与单独fixture入口。"""
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 import os
 import sys
 import time
+import secrets
+import signal
 from types import FrameType
 from typing import Any
 
@@ -20,10 +22,12 @@ class WindowsLifecycle:
         lease.__enter__()
         handle: int | None = None
         try:
-            handle = self.api.open_file(str(path), create=True, write=True)
+            handle = self.files.open_private_file(path, create=True, write=True)
             assert handle is not None
-            self.api.check_private(handle)
-            self.api.file_info(handle)
+            info = self.api.file_info(handle)
+            if info.attributes & 0x10 or info.links != 1:
+                raise OSError('windows_file_untrusted')
+            self.files.ensure_private(handle, path)
             self._leases[handle] = lease
             return handle
         except BaseException:
@@ -65,24 +69,61 @@ class WindowsLifecycle:
         return env
 
     def spawn_worker(self, directory: Path, env: Mapping[str, str]) -> None:
-        raise OSError('windows_provider_not_enabled')
+        from . import worker_identity as identity  # layout: allow 真实worker代际和镜像，不复用fixture入口
+        with self.files.lease(directory):
+            expected_image = identity.image_identity(self.files, identity.executable())
+            launch = dict(env)
+            launch[identity.TOKEN_ENV] = token = secrets.token_hex(16)
+            child = self._spawn([str(identity.executable()), '-m', 'agentstatus_bridge', 'worker'],
+                                directory, launch)
+            fact = self.api.process(child.pid)
+            deadline = time.monotonic()+10.0
+            while True:
+                try:
+                    identity.verify(self.files, directory, pid=child.pid, birth=str(fact.birth), token=token,
+                                    expected_image=expected_image)
+                    return
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise OSError('worker_identity_unverified')
+                    time.sleep(0.05)
 
     def spawn_fixture(self, script: Path, directory: Path, *, popen: Any = None) -> Any:
-        import subprocess  # layout: allow 首次fixture spawn才导入，Linux subprocess本身会加载fcntl
-        popen = popen or subprocess.Popen
         self.files.validate_file(script)
         with self.files.lease(directory):
-            return popen([sys.executable, str(script)], cwd=str(directory),
-                         env=self.worker_environment(os.environ), stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
-                         creationflags=0x00000008 | 0x00000200)  # DETACHED + NEW_GROUP; never BREAKAWAY
+            return self._spawn([sys.executable, str(script)], directory, self.worker_environment(os.environ), popen)
+
+    def _spawn(self, argv: list[str], directory: Path, env: Mapping[str, str], popen: Any = None) -> Any:
+        import subprocess  # layout: allow 两条显式spawn入口共用；仍有可登记的字面Popen调用
+        from .worker_identity import BREAKAWAY_ENV  # layout: allow 私有启动回执的观察字段
+        launch = dict(env)
+        launch[BREAKAWAY_ENV] = 'requested'
+        def create(flags: int) -> Any:
+            if popen is not None:  # explicit fixture injection, never production
+                return popen(argv, cwd=str(directory), env=dict(launch), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags)
+            return subprocess.Popen(argv, cwd=str(directory), env=dict(launch), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags)
+        try:
+            return create(0x01000208)
+        except OSError as error:
+            if getattr(error, 'winerror', None) != 5:
+                raise
+            launch[BREAKAWAY_ENV] = 'denied_fallback'
+            return create(0x00000208)
 
     def install_stop(self, handler: Callable[[int, FrameType | None], None]) -> dict[int, object]:
-        raise OSError('windows_provider_not_enabled')
+        return {number: signal.signal(number, handler) for number in (signal.SIGINT, signal.SIGTERM)}
 
     def restore_stop(self, previous: Mapping[int, object]) -> None:
-        if previous:
-            raise OSError('windows_provider_not_enabled')
+        for number, handler in previous.items():
+            signal.signal(number, handler)  # type: ignore[arg-type]
 
     def run_capture(self, argv: Sequence[str], timeout: float, *, replace_errors: bool = False) -> Any:
-        raise OSError('windows_provider_not_enabled')
+        # Only report's read-only commit validation, never codex queue fallback.
+        if (len(argv) != 7 or argv[0] != 'git' or argv[1] != '-C'
+                or list(argv[3:6]) != ['rev-parse', '--verify', '--quiet'] or not argv[6].endswith('^{commit}')):
+            raise OSError('windows_provider_not_enabled')
+        import subprocess  # layout: allow 只读提交号核验，显式编码
+        return subprocess.run(list(argv), stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, encoding='utf-8', errors='replace', timeout=timeout, check=False)

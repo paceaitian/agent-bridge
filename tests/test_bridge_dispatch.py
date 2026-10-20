@@ -41,6 +41,19 @@ from bridge_support import RecordingTransport, endpoint, ref
 
 
 class DispatchTests(unittest.TestCase):
+    def test_linux_pending_uses_discovery_cache(self) -> None:
+        from unittest.mock import Mock
+        self._task(ref())
+        sampler = Mock(return_value=[])
+        self.dispatcher.discover = sampler
+        for tick in (1000.0, 1000.5, 1001.0):
+            self.now = tick
+            self.dispatcher.run_once()  # do not clear _endpoints_at as _run does
+        sampler.assert_called_once()
+        self.now = 1003.0
+        self.dispatcher.run_once()
+        self.assertEqual(sampler.call_count, 2)
+
     def setUp(self) -> None:
         self._tmp = TemporaryDirectory()
         # 补丁打在 dispatch 引用的 device_name 上、不给 Dispatcher 显式传 device：

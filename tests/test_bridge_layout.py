@@ -42,6 +42,8 @@ KNOWN_PACKAGES = frozenset({PACKAGE, "agentstatus"})
 
 # 搬移登记表：「旧模块:名字 → 新模块:名字」，模块名相对包根
 MOVED: tuple[str, ...] = (
+    "platforms.windows.codex_sql:pinned_file → platforms.windows.private_file:pinned_file",
+    "endpoints:Caller → caller_values:Caller",
     "paths:STATE_DIR_ENV → platforms.path_values:STATE_DIR_ENV",
     "paths:BINDING_ENV → platforms.path_values:BINDING_ENV",
     "paths:CLAUDE_SESSIONS_ENV → platforms.path_values:CLAUDE_SESSIONS_ENV",

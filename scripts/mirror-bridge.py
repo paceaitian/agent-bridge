@@ -44,7 +44,7 @@ PORTABLE_TOOLS = ('scripts/mirror-bridge.py', 'scripts/build-bridge.py',
 def _test_candidates(root: Path) -> list[Path]:
     """可能属于桥的测试文件：命名约定 + 共享支撑模块。"""
     tests = sorted((root / "tests").glob("test_bridge_*.py"))
-    for name in ("bridge_support.py", "bridge_platform_guard.py", "bridge_winapi.py", "bridge_winapi_sdk.py"):
+    for name in ("bridge_support.py", "bridge_platform_guard.py", "bridge_winapi.py", "bridge_winapi_sdk.py", "bridge_short_socket.py", "bridge_short_socket_guard.py"):
         support = root / "tests" / name
         if support.is_file():
             tests.append(support)

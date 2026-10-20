@@ -6,8 +6,11 @@ from dataclasses import dataclass, field
 from collections.abc import Iterator, Callable, Mapping
 from typing import Any
 import uuid
+from time import monotonic, sleep
 
 from . import abi as A
+
+REPLACE_SECONDS = 2.0
 
 
 class WinFailure(OSError):
@@ -119,6 +122,27 @@ class WinApi:
                 raise OSError('windows_identity_unknown')
             return ProcessFact(pid, times[0].number(), self.token(handle))
 
+    def process_image(self, pid: int, birth: str) -> str:
+        """Documented image query, not PEB/argv inspection; bracket by generation."""
+        before = self.process(pid, expected_birth=birth)
+        current = self.current_token()
+        if before.token.sid != current.sid or before.token.elevated:
+            raise OSError('worker_identity_unverified')
+        with self.owned(self.handle(self.k.OpenProcess(0x101000, False, pid))) as handle:
+            times = [A.FILETIME() for _ in range(4)]
+            self.check(self.k.GetProcessTimes(handle, *(C.byref(t) for t in times)))
+            if str(times[0].number()) != birth:
+                raise OSError('worker_generation_changed')
+            buf = (A.WCHAR * 32768)()
+            length = A.DWORD(len(buf))
+            self.check(self.k.QueryFullProcessImageNameW(handle, 0, buf, C.byref(length)))
+            if not 0 < length.value < len(buf):
+                raise OSError('worker_image_unverified')
+            image = A.read_wide(buf, length.value)
+        if self.process(pid, expected_birth=birth) != before:
+            raise OSError('worker_generation_changed')
+        return image
+
     def process_table(self) -> list[tuple[int, int, str]]:
         with self.owned(self.handle(self.k.CreateToolhelp32Snapshot(2, 0))) as handle:
             entry = A.PROCESSENTRY32W()
@@ -155,7 +179,7 @@ class WinApi:
             self.dll['ole32'].CoTaskMemFree(out)
 
     @contextmanager
-    def private_attributes(self) -> Iterator[A.SECURITY_ATTRIBUTES]:
+    def private_attributes(self, *, inherit: bool = True) -> Iterator[A.SECURITY_ATTRIBUTES]:
         sid = self.current_token().sid
         raw = C.create_string_buffer(sid)
         sid_text = A.PTR()
@@ -174,7 +198,8 @@ class WinApi:
             self.k.LocalFree(sid_text)
         descriptor = A.PTR()
         # Private at creation; inheritance only to our children, protected DACL.
-        sddl = f'O:{principal}D:P(A;OICI;FA;;;{principal})(A;OICI;FA;;;SY)'
+        flags = 'OICI' if inherit else ''
+        sddl = f'O:{principal}D:P(A;{flags};FA;;;{principal})(A;{flags};FA;;;SY)'
         self.check(self.a.ConvertStringSecurityDescriptorToSecurityDescriptorW(
             A.wide(sddl), 1, C.byref(descriptor), None))
         try:
@@ -188,15 +213,22 @@ class WinApi:
                 raise WinFailure(self.last_error())
 
     def open_file(self, path: str, *, create: bool = False, write: bool = False,
-                  directory: bool = False, exclusive_create: bool = False) -> int:
+                  directory: bool = False, exclusive_create: bool = False, read_data: bool = False,
+                  write_dac: bool = False, sharing: int | None = None, metadata_only: bool = False) -> int:
         flags = 0x00200000 | (0x02000000 if directory else 0x80)  # no reparse traversal
         # READ_CONTROL alone does not participate in NTFS sharing arbitration.
         # A directory lease needs FILE_LIST_DIRECTORY, not delete privileges.
         access = 0x20000 | (0x40000000 if write else 0) | (0x1 if directory else 0)
+        access |= 0x1 if read_data else 0
+        access |= 0x40000 if write_dac else 0
+        if metadata_only:
+            access = 0x20000 | (0x40000 if write_dac else 0)
         disposition = 1 if exclusive_create else (4 if create else 3)
-        # Never FILE_SHARE_DELETE; data-access directory leases pin this generation.
+        # Directory leases retain identity handles, not a veto on owner renames.
+        if sharing is None:
+            sharing = 7 if directory else 3
         with self.private_attributes() as sa:
-            return self.handle(self.k.CreateFileW(A.wide(path), access, 3, C.byref(sa), disposition, flags, None))
+            return self.handle(self.k.CreateFileW(A.wide(path), access, sharing, C.byref(sa), disposition, flags, None))
 
     def file_info(self, handle: int, *, af_unix: bool = False) -> A.FILE_INFORMATION:
         info = A.FILE_INFORMATION()
@@ -217,7 +249,7 @@ class WinApi:
         length = self.k.GetFinalPathNameByHandleW(handle, final, len(final), 0)
         if not 0 < length < len(final):
             raise OSError('windows_path_unverified')
-        name = A.read_wide(final)
+        name = A.read_wide(final, length)
         if not (name.startswith('\\\\?\\') and len(name) >= 7 and name[5:7] == ':\\'):
             raise OSError('windows_path_unsupported')
         if self.k.GetDriveTypeW(A.wide(name[4:7])) != 3:
@@ -227,7 +259,8 @@ class WinApi:
         if A.read_wide(fs).upper() != 'NTFS':
             raise OSError('windows_filesystem_unsupported')
 
-    def check_private(self, handle: int, *, protected: bool = False) -> None:
+    def check_private(self, handle: int, *, protected: bool = False, allow_administrators: bool = False,
+                      allow_readers: bool = False) -> None:
         principal = self.current_token().sid
         owner, dacl, descriptor = A.PTR(), A.PTR(), A.PTR()
         status = self.a.GetSecurityInfo(handle, 1, 5, C.byref(owner), None, C.byref(dacl), None, C.byref(descriptor))
@@ -244,6 +277,7 @@ class WinApi:
             if not 0 < acl.count <= 128:
                 raise OSError('windows_acl_untrusted')
             system = bytes.fromhex('010100000000000512000000')
+            administrators = bytes.fromhex('01020000000000052000000020020000')
             own_allow = False
             for index in range(acl.count):
                 pointer = A.PTR()
@@ -254,9 +288,11 @@ class WinApi:
                 if ace.kind not in (0, 1) or ace.size < 16:
                     raise OSError('windows_acl_untrusted')
                 sid = self._sid(pointer.value + 8)
-                # Reject unknown grant types and any grants to other principals.
-                if ace.kind == 0 and sid not in (principal, system):
-                    raise OSError('windows_acl_untrusted')
+                # External SQL may have other readers. Even INHERIT_ONLY grants
+                # must not contain write/delete/ownership or unmapped generic bits.
+                if ace.kind == 0 and sid not in (principal, system) and not (allow_administrators and sid == administrators):
+                    if not (allow_readers and ace.mask & ~0x1200a9 == 0):
+                        raise OSError('windows_acl_untrusted')
                 if ace.kind == 0 and sid == principal and not ace.flags & 8 and (ace.mask & 0x1f01ff) == 0x1f01ff:
                     own_allow = True
             if not own_allow:
@@ -264,6 +300,33 @@ class WinApi:
         finally:
             if descriptor.value:
                 self.k.LocalFree(descriptor)
+
+    def check_owner(self, handle: int) -> None:
+        principal = self.current_token().sid
+        owner, descriptor = A.PTR(), A.PTR()
+        status = self.a.GetSecurityInfo(handle, 1, 1, C.byref(owner), None, None, None, C.byref(descriptor))
+        if status:
+            raise WinFailure(status)
+        try:
+            if self._sid(owner) != principal:
+                raise OSError('windows_owner_mismatch')
+        finally:
+            if descriptor.value:
+                self.k.LocalFree(descriptor)
+
+    def repair_private(self, handle: int, *, inherit: bool = False) -> None:
+        self.check_owner(handle)
+        # Inheritable ACEs may propagate to existing unprotected children;
+        # metadata-only handles do not provide an exclusive-sharing barrier.
+        with self.private_attributes(inherit=inherit) as sa:
+            present, defaulted, dacl = A.BOOL(), A.BOOL(), A.PTR()
+            self.check(self.a.GetSecurityDescriptorDacl(sa.descriptor, C.byref(present), C.byref(dacl), C.byref(defaulted)))
+            if not present.value or not dacl.value:
+                raise OSError('windows_acl_untrusted')
+            status = self.a.SetSecurityInfo(handle, 1, 0x80000004, None, None, dacl, None)
+            if status:
+                raise WinFailure(status)
+        self.check_private(handle, protected=True)
 
     def lock(self, handle: int, *, shared: bool) -> None:
         overlap = A.OVERLAPPED()  # [0,1), identical for shared probes/exclusive holders
@@ -287,11 +350,41 @@ class WinApi:
                 raise OSError('windows_short_write')
             cursor += written.value
 
+    def read(self, handle: int, limit: int) -> bytes:
+        """Bounded synchronous ordinary-file read using the already pinned handle."""
+        if not 0 < limit <= 1024 * 1024:
+            raise ValueError('windows_read_limit')
+        data = bytearray()
+        while len(data) < limit:
+            size = limit - len(data)
+            buf = C.create_string_buffer(size)
+            count = A.DWORD()
+            self.check(self.k.ReadFile(handle, buf, size, C.byref(count), None))
+            if count.value > size:
+                raise OSError('windows_read_invalid')
+            if count.value == 0:
+                break
+            data.extend(buf.raw[:count.value])
+        return bytes(data)
+
     def flush(self, handle: int) -> None:
         self.check(self.k.FlushFileBuffers(handle))
 
     def replace(self, source: str, dest: str) -> None:
-        self.check(self.k.MoveFileExW(A.wide(source), A.wide(dest), 1 | 8))
+        # DELETE sharing does not guarantee that an occupied target can be
+        # replaced. Bound contention retries, not the duration of a Win32 call.
+        deadline = monotonic() + REPLACE_SECONDS
+        delay = 0.02
+        while True:
+            try:
+                self.check(self.k.MoveFileExW(A.wide(source), A.wide(dest), 1 | 8))
+                return
+            except WinFailure as error:
+                remaining = deadline - monotonic()
+                if error.winerror not in (5, 32) or remaining <= 0:
+                    raise
+                sleep(min(delay, remaining))
+                delay = min(delay * 2, 0.16)
 
     def delete(self, path: str) -> None:
         self.check(self.k.DeleteFileW(A.wide(path)))

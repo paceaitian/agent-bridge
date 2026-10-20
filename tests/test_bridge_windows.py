@@ -38,6 +38,9 @@ class WindowsTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.k = Kernel(self.root)
         self.p = make_platform('windows', win_api=self.k.api)
+        self.version_patch = patch('agentstatus_bridge.platforms.windows.codex_version.read_cli_version', return_value=None)
+        self.version_patch.start()
+        self.addCleanup(self.version_patch.stop)
         self.addCleanup(lambda: self.assertEqual(self.k.handles, {}))
 
     def test_abi_layout_signatures_and_high_handles(self):
@@ -121,7 +124,9 @@ class WindowsTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.k.files[str(self.root)]={'aces':aces}
                 error=None
-                try:self.p.files.ensure_private_dir(self.root)
+                try:
+                    with self.k.api.owned(self.k.api.open_file(str(self.root), directory=True)) as handle:
+                        self.k.api.check_private(handle, protected=True)
                 except Exception as exc:error=exc
                 self.assertIsInstance(error,OSError)
                 self.assertEqual(self.k.handles,{})
@@ -189,10 +194,12 @@ class WindowsTests(unittest.TestCase):
                 self.assertEqual(cm.exception.code,0)
         self.assertEqual(self.k.calls,[])
         self.assertEqual(list(self.root.iterdir()),[])
-        with using_platform(self.p):
+        with (using_platform(self.p),patch.object(self.p.transport,'codex_cli_version',return_value=None) as version,
+              patch.dict(os.environ,{'CODEX_HOME':str(self.root/'absent-home')})):
             self.assertEqual(endpoints.discover(),[])
             self.assertEqual(endpoints.codex_title_report(),{'state':'discovery_unverified'})
-        self.assertEqual(self.k.calls,[])
+            self.assertEqual(version.call_count,1)  # unknown version permits discovery, absent root still prevents connect
+        self.assertFalse(any(n=='connect' for n,_ in self.k.calls))
         for module_name in ('test_bridge_windows','test_bridge_windows_streams'):
             module=importlib.import_module(module_name)
             classes=[v for v in vars(module).values() if isinstance(v,type) and issubclass(v,unittest.TestCase)]
@@ -216,12 +223,16 @@ class WindowsTests(unittest.TestCase):
             cache.read(self.root,{thread:((100,'2'),)})
             self.assertEqual(reader.read.call_count,2)
 
-    def test_summary_failure_never_revives_windows_worker(self):
+    def test_summary_failure_with_revive_false_never_starts_windows_worker(self):
         with (using_platform(self.p),patch.object(cli,'state_dir',side_effect=OSError('fixture')),
               patch.object(cli,'_start_worker') as spawn,patch.object(cli,'_revive_worker') as revive):
-            self.assertIsNone(cli._refresh_summary(revive=True))
+            self.assertIsNone(cli._refresh_summary(revive=False))  # manual/withdraw read path still never revives
             cli._revive_from_summary(Mock())
             spawn.assert_not_called()
+            revive.assert_not_called()
+            with patch.object(cli,'_worker_ensured',False):
+                self.assertIsNone(cli._refresh_summary(revive=True))
+            spawn.assert_called_once_with()
             revive.assert_not_called()
 
     def test_summary_without_ledger_still_validates_root_before_reading(self):
@@ -315,7 +326,8 @@ class WindowsTests(unittest.TestCase):
             self.assertIsNone(error)
         self.assertTrue(path.is_dir())
         self.k.files[str(path)]={'private':False}
-        with self.assertRaises(OSError):self.p.files.ensure_private_dir(path)
+        self.assertEqual(self.p.files.ensure_private_dir(path),path)
+        self.assertTrue(self.k.files[str(path)]['private'])
         for drive in (0,1,2,4,5,6):
             self.k.drive_type=drive
             with self.subTest(drive=drive),self.assertRaises(OSError):self.p.files.ensure_private_dir(self.root)
@@ -354,13 +366,15 @@ class WindowsTests(unittest.TestCase):
         self.assertIs(self.p.process.same_generation(ProcessIdentity('windows',100,'linux-proc-ticks','1')),Presence.UNKNOWN)
 
     def test_unverified_windows_caller_is_not_user_or_bypass(self):
+        self.assertEqual(self.k.calls,[])  # constructing the platform is still IO-free
         with using_platform(self.p):
-            caller=endpoints.identify_caller([],environ={})
+            caller=endpoints.identify_caller([],pid=999,environ={})
             self.assertFalse(caller.is_user_shell)
             self.assertEqual(caller.rejection,'platform_unverified')
             self.assertIsNone(endpoints.permission_class(caller))
             self.assertIsNone(endpoints.permission_class(endpoints.Caller(None,None)))
-        self.assertEqual(self.k.calls,[])
+        # W2-3 samples the explicitly requested PID; permission projection adds no IO.
+        self.assertEqual(self.k.calls,[('OpenProcess',(0x101000,0,999))])
 
     def test_lock_matrix_conflict_io_and_lease_lifetime(self):
         l = self.p.lifecycle
@@ -398,7 +412,12 @@ class WindowsTests(unittest.TestCase):
         for key,value in [('private',False),('owner',bytes.fromhex('01010000000000052b000000')),('reparse',True),('fs','FAT32'),('protected',False)]:
             old=dict(self.k.files[str(path)])
             self.k.files[str(path)][key]=value
-            with self.subTest(key=key),self.assertRaises(OSError): f.ensure_private_dir(path)
+            with self.subTest(key=key):
+                if key in {'private', 'protected'}:
+                    self.assertEqual(f.ensure_private_dir(path),path)
+                    self.assertTrue(self.k.files[str(path)]['protected'])
+                else:
+                    with self.assertRaises(OSError): f.ensure_private_dir(path)
             self.k.files[str(path)]=old
         for path in [Path('//server/share'),Path('relative'),self.root/'stream:extra',self.root/'..'/'outside',self.root/'trailing.',self.root/'NUL.txt',self.root/'COM¹']:
             with self.subTest(path=path),self.assertRaises(OSError): local_path(path)
@@ -419,7 +438,7 @@ class WindowsTests(unittest.TestCase):
         self.assertEqual([p.name for p in self.root.iterdir()],['summary.json'])
         self.assertEqual(self.k.handles,{})
 
-    def test_leaf_lease_requires_data_access_for_share_arbitration(self):
+    def test_directory_lease_shares_delete_and_metadata_only_control(self):
         leaf=self.root/'leaf';leaf.mkdir()
         target=self.root/'moved'
         # Independent metadata-only CreateFile control: no deletion sharing is
@@ -439,18 +458,17 @@ class WindowsTests(unittest.TestCase):
             error=None
             try:self.k.api.replace(str(leaf),str(target))
             except OSError as exc:error=exc
-            self.assertIsInstance(error,OSError)
-            self.assertEqual(getattr(error,'winerror',None),32)
-            self.assertTrue(leaf.exists())
-            self.assertFalse(target.exists())
-        self.k.api.replace(str(leaf),str(target))
+            self.assertIsNone(error)
+            self.assertTrue(all(h.get('sharing',7) & 4 for h in self.k.handles.values()))
+            self.assertFalse(leaf.exists())
+            self.assertTrue(target.exists())
         self.assertTrue(target.exists())
         self.assertEqual(self.k.handles,{})
 
     def test_existing_file_wrong_owner_rejected_without_leases(self):
         path=self.root/'existing';path.write_bytes(b'old')
         self.k.files[str(path)]={'owner':bytes.fromhex('01010000000000052b000000')}
-        with self.assertRaisesRegex(OSError,'windows_acl_untrusted'):
+        with self.assertRaisesRegex(OSError,'windows_owner_mismatch'):
             self.p.files.validate_file(path)
         self.assertEqual(path.read_bytes(),b'old')
         self.assertEqual(self.k.handles,{})
@@ -563,8 +581,8 @@ class WindowsTests(unittest.TestCase):
         self.assertFalse(stop_requested(self.p.files,self.root,identity))
 
     def test_windows_business_gates_before_any_side_effect(self):
-        commands=[['send','--to','x','-m','x'],['report','a','--result','--manual'],['retry','a'],['resume','a'],
-                  ['accept','a'],['close','a'],['cancel','a'],['pause','a'],['withdraw','a','--attempt','1'],['worker','--once'],['wait','a']]
+        commands=[['send','--to','claude@x','-m','x'],['send','--to','grok@x','-m','x'],
+                  ['withdraw','a','--attempt','1']]
         with (using_platform(self.p),patch.object(cli,'_refresh_summary',side_effect=AssertionError('refresh')),
                 patch.object(cli,'discover',side_effect=AssertionError('discovery'))):
             for command in commands:
@@ -573,20 +591,23 @@ class WindowsTests(unittest.TestCase):
                 self.assertEqual(code,9)
                 self.assertIn('windows_provider_not_enabled',out.getvalue())
                 self.assertIn('尚未写入任务',out.getvalue())
-            self.assertEqual(worker.default_transports(),{})
-            self.assertFalse(worker.ensure_worker(self.root))
-            self.assertEqual(worker.run_worker(root=self.root,once=True),9)
+            self.assertEqual(set(worker.default_transports()),{Provider.CODEX})
+            self.assertNotIn(Provider.CLAUDE,worker.default_transports())
+            self.assertNotIn(Provider.GROK,worker.default_transports())
         self.assertEqual(self.k.calls,[])
         self.assertEqual(list(self.root.iterdir()),[])
 
     def test_doctor_and_local_summary_no_provider_queries_or_idle(self):
-        with using_platform(self.p),patch.dict(os.environ,{'AB_STATE_DIR':str(self.root)}),patch.object(cli,'_start_worker',side_effect=AssertionError('spawn')):
+        with using_platform(self.p),patch.dict(os.environ,{'AB_STATE_DIR':str(self.root), 'CODEX_HOME':str(self.root/'absent-home')}),patch.object(cli,'_start_worker',side_effect=AssertionError('spawn')):
             output=io.StringIO()
             with redirect_stdout(output): self.assertEqual(cli.main(['doctor','--json']),0)
             doc=json.loads(output.getvalue())
             self.assertTrue(doc['ledgerReadable'])
-            self.assertFalse(doc['providerEnabled'])
-            self.assertEqual(doc['codexVersion'],'not_queried')
+            self.assertTrue(doc['providerEnabled'])
+            self.assertEqual(doc['codexVersion'],'unknown')
+            self.assertEqual(doc['codexDaemon']['reason'], 'read_unavailable')
+            self.assertEqual(doc['codexDaemon']['cliVersion'], 'unknown')
+            self.assertFalse(any(n == 'connect' for n, _ in self.k.calls))
             self.assertEqual(doc['discovery'],'unverified')
             self.assertEqual(summary._observer_binding(Provider.CLAUDE,'synthetic','selected','%1',100,'s',10)['observerKeys'],[])
             with redirect_stdout(io.StringIO()):
@@ -605,7 +626,7 @@ class WindowsTests(unittest.TestCase):
         self.p.files.atomic_write(self.root,b'pass',name='worker.py',prefix='.worker.')
         with patch('subprocess.Popen') as spawn:
             l.spawn_fixture(self.root/'worker.py',self.root,popen=spawn)
-        self.assertEqual(spawn.call_args.kwargs['creationflags'],0x208)
+        self.assertEqual(spawn.call_args.kwargs['creationflags'],0x1000208)
         self.assertTrue(spawn.call_args.kwargs['close_fds'])
         self.assertEqual(spawn.call_args.args[0][0],sys.executable)
         self.assertEqual(self.k.api.context(),{'consoleDetached':True,'inJob':True,'outlivesJob':False})

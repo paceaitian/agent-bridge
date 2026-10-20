@@ -27,6 +27,7 @@ from agentstatus_bridge.transports import DeliveryContext, DeliveryOutcome
 
 
 from bridge_platform_guard import ProductionSocketUse  # 兼容已有用例；导入即安装平台连接守卫
+import bridge_short_socket_guard  # 独立于受变异 helper，禁止测试回收真实共享目录
 
 
 def _isolate_host_policy_dirs() -> None:

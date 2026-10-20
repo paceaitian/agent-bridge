@@ -64,6 +64,7 @@ MAX_FILES = 16
 FINISHED_RETENTION_SECONDS = 30 * 86400
 MAX_FINISHED_TASKS = 1000
 WITHDRAWAL_RECOVERY_SECONDS = 600  # 远大于10秒受控等待预算，防止异空间/卡住的活动行永久占位（§73.6）
+WINDOWS_SENDING_RECOVERY_SECONDS = 600 + 120  # W2 add总预算＋余量；只恢复UNKNOWN，不重发
 
 _SCHEMA_V2: tuple[str, ...] = (
     """CREATE TABLE IF NOT EXISTS meta (
@@ -1128,24 +1129,30 @@ class Store:
     # ---- 恢复、归档与保留 ----
 
     def recover_interrupted(self, *, now: float, proc_root: Path = procfs.DEFAULT_PROC) -> int:
-        """发送进程已不在的 sending 记录改为 unknown；仍在运行的发送不打断。
+        """发送进程已不在的 sending 记录改为 unknown；Windows另有超预算兜底。
 
         只应由持有单实例锁的 worker 调用：其他进程（例如在 PID 命名空间里）可能看不到 worker。
         """
         recovered = 0
         for attempt in self.attempts_in((Delivery.SENDING,)):
+            reason = "interrupted_during_send"
             pid = attempt.delivery_detail.get("senderPid")
             start = attempt.delivery_detail.get("senderStart")
             if get_platform().name == 'windows':
-                if not isinstance(pid, int) or not isinstance(start, str) or procfs.windows_presence(pid, start) is not Presence.EXITED:
-                    continue
+                presence = (procfs.windows_presence(pid, start)
+                            if isinstance(pid, int) and isinstance(start, str) else Presence.UNKNOWN)
+                if presence is not Presence.EXITED:
+                    started = attempt.delivery_at if attempt.delivery_at is not None else attempt.created_at
+                    if now - started <= WINDOWS_SENDING_RECOVERY_SECONDS:
+                        continue
+                    reason = "codex_queue_timeout"
             elif isinstance(pid, int) and isinstance(start, str) and procfs.is_same_generation(pid, start, proc_root):
                 continue
             if self.transition_delivery(
                 attempt.id,
                 expected=(Delivery.SENDING,),
                 new=Delivery.UNKNOWN,
-                reason="interrupted_during_send",
+                reason=reason,
                 now=now,
             ):
                 recovered += 1

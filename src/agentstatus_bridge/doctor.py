@@ -19,6 +19,7 @@ from .platforms.types import SampleState
 from .paths import claude_sessions_dir, device_name, state_dir, state_dir_source
 from .store import Store, StoreError
 from .transports.claude_peer import inbox_directory
+from .transports.codex_native import daemon_diagnostic
 from .transports.codex_queue import EVIDENCE_WINDOW, cli_version, summarize_queue_evidence, summarize_rpc_evidence
 from .worker import read_log_tail, worker_running
 
@@ -52,11 +53,22 @@ def collect_checks() -> dict[str, object]:
     """收集 doctor 的全部事实；`checks` 的插入顺序就是文字输出的顺序（JSON 用 sort_keys 看不出），原样保留。"""
     if get_platform().name == 'windows':
         checks: dict[str, object] = {
-            'abVersion': __version__, 'platform': 'windows', 'providerEnabled': False,
+            'abVersion': __version__, 'platform': 'windows', 'providerEnabled': True,
             'processQualification': 'unverified', 'discovery': 'unverified',
-            'codexVersion': 'not_queried', 'runtime': 'unsupported', 'workerAutomatic': False,
+            'codexVersion': 'not_queried', 'runtime': 'unsupported', 'workerAutomatic': True,
             'windowsRealMachineGate': 'not_run', 'registrationAuthority': 'unverified',
         }
+        diagnostic = daemon_diagnostic(get_platform().files.codex_home)
+        checks['codexDaemon'] = diagnostic
+        checks['codexVersion'] = diagnostic['cliVersion']
+        from .platforms.windows.worker_identity import diagnostic as worker_diagnostic  # layout: allow Windows本地worker证据，无provider外调
+        from .platforms.windows.files import WindowsPaths  # layout: allow doctor窄平台分支
+        files = get_platform().files
+        if isinstance(files, WindowsPaths):
+            try:
+                checks['worker'] = worker_diagnostic(files, files.state_dir())
+            except OSError:
+                checks['worker'] = {'generationAndImage': 'unverified'}
         try:
             with Store.open() as local:
                 checks['ledgerReadable'] = True
@@ -64,6 +76,8 @@ def collect_checks() -> dict[str, object]:
         except (StoreError, OSError):
             checks['ledgerReadable'] = False
             checks['storageReason'] = 'windows_storage_unverified'
+        if isinstance(files, WindowsPaths):
+            checks['privateAclRepairObserved'] = files.acl_observation()
         return checks
     version = cli_version()
     root = state_dir()
@@ -147,6 +161,11 @@ def print_checks(checks: dict[str, object]) -> None:
         if key == "codexThreadTitle" and isinstance(value, dict):
             for line in thread_title_lines(value):
                 print(line)
+            continue
+        if key == 'codexDaemon' and isinstance(value, dict):
+            print(f"Codex Windows daemon（版本仅观察）：{value}")
+            if value.get('logoutRisk') == 'desktop_logout_may_stop_shared_backend_inferred':
+                print('  推断告警：桌面注销可能终止共享后端；这不是已实测的注销结果。')
             continue
         if isinstance(value, list):
             print(f"{labels.get(key, key)}：" + ("（无）" if not value else ""))

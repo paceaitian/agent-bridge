@@ -8,7 +8,6 @@ from typing import Any
 
 from .null import NullMux, NullRuntime
 from .types import BridgePlatform, Capability
-from .null_transport import UnsupportedPlatform
 
 
 def make_platform(name: str | None = None, *, proc_root: Path | None = None, win_api: Any = None) -> BridgePlatform:
@@ -28,10 +27,11 @@ def make_platform(name: str | None = None, *, proc_root: Path | None = None, win
         from .windows.process import WindowsProcess  # layout: allow Windows P
         from .windows.files import WindowsPaths  # layout: allow Windows F
         from .windows.lifecycle import WindowsLifecycle  # layout: allow Windows L
+        from .windows.local_transport import WindowsPlatform  # layout: allow W2只读T；写能力仍未开放
         api = win_api if win_api is not None else LazyApi()
         files = WindowsPaths(api)
         return BridgePlatform('windows', WindowsProcess(api), NullMux(), NullRuntime(), Capability.UNVERIFIED,
-                              files, WindowsLifecycle(api, files), UnsupportedPlatform())
+                              files, WindowsLifecycle(api, files), WindowsPlatform(api, files))
     raise ValueError('platform_unsupported')
 
 

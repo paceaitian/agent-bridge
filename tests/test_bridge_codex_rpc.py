@@ -344,11 +344,9 @@ class SocketChecksTests(RpcCase):
         daemon.socket_path.unlink()  # daemon 退出后物理 socket 被删、链接悬空
         self.assertEqual(self.add(daemon), RpcFallback("socket_missing"))
 
-    def test_target_that_is_not_a_private_socket_is_rejected(self) -> None:
+    def test_target_that_is_not_a_socket_is_rejected(self) -> None:
         cases: dict[str, Callable[[FakeDaemon], None]] = {
             "普通文件": lambda d: (d.socket_path.unlink(), d.socket_path.write_text("")),  # type: ignore[func-returns-value]
-            "组可读写": lambda d: os.chmod(d.socket_path, 0o660),
-            "目录 0755": lambda d: os.chmod(d.directory, 0o755),
         }
         for name, spoil in cases.items():
             with self.subTest(case=name):
@@ -848,6 +846,7 @@ class SocketCreationInventoryTests(unittest.TestCase):
     CALLS = frozenset({"socket.socket", "socket.create_connection", "socket.socketpair", "socket.fromfd"})
     PLATFORM_CALLS = frozenset({'new_stream', 'connect_claude', 'inbox'})
     EXPECTED = [
+        ('platforms/windows/local_transport.py', ('caller_identity',), '.new_stream'), # B2: SDK Fake only
         ('transports/codex_native.py', ('__init__',), '.new_stream'),
         ('transports/codex_rpc.py', ('queue_add',), '.new_stream'),
         ('transports/claude_peer.py', ('deliver',), '.new_stream'),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from typing import Any, Protocol
 
 from ..model import Delivery, Endpoint, Provider
@@ -33,6 +34,7 @@ class DeliveryContext:
     # 回执类用 next（被对方当前轮吸收反而更早知道结果），交接类用 later（不插进一轮无关的推理）。
     # 通道不认识的取值一律回落到通道自己的默认，不让上层写错把消息打成中断。
     priority: str | None = None
+    before_send: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 class Transport(Protocol):

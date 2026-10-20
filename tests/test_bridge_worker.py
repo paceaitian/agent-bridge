@@ -371,6 +371,7 @@ class WorkerTests(unittest.TestCase):
         assert sent is not None
         self.assertEqual(sent.delivery, Delivery.QUEUED)
         self.assertFalse(worker_running(self.root))
+        self.assertTrue(self.inbox_dir.is_dir(), 'Linux worker must open its inbox')
         self.assertEqual(list(self.inbox_dir.iterdir()), [])
 
     def _pending_task(self, *, body: str = "x", now: float = 1.0) -> str:
@@ -453,7 +454,7 @@ class WorkerSpawnInventoryTests(unittest.TestCase):
         "os.system", "os.popen", "os.fork", "os.forkpty", "os.posix_spawn", "os.posix_spawnp",
         "os.execv", "os.execve", "os.execvp", "os.spawnv", "os.spawnvp",
     })
-    PLATFORM_CALLS = frozenset({'run_capture', 'spawn_worker'})
+    PLATFORM_CALLS = frozenset({'run_capture', 'spawn_worker', '_spawn'})
     # 后台（长命）子进程：只有它会带着整份环境活下去，所以单独再钉一次
     BACKGROUND_CALLS = frozenset({
         "subprocess.Popen", "asyncio.create_subprocess_exec", "asyncio.create_subprocess_shell",
@@ -463,6 +464,11 @@ class WorkerSpawnInventoryTests(unittest.TestCase):
         ('reports.py', ('_git_resolve_commit',), '.run_capture'),
         ('transports/codex_queue.py', ('_default_runner',), '.run_capture'),
         ('worker.py', ('ensure_worker',), '.spawn_worker'),
+        ('platforms/windows/codex_version.py', ('read_cli_version',), 'subprocess.run'), # W2-1 only --version, UTF-8, no shell
+        ('platforms/windows/lifecycle.py', ('_spawn', 'create'), 'subprocess.Popen'), # §77.17 shared breakaway/fallback
+        ('platforms/windows/lifecycle.py', ('spawn_worker',), '._spawn'),
+        ('platforms/windows/lifecycle.py', ('spawn_fixture',), '._spawn'),
+        ('platforms/windows/lifecycle.py', ('run_capture',), 'subprocess.run'), # W2-4 only git read-only commit validation
         ("platforms/linux/mux.py", ("tmux_pane_titles",), "subprocess.run"),    # W1-1下沉，原argv不改
         ("platforms/linux/mux.py", ("tmux_panes",), "subprocess.run"),          # tmux 只读发现
         ("platforms/linux/lifecycle.py", ("run_capture",), "subprocess.run"), # 原git分支，不带errors参数
@@ -505,7 +511,8 @@ class WorkerSpawnInventoryTests(unittest.TestCase):
 
     def test_background_spawn_is_owned_by_ensure_worker(self) -> None:
         background = [site for site in self.inventory() if site[2] in self.BACKGROUND_CALLS]
-        self.assertEqual(background, [("platforms/linux/lifecycle.py", ("spawn_worker",), "subprocess.Popen")])
+        self.assertEqual(background, [("platforms/linux/lifecycle.py", ("spawn_worker",), "subprocess.Popen"),
+                                      ("platforms/windows/lifecycle.py", ("_spawn", "create"), "subprocess.Popen")])
         self.assertEqual([site for site in self.inventory() if site[2]=='.spawn_worker'],
                          [('worker.py', ('ensure_worker',), '.spawn_worker')])
 

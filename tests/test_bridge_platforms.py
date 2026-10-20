@@ -72,7 +72,7 @@ builtins.__import__ = guarded
 from agentstatus_bridge.platforms.factory import make_platform
 # Load selected Python modules under import guard; constructor IO guard below
 # excludes importlib's own source reads, not any backend operation.
-from agentstatus_bridge.platforms.windows import lazy, process, files, lifecycle
+from agentstatus_bridge.platforms.windows import lazy, process, files, lifecycle, local_transport
 def audit(event, args):
     if event in {'socket.connect','subprocess.Popen','os.listdir','os.scandir'} or event == 'open':
         raise AssertionError('factory IO: '+event)
