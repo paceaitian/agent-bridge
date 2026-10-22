@@ -62,6 +62,8 @@ HANDED_OVER = frozenset({Delivery.WRITTEN, Delivery.QUEUED, Delivery.DELIVERED})
 MAY_HAVE_ARRIVED = frozenset(HANDED_OVER | {Delivery.HELD, Delivery.UNKNOWN})
 # 结束回执（DESIGN §45.31）：notice 尝试的 options 里 noticeKind=closure，closure 记 accepted/closed
 NOTICE_KIND_OPTION = "noticeKind"
+# 提醒令牌的 options 字段；供 Store 限额判定和提醒去重共用。
+REMINDER_OPTION = "reminderToken"
 CLOSURE_KIND = "closure"
 CLOSURE_STATE_OPTION = "closure"
 DELIVERY_NEEDS_ATTENTION = frozenset(

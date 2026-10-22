@@ -20,12 +20,12 @@ from .model import (
 )
 from .naming import command_name
 from .store import Store, StoreError
+from .store import CAPACITY_CODES as _CAPACITY_CODES
 from .notification_policy import can_notify
 
 ACCEPTED = "accepted"
 CLOSED = "closed"
-# 容量不足时跳过该接收者：结束回执是附带的同步，不能让验收或关闭失败（§45.31.4）
-_CAPACITY_CODES = frozenset({"capacity_attempts", "capacity_pending"})
+# 容量不足时跳过该接收者；与 report 共用两种容量码（§45.31.4、§83）
 MAX_REASON_CHARS = 200
 
 

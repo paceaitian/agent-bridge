@@ -10,14 +10,14 @@ from dataclasses import dataclass
 
 from .ids import short
 from .labels import next_step, reason_text
-from .model import HANDED_OVER, Attempt, Delivery, Role, Task, TaskView, describe
-from .store import MAX_ATTEMPTS_PER_TASK
+from .model import HANDED_OVER, REMINDER_OPTION, Attempt, Delivery, Role, Task, TaskView, describe
+from .store import attempt_limit
 from .summary import attention_at, attention_token, classify
 from .notification_policy import can_notify, wire_ref
 
 REMIND_AFTER_SECONDS = 30 * 60.0
 # 提醒记在 notice 尝试的 options 上：尝试不按条数裁剪，比每任务有上限的事件时间线更适合去重
-REMINDER_OPTION = "reminderToken"
+# REMINDER_OPTION 在 model 定义，供 Store 写入限额与本模块预筛共用；此处兼容导出。
 # 回执还在桥内或正在发送：它送达本身就是提醒，不叠加
 _NOT_YET_ARRIVED = frozenset({Delivery.PENDING, Delivery.SENDING})
 # 回执可能已到发起方：从它交出的时刻起重新计时。HELD 是对方会话里弹出了批准框（批准后改记送达时刻，过期则不算到达）；
@@ -81,8 +81,8 @@ def pending_reminder(task: Task, attempts: list[Attempt]) -> PendingReminder | N
     token, view = found
     if view.current is None or origin.same_session(view.current.target):
         return None  # 发起方就是当前接收方（例如自己复核）时它已经知道
-    if max((attempt.seq for attempt in attempts), default=0) >= MAX_ATTEMPTS_PER_TASK:
-        return None  # 交接次数已满，排不进提醒；不能让 worker 为它一直驻留
+    if max((attempt.seq for attempt in attempts), default=0) >= attempt_limit(Role.NOTICE, {REMINDER_OPTION: token}):
+        return None  # 提醒预算已满，留下终态通知和结束回执；不为排不进的提醒驻留
     if attention_declined(task, attempts, view):
         return None
     attention = attention_at(task, view)
@@ -119,7 +119,7 @@ def reminder_body(task: Task, attempts: list[Attempt], view: TaskView, *, comman
     receiver = wire_ref(view.current.target).display() if view.current is not None else "对方"
     minutes = int(REMIND_AFTER_SECONDS // 60)
     lines = [f"提醒：这项任务已超过 {minutes} 分钟没有处理——{reason_text(view.reason, command=command)}（{receiver}）。"]
-    step = next_step(task, attempts, ref=short(task.id), command=command)
+    step = next_step(task, attempts, ref=short(task.id), command=command, reserved=1)
     if step is not None:
         lines.append(f"下一步：{step.text}")
     return "\n".join(lines)

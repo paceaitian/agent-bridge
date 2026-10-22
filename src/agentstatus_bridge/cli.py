@@ -41,6 +41,8 @@ from .labels import (  # 标签表移至 labels 供摘要与 worker 共用；此
     next_step,
     reason_text,
     role_label,
+    review_capacity_hint,
+    notification_capacity_hint,
 )
 from .model import (
     HANDED_OVER,
@@ -66,7 +68,7 @@ from .observer_dbus import ObserverView
 from .platforms.factory import get_platform, using_platform
 from .paths import codex_home, codex_sqlite_home, device_name, state_dir
 from .reports import ReportError, ReportInput, apply_report, file_reference
-from .store import DB_NAME, MAX_BODY_BYTES, Store, StoreError
+from .store import ATTEMPT_WARNING_THRESHOLD, DB_NAME, MAX_BODY_BYTES, Store, StoreError
 from .closure import ACCEPTED, CLOSED, ClosureOutcome, queue_closures
 from .dispatch import needs_worker, select_generation
 from .doctor import collect_checks, print_checks
@@ -639,13 +641,25 @@ def cmd_report(args: argparse.Namespace) -> int:
         # 汇报已提交：拉起 worker 失败不能以异常堆栈退出，让人误以为没记上（DESIGN §45.29）
         unavailable = _queued_without_worker(_start_worker()) if outcome.followups else False
         exit_code = EXIT_UNAVAILABLE if unavailable else EXIT_OK
+        warnings = []
+        if 'review' in outcome.skipped:
+            warnings.append(review_capacity_hint(outcome.skipped['review'], reporter=True))
+        if 'result' in outcome.skipped:
+            warnings.append(notification_capacity_hint(outcome.skipped['result'], reporter=True))
+        if max(a.seq for a in store.attempts(outcome.task.id)) >= ATTEMPT_WARNING_THRESHOLD:
+            warnings.append(reason_text('report_attempts_near_limit'))
         if args.json:
-            _print_json(_task_document(store, outcome.task))
+            document = _task_document(store, outcome.task)
+            document['reportSkipped'] = outcome.skipped
+            document['warnings'] = warnings
+            _print_json(document)
             return exit_code
         print(f"已记录：{EVENT_LABELS[kind.value]}（任务 {short(outcome.task.id)} #{outcome.attempt.seq}）")
         for followup in outcome.followups:
             label = "已排队发给复核方" if followup.role is Role.REVIEW else "已排队通知发起方"
             print(f"{label} {followup.target.display()}")
+        for warning in warnings:
+            print(f"提示：{warning}")
     return exit_code
 
 
@@ -963,6 +977,8 @@ def cmd_retry(args: argparse.Namespace) -> int:
             raise CliError(error.code, _exit_for_store_error(error.code)) from error
         started = _start_worker()
         print(f"已排队第 {attempt.seq} 次{ROLE_LABELS[attempt.role]} → {attempt.target.display()}（任务 {short(attempt.task_id)}）")
+        if attempt.seq >= ATTEMPT_WARNING_THRESHOLD:
+            print(f"提示：{reason_text('attempts_near_limit')}")
         if args.force and not undelivered and not rework:
             print("注意：上一条消息可能已送达，对方可能重复执行")
     return EXIT_UNAVAILABLE if _queued_without_worker(started) else EXIT_OK

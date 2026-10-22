@@ -162,6 +162,206 @@ class CliTests(unittest.TestCase):
             store.begin_send(attempt.id, now=1.0, pid=1, start_ticks="1")
             store.finish_send(attempt.id, delivery=delivery, reason="test", provider_ref=None, detail={}, now=2.0)
 
+    def fill_capacity(self, task_id: str, total: int) -> None:
+        with self.store() as store:
+            while len(store.attempts(task_id)) < total:
+                store.add_attempt(task_id, role=Role.NOTICE, target=LEAD.ref, body='capacity fixture',
+                                  refs=[], now=3.0, sender=IMPL.ref, sender_class='bypass')
+
+    def test_capacity_report_commits_with_explicit_text_json_and_status_warning(self) -> None:
+        for json_mode in (False, True):
+            self.caller = as_agent(LEAD)
+            task_id = self.send()
+            self.mark_sent(task_id)
+            self.fill_capacity(task_id, 64)
+            self.caller = as_agent(IMPL)
+            with patch.object(cli, '_start_worker', side_effect=AssertionError('no queued followup')):
+                code, out, err = self.run_cli('report', task_id, '--attempt', '1', '--result', '--note',
+                                             'capacity saved', *(['--json'] if json_mode else []))
+            self.assertEqual(code, 0, err)
+            if json_mode:
+                document = json.loads(out)
+                self.assertEqual(document['reportSkipped'], {'result': 'capacity_attempts'})
+                out = '\n'.join(document['warnings'])
+            self.assertIn('汇报已提交，通知未能排队', out)
+            self.assertIn('status 查看', out)
+            self.assertIn('接近交接上限', out)
+            self.caller = as_agent(LEAD)
+            code, out, err = self.run_cli('status', task_id)
+            self.assertEqual(code, 0, err)
+            self.assertIn('未排通知', out)
+            self.assertIn('通知因交接次数已达上限未排队', out)
+            with self.store() as store:
+                self.assertEqual(store.attempts(task_id)[0].result['note'], 'capacity saved')
+
+    def test_capacity_report_warning_starts_at_48_even_for_ack_progress(self) -> None:
+        self.caller = as_agent(LEAD)
+        task_id = self.send()
+        self.mark_sent(task_id)
+        for total, kind, json_mode in ((47, '--ack', False), (48, '--ack', False), (48, '--progress', True)):
+            self.fill_capacity(task_id, total)
+            self.caller = as_agent(IMPL)
+            code, out, err = self.run_cli('report', task_id, '--attempt', '1', kind, *(['--json'] if json_mode else []))
+            self.assertEqual(code, 0, err)
+            if json_mode:
+                out = '\n'.join(json.loads(out)['warnings'])
+            self.assertEqual('接近交接上限' in out, total >= 48)
+            if total >= 48:
+                self.assertIn('后续由发起方决定', out)
+
+    def test_capacity_retry_warning_boundary_and_rejection_keeps_pending_notices(self) -> None:
+        for total in (46, 47, 59, 60):
+            self.caller = as_agent(LEAD)
+            task_id = self.send()
+            self.mark_sent(task_id)
+            self.caller = as_agent(IMPL)
+            self.assertEqual(self.run_cli('report', task_id, '--attempt', '1', '--blocked')[0], 0)
+            self.fill_capacity(task_id, total)
+            with self.store() as store:
+                previous = [(a.id, a.delivery) for a in store.attempts(task_id)]
+            self.caller = as_agent(LEAD)
+            code, out, err = self.run_cli('retry', task_id)
+            if total == 60:
+                self.assertEqual(code, 3, err)
+                self.assertIn('capacity_attempts', err)
+                self.assertIn('close 旧任务', err)
+                self.assertIn('send 新任务', err)
+                with self.store() as store:
+                    self.assertEqual([(a.id, a.delivery) for a in store.attempts(task_id)], previous)
+            else:
+                self.assertEqual(code, 0, err)
+                self.assertEqual('接近交接上限' in out, total + 1 >= 48)
+                with self.store() as store:
+                    self.assertEqual(store.attempts(task_id)[-1].seq, total + 1)
+
+    def test_capacity_auto_review_fallback_reaches_cli_and_status(self) -> None:
+        self.caller = as_agent(LEAD)
+        task_id = self.send('--review-by', 'claude@review')
+        self.mark_sent(task_id)
+        self.fill_capacity(task_id, 60)
+        self.caller = as_agent(IMPL)
+        code, out, err = self.run_cli('report', task_id, '--attempt', '1', '--result')
+        self.assertEqual(code, 0, err)
+        self.assertIn('已排队通知发起方', out)
+        self.assertIn('复核未能排入（交接次数已达上限）', out)
+        self.assertIn('后续由发起方决定', out)
+        self.assertNotIn(f'请 {CMD} close', out)
+        self.assertEqual(self.run_cli('close', task_id)[0], 3)  # 汇报方没有收尾权限
+        self.caller = as_agent(LEAD)
+        code, out, err = self.run_cli('status', task_id)
+        self.assertEqual(code, 0, err)
+        self.assertIn('复核未能排入', out)
+        self.assertIn('close 后新开任务复核', out)
+
+    def test_capacity_notice_reminder_status_and_summary_next_keep_actions_without_retry(self) -> None:
+        from agentstatus_bridge.labels import next_step
+        from agentstatus_bridge.reminders import reminder_body
+        for total, kind, action in ((59, '--blocked', 'rework_or_close'), (60, '--result', 'accept')):
+            self.caller = as_agent(LEAD)
+            task_id = self.send()
+            self.mark_sent(task_id)
+            self.fill_capacity(task_id, total - 1)
+            with self.store() as store:
+                work = store.add_attempt(task_id, role=Role.HANDOFF, target=IMPL.ref, body='boundary fixture',
+                                         refs=[], now=4, sender=LEAD.ref, sender_class='bypass')
+            self.mark_sent(task_id)
+            self.caller = as_agent(IMPL)
+            code, _, err = self.run_cli('report', task_id, '--attempt', str(work.seq), kind)
+            self.assertEqual(code, 0, err)
+            with self.store() as store:
+                task = store.get_task(task_id)
+                attempts = store.attempts(task_id)
+                self.assertEqual(attempts[-1].seq, total + 1)
+                self.assertNotIn('retry', attempts[-1].body)
+                reminder = reminder_body(task, attempts, cli.describe(task, attempts))
+                self.assertNotIn('retry', reminder)
+                step = next_step(task, attempts, ref=task_id)
+                entry = summary._task_entry(task, attempts)
+                self.assertEqual(step.action, action)
+                self.assertEqual(entry['next']['action'], action)
+                self.assertNotIn('retry', entry['next']['text'])
+                self.assertNotIn('retry', entry['next']['command'])
+            self.caller = as_agent(LEAD)
+            code, out, err = self.run_cli('status', task_id)
+            self.assertEqual(code, 0, err)
+            next_lines = [line for line in out.splitlines() if line.startswith('下一步：')]
+            self.assertEqual(len(next_lines), 1)
+            self.assertNotIn('retry', next_lines[0])
+
+    def test_work_58_blocked_notice_59_still_allows_retry_in_status_and_summary(self) -> None:
+        self.caller = as_agent(LEAD)
+        task_id = self.send()
+        self.mark_sent(task_id)
+        self.fill_capacity(task_id, 57)
+        with self.store() as store:
+            work = store.add_attempt(task_id, role=Role.HANDOFF, target=IMPL.ref, body='boundary fixture',
+                                     refs=[], now=4, sender=LEAD.ref, sender_class='bypass')
+            self.assertEqual(work.seq, 58)
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        code, _, err = self.run_cli('report', task_id, '--attempt', '58', '--blocked')
+        self.assertEqual(code, 0, err)
+        with self.store() as store:
+            attempts = store.attempts(task_id)
+            self.assertEqual(attempts[-1].seq, 59)
+            self.assertIn(f'{CMD} retry', attempts[-1].body)
+            entry = summary._task_entry(store.get_task(task_id), attempts)
+            self.assertEqual(entry['next']['action'], 'rework_or_close')
+            self.assertEqual(entry['next']['command'], f'{CMD} retry {task_id}')
+            self.assertIn(f'{CMD} retry {task_id}', entry['next']['text'])
+        self.caller = as_agent(LEAD)
+        code, out, err = self.run_cli('status', task_id)
+        self.assertEqual(code, 0, err)
+        next_lines = [line for line in out.splitlines() if line.startswith('下一步：')]
+        self.assertEqual(len(next_lines), 1)
+        self.assertIn(f'{CMD} retry {task_id[:8]}', next_lines[0])
+        code, _, err = self.run_cli('retry', task_id)
+        self.assertEqual(code, 0, err)
+        with self.store() as store:
+            self.assertEqual(store.attempts(task_id)[-1].seq, 60)
+            self.assertEqual(store.attempts(task_id)[-1].role, Role.HANDOFF)
+
+    def test_pending_capacity_report_and_status_address_different_readers(self) -> None:
+        self.caller = as_agent(LEAD)
+        task_id = self.send('--review-by', 'claude@review')
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        with patch.object(Store, 'add_attempt', side_effect=StoreError('capacity_pending')):
+            code, out, err = self.run_cli('report', task_id, '--attempt', '1', '--result', '--json')
+        self.assertEqual(code, 0, err)
+        document = json.loads(out)
+        self.assertEqual(document['reportSkipped'], {'review': 'capacity_pending', 'result': 'capacity_pending'})
+        warnings = '\n'.join(document['warnings'])
+        self.assertIn('复核未能排入（全局待投递容量已满）', warnings)
+        self.assertIn('后续由发起方决定', warnings)
+        self.assertIn('不要重复汇报', warnings)
+        self.assertNotIn('稍后再试', warnings)
+        self.caller = as_agent(LEAD)
+        code, out, err = self.run_cli('status', task_id)
+        self.assertEqual(code, 0, err)
+        self.assertIn('全局待投递容量已满', out)
+        self.assertIn('队列腾空后', out)
+        self.assertIn('若本任务还有提醒名额且仍符合提醒条件', out)
+        self.assertNotIn('总序号≤60', out)
+        self.assertNotIn('原30分钟', out)
+        self.assertNotIn('稍后再试', out)
+        self.assertNotIn('不要重复汇报', out)
+
+    def test_capacity_queued_notice_without_worker_still_returns_6(self) -> None:
+        self.caller = as_agent(LEAD)
+        task_id = self.send()
+        self.mark_sent(task_id)
+        self.fill_capacity(task_id, 60)
+        self.caller = as_agent(IMPL)
+        self.worker_up = False
+        with patch.object(cli, 'ensure_worker', side_effect=OSError('fixture startup failed')):
+            code, out, err = self.run_cli('report', task_id, '--attempt', '1', '--result', '--json')
+        self.assertEqual(code, 6, err)
+        self.assertEqual(json.loads(out)['reportSkipped'], {})
+        with self.store() as store:
+            self.assertIs(store.attempts(task_id)[0].work, Work.RESULT)
+            self.assertEqual(store.attempts(task_id)[-1].seq, 61)
+
     def test_peers_json_lists_the_threads_a_codex_process_holds(self) -> None:
         """诊断用：多 thread 的 Codex 进程在 peers --json 里列出持有集合（DESIGN §45.48 R1，Codex 实现复核 C02）。"""
         root, child = "019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa", "019a0000-cccc-7ccc-8ccc-cccccccccccc"

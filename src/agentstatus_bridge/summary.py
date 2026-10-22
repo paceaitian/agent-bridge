@@ -471,7 +471,7 @@ def _task_entry(task: Task, attempts: list[Attempt]) -> dict[str, Any]:
     attention: dict[str, Any] = {"kind": kind}
     if kind != "none":
         attention.update(token=attention_token(task, view), at=attention_at(task, view), notify=notify)
-    step = next_step(task, attempts, ref=task.id)
+    step = next_step(task, attempts, ref=task.id, reserved=0)
     target: dict[str, Any] | None = None
     if current is not None:
         bound = binding(current)

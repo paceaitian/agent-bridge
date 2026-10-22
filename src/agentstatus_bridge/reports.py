@@ -5,7 +5,8 @@
 显式 `--manual` 代为补记。只推进当前尝试，陈旧尝试、已交结果后的重复结果都拒绝。
 
 原子性：文件 hash 与提交校验在事务外完成；随后在一个事务内重新校验并写入汇报、复核结论与
-后续请求。中断或并发重复时整体回滚或被拒，不会出现“结果已交但复核请求缺失”。
+后续请求。中断或并发重复时整体回滚或被拒；仅容量不足时跳过后续请求并记事件，
+不丢失已交结果。自动复核排不进时改通知发起方（DESIGN §83）。
 """
 
 from __future__ import annotations
@@ -36,9 +37,9 @@ from .model import (
     Work,
     work_attempts,
 )
-from .labels import next_step
+from .labels import next_step, review_capacity_hint
 from .paths import codex_home as default_codex_home
-from .store import MAX_BODY_BYTES, MAX_FILES, Store, StoreError
+from .store import CAPACITY_CODES, MAX_BODY_BYTES, MAX_FILES, Store, StoreError
 from .notification_policy import can_notify, wire_ref
 
 MAX_NOTE_CHARS = 4000
@@ -81,6 +82,8 @@ class ReportOutcome:
     task: Task
     attempt: Attempt
     followups: list[Attempt] = field(default_factory=list)
+    # 容量降级路线（review/result）到原因码；只影响展示，不用它恢复或重发。
+    skipped: dict[str, str] = field(default_factory=dict)
 
 
 GitRunner = Callable[[Path, str], str | None]
@@ -308,6 +311,7 @@ def apply_report(
     commit = _commit_reference(report.commit, cwd=cwd, git=git) if report.commit else None
 
     followups: list[Attempt] = []
+    skipped: dict[str, str] = {}
     with store.transaction():
         # 事务内重新读取并校验：并发的重复汇报在这里被拒绝
         current_task = store.get_task(task.id)
@@ -362,8 +366,8 @@ def apply_report(
         ):
             if not can_notify(current_task.reviewer):
                 raise ReportError('target_no_inbox')  # rolls back result and auto-review together
-            followups.append(
-                store.add_attempt(
+            try:
+                followups.append(store.add_attempt(
                     task.id,
                     role=Role.REVIEW,
                     target=current_task.reviewer,
@@ -374,10 +378,16 @@ def apply_report(
                     sender_class=first.sender_class,
                     # 登记工作流时对共享 thread 的放行同样适用于复核目标
                     options={"allowShared": first.allow_shared or current_task.options.get("allowShared") is True},
-                )
-            )
-        elif (
-            kind in (ReportKind.RESULT, ReportKind.BLOCKED, ReportKind.FAILED, ReportKind.APPROVE, ReportKind.CHANGES)
+                ))
+            except StoreError as error:
+                if error.code not in CAPACITY_CODES:
+                    raise
+                skipped['review'] = error.code
+                store.add_event(task.id, 'review_skipped_capacity', now=now, attempt_seq=attempt.seq,
+                                detail={'reason': error.code})
+        if (
+            not followups
+            and kind in (ReportKind.RESULT, ReportKind.BLOCKED, ReportKind.FAILED, ReportKind.APPROVE, ReportKind.CHANGES)
             and current_task.origin is not None
             and current_task.notify_origin
             and can_notify(current_task.origin)
@@ -385,20 +395,28 @@ def apply_report(
         ):
             # 发起方最容易忘的是收尾：按本次写入后的阶段写明下一步（验收/返工/关闭），事务内读得到刚写入的状态
             written_task = store.get_task(task.id) or current_task
-            step = next_step(written_task, store.attempts(task.id), ref=short(task.id))
-            followups.append(
-                store.add_attempt(
+            step = next_step(written_task, store.attempts(task.id), ref=short(task.id), reserved=1)
+            next_text = step.text if step else None
+            if 'review' in skipped:
+                next_text = review_capacity_hint(skipped['review'])
+            try:
+                followups.append(store.add_attempt(
                     task.id,
                     role=Role.NOTICE,
                     target=current_task.origin,
-                    body=notice_body(current_task, attempt, kind, result, next_text=step.text if step else None),
+                    body=notice_body(current_task, attempt, kind, result, next_text=next_text),
                     refs=files,
                     now=now,
                     sender=caller.endpoint.ref if caller.endpoint else None,
                     sender_class=caller_class,
-                )
-            )
-        elif (current_task.origin is not None and not can_notify(current_task.origin)
+                ))
+            except StoreError as error:
+                if error.code not in CAPACITY_CODES:
+                    raise
+                skipped['result'] = error.code
+                store.add_event(task.id, 'notification_skipped', now=now, attempt_seq=attempt.seq,
+                                detail={'reason': error.code, 'route': 'result'})
+        elif (not followups and current_task.origin is not None and not can_notify(current_task.origin)
               and kind in (ReportKind.RESULT, ReportKind.BLOCKED, ReportKind.FAILED, ReportKind.APPROVE, ReportKind.CHANGES)):
             store.add_event(task.id, 'notification_skipped', now=now, attempt_seq=attempt.seq,
                             detail={'reason': 'poll_only', 'route': 'result'})
@@ -406,4 +424,4 @@ def apply_report(
     updated = store.get_attempt(attempt.id)
     if refreshed is None or updated is None:
         raise StoreError("corrupt_record")
-    return ReportOutcome(task=refreshed, attempt=updated, followups=followups)
+    return ReportOutcome(task=refreshed, attempt=updated, followups=followups, skipped=skipped)

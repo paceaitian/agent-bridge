@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import replace
 from itertools import product
 import unittest
+from unittest.mock import patch
 
-from agentstatus_bridge import cli, labels, views
+from agentstatus_bridge import cli, labels, views, store as store_module
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
 from agentstatus_bridge.ids import short
 from agentstatus_bridge.labels import next_step
@@ -139,6 +140,79 @@ class NextStepTests(unittest.TestCase):
         # 打印路径是直接下标（cli.peers / cli.send），漏一个成员就是 KeyError 而不是难看的文案
         self.assertEqual(set(labels.RUNTIME_LABELS), set(Runtime))
 
+    def test_capacity_next_step_keeps_actions_but_removes_unavailable_retry(self) -> None:
+        cases = [
+            (task(), attempt(delivery=Delivery.HELD), 'approve_at_target'),
+            (task(), attempt(delivery=Delivery.UNKNOWN), 'confirm_then_force_retry'),
+            (task(), attempt(delivery=Delivery.FAILED), 'retry_or_close'),
+            (task(), attempt(delivery=Delivery.CANCELLED), 'retry_or_close'),
+            (task(), attempt(work=Work.BLOCKED), 'rework_or_close'),
+            (task(), attempt(work=Work.FAILED), 'rework_or_close'),
+            (task(flow=Flow.REVIEW), attempt(role=Role.REVIEW, work=Work.RESULT), 'ask_reviewer_or_retry'),
+            (task(flow=Flow.REVIEW, verdict=Verdict.CHANGES), attempt(role=Role.REVIEW, work=Work.RESULT), 'rework'),
+            (task(), attempt(work=Work.RESULT), 'accept'),
+        ]
+        for item, work, action in cases:
+            for seq, reserved, limited in ((58, 1, False), (59, 0, False), (59, 1, True),
+                                           (60, 0, True), (60, 1, True), (64, 0, True)):
+                with self.subTest(action=action, seq=seq, reserved=reserved):
+                    step = next_step(item, [replace(work, seq=seq)], ref='TASK', command='trial', reserved=reserved)
+                    self.assertIsNotNone(step)
+                    self.assertEqual(step.action, action)
+                    if limited:
+                        self.assertNotIn('retry', step.text)
+                        self.assertNotIn('retry', step.command or '')
+                        self.assertIn('trial close TASK 后 trial send 新任务', step.text)
+                        expected = {'accept': 'trial accept TASK', 'approve_at_target': None}
+                        self.assertEqual(step.command, expected.get(action, 'trial close TASK'))
+                        if action == 'approve_at_target':
+                            self.assertIn('批准这条消息；若已过期，', step.text)
+                        elif action == 'confirm_then_force_retry':
+                            self.assertIn('先确认对方没收到（也不会再汇报），再', step.text)
+                        elif action == 'ask_reviewer_or_retry':
+                            self.assertIn('让复核方补交结论，或 ', step.text)
+                    else:
+                        self.assertIn('retry', step.text)
+
+    def test_review_capacity_hint_distinguishes_capacity_and_audience(self) -> None:
+        for reporter in (False, True):
+            pending = labels.review_capacity_hint('capacity_pending', reporter=reporter)
+            attempts = labels.review_capacity_hint('capacity_attempts', reporter=reporter)
+            self.assertIn('全局待投递容量已满', pending)
+            self.assertNotIn('交接次数已达上限', pending)
+            self.assertIn('交接次数已达上限', attempts)
+            if reporter:
+                self.assertIn('后续由发起方决定', pending)
+                self.assertNotIn(f'请 {CMD} close', pending)
+            else:
+                self.assertIn(f'请 {CMD} close 后新开任务复核', pending)
+
+    def test_notification_capacity_text_has_distinct_audience_without_retry_contradiction(self) -> None:
+        for code in ('capacity_pending', 'capacity_attempts'):
+            report = labels.notification_capacity_hint(code, reporter=True)
+            status = labels.notification_capacity_hint(code)
+            self.assertIn('不要重复汇报', report)
+            self.assertIn('发起方需', report)
+            self.assertNotIn('不要重复汇报', status)
+            self.assertIn('对方汇报已提交', status)
+            for text in (report, status):
+                self.assertNotIn('稍后再试', text)
+                if code == 'capacity_pending':
+                    self.assertIn('全局待投递容量已满', text)
+                    self.assertIn('队列腾空后', text)
+                    self.assertIn('若本任务还有提醒名额', text)
+                    self.assertIn('仍符合提醒条件', text)
+                    self.assertNotRegex(text, r'\d')
+                else:
+                    self.assertIn('交接次数已达上限', text)
+                    self.assertNotIn('30分钟', text)
+
+    def test_reminder_limit_is_derived_from_notice_reserve(self) -> None:
+        with patch.object(store_module, 'NOTICE_RESERVE', 5):
+            self.assertEqual(store_module.attempt_limit(Role.HANDOFF), 59)
+            self.assertEqual(store_module.attempt_limit(Role.NOTICE, {'reminderToken': 'fixture'}), 60)
+            self.assertEqual(store_module.attempt_limit(Role.NOTICE), 64)
+
     def test_every_report_kind_has_an_event_label(self) -> None:
         # cmd_report 的打印路径也是直接下标：ReportKind 是闭合枚举，漏一个成员就该是 KeyError
         # （EVENT_LABELS 还含账本里的其他事件名，所以是包含关系而不是相等）
@@ -166,7 +240,8 @@ class ReasonTextCommandTests(unittest.TestCase):
         carriers = [code for code, text in labels.REASON_TEXTS.items() if labels.PLACEHOLDER in text]
         # 清理范围是 6 条，不是 3 条：DESIGN 与提交信息原来都记错了（独立 Opus 审计 P2-1）；
         # §53.3.8 加了 3 条（标题缺 id 的目标文案、汇报与发起的未归属文案都指向 doctor）
-        self.assertEqual(len(carriers), 9, carriers)
+        # §83 及审计 r1 按读者/原因分开的容量文案同样使用当前入口名。
+        self.assertEqual(len(carriers), 15, carriers)
         for code in labels.REASON_TEXTS:
             with self.subTest(code=code):
                 self.assertNotIn(labels.PLACEHOLDER, labels.reason_text(code, command="testcmd"))

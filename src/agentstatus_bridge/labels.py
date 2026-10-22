@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from .model import Attempt, Consumption, Delivery, Phase, Role, Runtime, Task, Work, describe
 from .naming import command_name
-from .store import MAX_BODY_BYTES, MAX_FILES
+from .store import MAX_BODY_BYTES, MAX_FILES, attempt_limit
 from .transports.codex_queue import READABLE_REASONS
 
 # 原因文案里的命令名占位：文案是模块级常量，只能在 `reason_text` 里按本次进程的入口名替换
@@ -128,7 +128,13 @@ REASON_TEXTS: dict[str, str] = {
     "message_too_large": f"任务内容过长（上限 {MAX_BODY_BYTES // 1024} KiB），请改用 --ref 引用文件",
     "capacity_active_tasks": "进行中的任务过多（上限 100），请先验收或关闭一些",
     "capacity_pending": "排队中的消息过多，请稍后再试",
-    "capacity_attempts": "这项任务的交接次数已达上限",
+    "capacity_attempts": "这项任务的交接次数已达上限；请 {command} close 旧任务，再 {command} send 新任务",
+    "attempts_near_limit": "接近交接上限，长迭代建议 {command} close 旧任务、{command} send 新任务",
+    "report_attempts_near_limit": "接近交接上限，后续由发起方决定 {command} close 本任务、{command} send 新任务",
+    "notification_attempts_report": "汇报已提交，通知未能排队（交接次数已达上限），发起方需 {command} status 查看；不要重复汇报",
+    "notification_pending_report": "汇报已提交，通知未能排队（全局待投递容量已满），发起方需 {command} status 查看；不要重复汇报。队列腾空后，若本任务还有提醒名额且仍符合提醒条件，提醒会照常叫醒发起方",
+    "notification_attempts_status": "对方汇报已提交，通知因交接次数已达上限未排队；请查看本任务结果并决定 {command} close 后新开任务",
+    "notification_pending_status": "对方汇报已提交，通知因全局待投递容量已满未排队；请查看本任务结果。队列腾空后，若本任务还有提醒名额且仍符合提醒条件，提醒会照常叫醒发起方",
     "store_unavailable": "任务账本无法打开",
     "store_corrupt": "任务账本已损坏",
     "store_busy": "任务账本正忙，请重试",
@@ -234,7 +240,25 @@ EVENT_LABELS: dict[str, str] = {
     "origin_reminded": "超时未处理，提醒发起方",
     "closure_created": "排队结束回执",
     "closure_skipped_capacity": "容量已满，未排结束回执",
+    "notification_skipped": "未排通知",
+    "review_skipped_capacity": "容量已满，未排复核请求",
 }
+
+
+def review_capacity_hint(code: str, *, reporter: bool = False) -> str:
+    """两种容量拒绝的复核降级提示；汇报方只获知决定归发起方，不被要求自行 close。"""
+    reason = "交接次数已达上限" if code == "capacity_attempts" else "全局待投递容量已满"
+    cmd = command_name()
+    if reporter:
+        return f"复核未能排入（{reason}）；结果已提交，后续由发起方决定 {cmd} close 本任务、{cmd} send 新任务复核"
+    return f"复核未能排入（{reason}），请 {cmd} close 后新开任务复核"
+
+
+def notification_capacity_hint(code: str, *, reporter: bool = False) -> str:
+    """容量跳过通知的完整文案：按原因与读者选择，不能拼上通用的“稍后再试”。"""
+    capacity = 'attempts' if code == 'capacity_attempts' else 'pending'
+    audience = 'report' if reporter else 'status'
+    return reason_text(f'notification_{capacity}_{audience}')
 
 
 def reason_text(code: str | None, *, command: str | None = None) -> str:
@@ -268,14 +292,20 @@ class NextStep:
     command: str | None = None
 
 
-def next_step(task: Task, attempts: list[Attempt], *, ref: str, command: str | None = None) -> NextStep | None:
+def next_step(
+    task: Task, attempts: list[Attempt], *, ref: str, command: str | None = None, reserved: int = 0
+) -> NextStep | None:
     """按任务当前阶段给出下一步；ref 是命令里的任务标识（CLI 用短 ID，摘要用完整 ID）。
 
     命令名缺省按本进程入口解析：这些文案会进摘要的 `next.command`，也会被用户直接照抄（DESIGN §45.36）。
+    reserved 是正文写成后还要插入的通知数；达到工作上限时只改文案/命令，不改摘要 action 枚举。
     """
     cmd = command or command_name()
     view = describe(task, attempts)
     reason = view.reason
+    at_capacity = max((item.seq for item in attempts), default=0) + reserved >= attempt_limit(Role.HANDOFF)
+    close_command = f"{cmd} close {ref}"
+    close_text = f"交接次数已达上限，{close_command} 后 {cmd} send 新任务"
     if view.phase is Phase.DONE or view.phase is Phase.CLOSED:
         return None
     if reason == "paused":
@@ -284,20 +314,32 @@ def next_step(task: Task, attempts: list[Attempt], *, ref: str, command: str | N
         return NextStep("wait", f"等后台 worker 发送；不需要了可 {cmd} cancel {ref}")
     if reason == "delivery_held":
         # 等接收方批准时重发没有帮助，只提示去对方会话处理
+        if at_capacity:
+            return NextStep("approve_at_target", f"去对方会话里批准这条消息；若已过期，{close_text}")
         return NextStep("approve_at_target", f"去对方会话里批准这条消息；过期后可 {cmd} retry")
     if reason == "delivery_unknown":
+        if at_capacity:
+            return NextStep("confirm_then_force_retry", f"不会自动重发。交接次数已达上限；先确认对方没收到（也不会再汇报），再 {close_command} 后 {cmd} send 新任务", close_command)
         return NextStep(
             "confirm_then_force_retry",
             f"不会自动重发。确认对方没收到后可 {cmd} retry {ref} --force",
             f"{cmd} retry {ref} --force",
         )
     if reason.startswith("delivery_") or reason == "cancelled_undelivered":
+        if at_capacity:
+            return NextStep("retry_or_close", f"未送达；{close_text}", close_command)
         return NextStep("retry_or_close", f"未送达：{cmd} retry {ref}（可加 --to 改派）或 {cmd} close {ref}", f"{cmd} retry {ref}")
     if reason in {"blocked_reported", "failure_reported"}:
+        if at_capacity:
+            return NextStep("rework_or_close", close_text, close_command)
         return NextStep("rework_or_close", f"处理对方的问题后 {cmd} retry {ref} 返工，或 {cmd} close {ref}", f"{cmd} retry {ref}")
     if reason == "review_verdict_missing":
+        if at_capacity:
+            return NextStep("ask_reviewer_or_retry", f"让复核方补交结论，或 {close_text}", close_command)
         return NextStep("ask_reviewer_or_retry", f"让复核方补交结论，或 {cmd} retry {ref} 重新复核", f"{cmd} retry {ref}")
     if reason == "changes_requested":
+        if at_capacity:
+            return NextStep("rework", f"{close_text}；也可 {cmd} accept {ref} --force", close_command)
         return NextStep(
             "rework", f"{cmd} retry {ref} 把复核意见交回实现方返工，或 {cmd} accept {ref} --force", f"{cmd} retry {ref}"
         )
@@ -307,6 +349,8 @@ def next_step(task: Task, attempts: list[Attempt], *, ref: str, command: str | N
         # 复核已通过时普通 retry 会被要求 --force，且那是重新复核而不是返工：不建议（Codex 设计复审 F04）
         return NextStep("accept", f"{cmd} accept {ref} 验收；复核结论见 {cmd} status {ref}", f"{cmd} accept {ref}")
     if view.phase is Phase.AWAITING_ACCEPTANCE:
+        if at_capacity:
+            return NextStep("accept", f"{cmd} accept {ref} 验收；如需返工，{close_text}", f"{cmd} accept {ref}")
         return NextStep("accept", f"{cmd} accept {ref} 验收；需要返工用 {cmd} retry {ref}", f"{cmd} accept {ref}")
     if view.phase is Phase.RUNNING and view.current is not None:
         if view.current.delivery is Delivery.WRITTEN:

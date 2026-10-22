@@ -22,6 +22,8 @@ from .labels import (
     next_step,
     reason_text,
     role_label,
+    review_capacity_hint,
+    notification_capacity_hint,
 )
 from .model import (
     CLOSURE_KIND,
@@ -38,7 +40,7 @@ from .model import (
     describe,
 )
 from .naming import command_name
-from .store import Store
+from .store import CAPACITY_CODES, Store
 from .platforms.factory import get_platform
 
 
@@ -208,7 +210,7 @@ def _task_document(
 
 
 def _next_step(task: Task, attempts: list[Attempt]) -> str | None:
-    step = next_step(task, attempts, ref=short(task.id))
+    step = next_step(task, attempts, ref=short(task.id), reserved=0)
     return step.text if step is not None else None
 
 
@@ -321,6 +323,10 @@ def _print_task(
                     label = kind
             detail = event["detail"] if isinstance(event["detail"], dict) else {}
             extra = detail.get("note") or detail.get("text") or reason_text(detail.get("reason"))
+            if kind == 'notification_skipped' and detail.get('reason') in CAPACITY_CODES:
+                extra = notification_capacity_hint(detail['reason'])
+            elif kind == 'review_skipped_capacity' and detail.get('reason') in CAPACITY_CODES:
+                extra = review_capacity_hint(detail['reason'])
             suffix = f"：{str(extra)[:160]}" if extra else ""
             seq = f" #{event['attemptSeq']}" if event["attemptSeq"] else ""
             print(f"  {_clock(float(event['at']))}{seq} {label or kind}{suffix}")

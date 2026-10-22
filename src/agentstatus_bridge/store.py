@@ -31,6 +31,7 @@ from .model import (
     CLOSURE_KIND,
     HANDED_OVER,
     NOTICE_KIND_OPTION,
+    REMINDER_OPTION,
     Attempt,
     Consumption,
     Delivery,
@@ -49,6 +50,12 @@ SCHEMA_VERSION = 2
 DB_NAME = "bridge.sqlite3"
 MAX_ACTIVE_TASKS = 100
 MAX_ATTEMPTS_PER_TASK = 64
+# 通知预留总额；其中最多一个名额可用于提醒，其余留给终态通知和结束回执。
+NOTICE_RESERVE = 4
+# 按全部尝试序号计数的提前提示阈值，不是工作轮次数。
+ATTEMPT_WARNING_THRESHOLD = 48
+# 仅这两种写前容量拒绝允许业务层跳过附带消息，不回滚主状态。
+CAPACITY_CODES = frozenset({"capacity_attempts", "capacity_pending"})
 MAX_PENDING_ATTEMPTS = 256
 # 接收 pane 只接受 tmux 形式，与摘要 binding 同一口径（DESIGN §45.24）
 _PANE_RE = re.compile(r"%[0-9]+")
@@ -65,6 +72,15 @@ FINISHED_RETENTION_SECONDS = 30 * 86400
 MAX_FINISHED_TASKS = 1000
 WITHDRAWAL_RECOVERY_SECONDS = 600  # 远大于10秒受控等待预算，防止异空间/卡住的活动行永久占位（§73.6）
 WINDOWS_SENDING_RECOVERY_SECONDS = 600 + 120  # W2 add总预算＋余量；只恢复UNKNOWN，不重发
+
+
+def attempt_limit(role: Role, options: dict[str, Any] | None = None) -> int:
+    """§83：按全部尝试的序号限额，不能只数工作条数；提醒留出终态通知＋两个结束回执。"""
+    if role is not Role.NOTICE:
+        return MAX_ATTEMPTS_PER_TASK - NOTICE_RESERVE
+    if options is not None and REMINDER_OPTION in options:
+        return MAX_ATTEMPTS_PER_TASK - (NOTICE_RESERVE - 1)
+    return MAX_ATTEMPTS_PER_TASK
 
 _SCHEMA_V2: tuple[str, ...] = (
     """CREATE TABLE IF NOT EXISTS meta (
@@ -569,7 +585,7 @@ class Store:
                     "SELECT COALESCE(MAX(seq), 0) FROM attempts WHERE task_id = ?", (task_id,)
                 ).fetchone()[0]
             ) + 1
-            if seq > MAX_ATTEMPTS_PER_TASK:
+            if seq > attempt_limit(role, options):
                 raise StoreError("capacity_attempts")
             self._check_pending_capacity(conn)
             attempt = self._insert_attempt(
