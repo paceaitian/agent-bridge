@@ -117,7 +117,6 @@ class Discovery:
                 'namingComplete': self.names_complete,
                 'hiddenEphemeral': self.hidden_ephemeral, 'loadedTotal': self.loaded_total,
                 'nativeReads': self.native_reads, 'nativeReadBudgetHit': self.native_read_budget_hit,
-                'qualification': 'implementation_only_pending_w2_5',
                 'aliasState': self.aliases.reason, 'warning': NO_PANE_WARNING,
                 'unavailableAliases': [{'alias': a, 'reason': 'alias_target_unavailable',
                                         'message': '别名目标当前不可用'} for a in self.aliases.unavailable],

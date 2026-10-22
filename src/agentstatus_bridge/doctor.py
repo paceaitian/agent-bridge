@@ -12,6 +12,7 @@ from pathlib import Path
 import sqlite3
 
 from . import __version__, summary
+from .caller_diagnostic import collect as caller_diagnostic
 from .endpoints import codex_title_report
 from .naming import command_name
 from .platforms.factory import get_platform
@@ -54,9 +55,7 @@ def collect_checks() -> dict[str, object]:
     if get_platform().name == 'windows':
         checks: dict[str, object] = {
             'abVersion': __version__, 'platform': 'windows', 'providerEnabled': True,
-            'processQualification': 'unverified', 'discovery': 'unverified',
-            'codexVersion': 'not_queried', 'runtime': 'unsupported', 'workerAutomatic': True,
-            'windowsRealMachineGate': 'not_run', 'registrationAuthority': 'unverified',
+            'codexVersion': 'not_queried', 'workerAutomatic': True,
         }
         diagnostic = daemon_diagnostic(get_platform().files.codex_home)
         checks['codexDaemon'] = diagnostic
@@ -64,8 +63,8 @@ def collect_checks() -> dict[str, object]:
         from .platforms.windows.commands import claude_evidence  # layout: allow W3 bounded native metadata, never key contents
         native_claude = claude_evidence()
         checks['claudePeer'] = {'complete': native_claude.complete, 'reason': native_claude.reason,
-                               'eligibleCount': len(native_claude.endpoints), 'authentication': 'not_probed',
-                               'productAcceptance': 'not_run'}
+                               'eligibleCount': len(native_claude.endpoints), 'authentication': 'not_probed'}
+        checks['caller'] = caller_diagnostic()
         from .platforms.windows.worker_identity import diagnostic as worker_diagnostic  # layout: allow Windows本地worker证据，无provider外调
         from .platforms.windows.files import WindowsPaths  # layout: allow doctor窄平台分支
         files = get_platform().files
@@ -131,6 +130,7 @@ def collect_checks() -> dict[str, object]:
     except StoreError as error:
         checks["ledgerOk"] = False
         checks["ledgerError"] = error.code
+    checks['caller'] = caller_diagnostic()
     return checks
 
 
@@ -157,6 +157,12 @@ def print_checks(checks: dict[str, object]) -> None:
         "workerLog": "worker 最近日志",
     }
     for key, value in checks.items():
+        if key == 'caller' and isinstance(value, dict):
+            print(f"调用者：agent 已归属={'是' if value.get('attributed') else '否'}；"
+                  f"via={value.get('via')}；rejection={value.get('rejection')}；"
+                  f"祖先链 termination={value.get('termination')}，长度={value.get('chainLength')}；"
+                  f"最近 agent={value.get('nearestAgent')}")
+            continue
         if key == "codexQueueEvidence" and isinstance(value, dict):
             print(queue_evidence_text(value))
             continue

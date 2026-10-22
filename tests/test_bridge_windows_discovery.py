@@ -148,7 +148,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(bytes(self.k.http).split(b'\r\n')[0], b'GET /rpc HTTP/1.1')
         self.assertNotIn(b'/daemon/shutdown', self.k.socket_out)
         self.assertTrue(result.document()['providerEnabled'])
-        self.assertEqual(result.document()['qualification'],'implementation_only_pending_w2_5')
+        self.assertNotIn('qualification', result.document())
         self.assertEqual(result.document()['warning'], D.NO_PANE_WARNING)
         self.assertEqual(result.document()['peers'][0]['warning'], D.NO_PANE_WARNING)
         self.assertEqual(result.document()['peers'][0]['runtime'], 'unknown')

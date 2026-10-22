@@ -121,6 +121,13 @@ def record_linux():
         stack.enter_context(patch.object(doctor, 'cli_version', return_value=None))
         stack.enter_context(patch.object(doctor, 'inbox_directory', return_value=root/'inbox'))
         stack.enter_context(patch.object(doctor, 'package_path', return_value='<package>/agentstatus_bridge'))
+        # W3.2 adds caller diagnostics only. Keep the frozen pre-W1 contract intact;
+        # real attribution is covered separately by test_bridge_caller_diagnostic.
+        caller = {'attributed': False, 'via': None, 'rejection': None,
+                  'termination': 'root', 'chainLength': 1, 'nearestAgent': None}
+        has_caller = hasattr(doctor, 'caller_diagnostic')  # recorder still runs on frozen old src
+        if has_caller:
+            stack.enter_context(patch.object(doctor, 'caller_diagnostic', return_value=caller))
         for name in ('chmod', 'fchmod', 'fsync', 'replace', 'mkdir'):
             stack.enter_context(patch.object(os, name, side_effect=wrap(name)))  # layout: allow 固定五个OS调用的副作用轨迹；下方golden逐项比较
         stack.enter_context(patch.object(os, 'open', side_effect=opened))
@@ -131,7 +138,19 @@ def record_linux():
             out, err = io.StringIO(), io.StringIO()
             with redirect_stdout(out), redirect_stderr(err):
                 code = cli.main(list(args))
-            outputs.append([list(args), code, norm(out.getvalue()), norm(err.getvalue())])
+            shown = out.getvalue()
+            if args[0] == 'doctor' and has_caller:
+                if '--json' in args:
+                    data = json.loads(shown)
+                    if data.pop('caller') != caller:
+                        raise AssertionError('caller projection changed')
+                    shown = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + '\n'
+                else:
+                    line = '调用者：agent 已归属=否；via=None；rejection=None；祖先链 termination=root，长度=1；最近 agent=None\n'
+                    if shown.count(line) != 1:
+                        raise AssertionError('caller text missing or changed')
+                    shown = shown.replace(line, '')
+            outputs.append([list(args), code, norm(shown), norm(err.getvalue())])
             if code not in (0, 6):
                 raise AssertionError(outputs)
             return out.getvalue()

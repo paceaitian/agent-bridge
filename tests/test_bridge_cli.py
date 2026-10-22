@@ -127,6 +127,8 @@ class CliTests(unittest.TestCase):
             patch.object(doctor, "_runtime_available", return_value=True),
             # doctor 的标题检查会扫真实 /proc 与 tmux（DESIGN §53.5）
             patch.object(doctor, "codex_title_report", return_value={"daemonMode": False}),
+            patch.object(doctor, "caller_diagnostic", return_value={"attributed": False, "via": None,
+                         "rejection": None, "termination": "root", "chainLength": 2, "nearestAgent": None}),
             patch.object(cli, "discover", side_effect=discovering(lambda: list(self.endpoints), self.discovered)),
             patch.object(cli, "identify_caller", side_effect=lambda _endpoints: self.caller),
             patch.object(cli, "ensure_worker", return_value=False),

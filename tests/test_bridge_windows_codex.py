@@ -577,7 +577,7 @@ class WindowsCodexTests(unittest.TestCase):
             checks = doctor.collect_checks()
             self.assertTrue(checks['codexDaemon']['reachable'])
             self.assertTrue(checks['providerEnabled'])
-            self.assertEqual(checks['discovery'], 'unverified')
+            self.assertNotIn('discovery', checks)
             self.assertTrue(checks['workerAutomatic'])
             out = io.StringIO()
             with redirect_stdout(out), redirect_stderr(out):

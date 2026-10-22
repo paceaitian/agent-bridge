@@ -622,7 +622,7 @@ class WindowsTests(unittest.TestCase):
             self.assertEqual(doc['codexDaemon']['reason'], 'read_unavailable')
             self.assertEqual(doc['codexDaemon']['cliVersion'], 'unknown')
             self.assertFalse(any(n == 'connect' for n, _ in self.k.calls))
-            self.assertEqual(doc['discovery'],'unverified')
+            self.assertNotIn('discovery', doc)
             self.assertEqual(summary._observer_binding(Provider.CLAUDE,'synthetic','selected','%1',100,'s',10)['observerKeys'],[])
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(cli.main(['summary','--if-stale','--json']),0)
