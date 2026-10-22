@@ -61,6 +61,11 @@ def collect_checks() -> dict[str, object]:
         diagnostic = daemon_diagnostic(get_platform().files.codex_home)
         checks['codexDaemon'] = diagnostic
         checks['codexVersion'] = diagnostic['cliVersion']
+        from .platforms.windows.commands import claude_evidence  # layout: allow W3 bounded native metadata, never key contents
+        native_claude = claude_evidence()
+        checks['claudePeer'] = {'complete': native_claude.complete, 'reason': native_claude.reason,
+                               'eligibleCount': len(native_claude.endpoints), 'authentication': 'not_probed',
+                               'productAcceptance': 'not_run'}
         from .platforms.windows.worker_identity import diagnostic as worker_diagnostic  # layout: allow Windows本地worker证据，无provider外调
         from .platforms.windows.files import WindowsPaths  # layout: allow doctor窄平台分支
         files = get_platform().files

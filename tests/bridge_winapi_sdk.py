@@ -84,6 +84,10 @@ class FILE_ATTRIBUTE_TAG_INFO(C.Structure):
     _fields_ = [('FileAttributes', U32), ('ReparseTag', U32)]
 
 
+class FILE_ID_INFO(C.Structure):
+    _fields_ = [('VolumeSerialNumber', C.c_uint64), ('FileId', C.c_ubyte * 16)]
+
+
 def wide(value):
     raw = value.encode('utf-16-le', 'surrogatepass') + b'\0\0'
     return (U16 * (len(raw) // 2)).from_buffer_copy(raw)
@@ -120,6 +124,7 @@ SDK = {
         'CreateDirectoryW': (I32, [P, P]),
         'GetFileInformationByHandle': (I32, [H, P]),
         'GetFileInformationByHandleEx': (I32, [H, I32, P, U32]),
+        'SetFileInformationByHandle': (I32, [H, I32, P, U32]),
         'GetVolumeInformationByHandleW': (I32, [H, P, U32, P, P, P, P, U32]),
         'GetFinalPathNameByHandleW': (U32, [H, P, U32, U32]),
         'GetDriveTypeW': (U32, [P]),

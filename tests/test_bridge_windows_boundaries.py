@@ -309,9 +309,12 @@ class BoundaryTests(unittest.TestCase):
     def test_peer_rejected_before_http_and_boundary_root_still_checked(self):
         pid = self.k.processes[200]
         self.k.processes[200] = (*pid[:2], b'\x01\x01'+b'\0'*6+b'\x01\0\0\0', False, 'codex.exe')
-        with self.scope(): result = D.discover(self.p.transport)
-        self.assertFalse(result.complete)
-        self.assertEqual(bytes(self.k.socket_out), b'')
+        for stage in ('process', 'token', 'queryable'):
+            with self.subTest(stage=stage):
+                self.k.restricted_process_stage = stage
+                with self.scope(): result = D.discover(self.p.transport)
+                self.assertFalse(result.complete)
+                self.assertEqual(bytes(self.k.socket_out), b'')
         self.k.processes[200] = pid
         with self.scope():
             target = self.target()
@@ -370,6 +373,8 @@ class BoundaryTests(unittest.TestCase):
             self.k.processes[200]=(*self.k.processes[200][:4],'claude.exe')
             refused=C.identify(pid=100,environ=env,evidence=evidence)
             self.assertIsNone(refused.endpoint); self.assertFalse(refused.is_user_shell)
+            self.assertEqual(C.identify(pid=100,environ={**env,'CODEX_SESSION_ID':uuid(2)},evidence=evidence).rejection,'platform_unverified')
+            self.k.processes[200]=(*self.k.processes[200][:4],'codex.exe')
             self.assertEqual(C.identify(pid=100,environ={**env,'CODEX_SESSION_ID':uuid(2)},evidence=evidence).rejection,'subagent')
 
     def test_state_directory_repair_is_private_and_persistently_observed(self):

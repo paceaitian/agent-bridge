@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 from .platforms.factory import get_platform
+from .platforms.types import Presence
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -218,6 +219,19 @@ def _attribute(
         if caller.endpoint is not None:
             if not caller.endpoint.ref.same_session(attempt.target):
                 raise ReportError('reporter_mismatch')
+            if attempt.target.provider is Provider.CLAUDE:
+                expected_pid = attempt.delivery_detail.get('deliveredPid', attempt.target.pid)
+                expected_start = attempt.delivery_detail.get('deliveredStart', attempt.target.start_ticks)
+                ref = caller.endpoint.ref
+                if (ref.pid, ref.start_ticks) != (expected_pid, expected_start):
+                    if type(expected_pid) is not int or not isinstance(expected_start, str):
+                        raise ReportError('reporter_unattributed')
+                    from .platforms.windows.commands import receiver_presence  # layout: allow native prior-peer generation proof
+                    current = receiver_presence(expected_pid, expected_start)
+                    if current is Presence.CURRENT:
+                        raise ReportError('reporter_generation_mismatch')
+                    if current is not Presence.EXITED:
+                        raise ReportError('reporter_unattributed')
             # Current authenticated loaded-root attribution already proves the
             # caller's daemon generation. Historical daemon death is not revocation.
             return 'agent'

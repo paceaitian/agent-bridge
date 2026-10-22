@@ -159,7 +159,10 @@ class WindowsPaths:
 
     def grok_home(self) -> Path:
         raise OSError('windows_provider_not_enabled')
-    claude_sessions_dir = grok_home
+
+    def claude_sessions_dir(self) -> Path:
+        value = os.environ.get('CLAUDE_CONFIG_DIR')
+        return local_path(Path(value) if value is not None else Path.home() / '.claude') / 'sessions'
 
     def codex_sqlite_home(self) -> Path | None:
         value = os.environ.get('CODEX_SQLITE_HOME')

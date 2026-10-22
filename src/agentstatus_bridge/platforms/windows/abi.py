@@ -16,6 +16,10 @@ class FILE_ATTRIBUTE_TAG_INFO(C.Structure):
     _fields_ = [('attributes', DWORD), ('tag', DWORD)]
 
 
+class FILE_ID_INFO(C.Structure):
+    _fields_ = [('volume', C.c_uint64), ('file_id', C.c_ubyte * 16)]
+
+
 class FILETIME(C.Structure):
     _fields_ = [('low', DWORD), ('high', DWORD)]
 
@@ -115,6 +119,7 @@ SIGNATURES = {
         'CreateDirectoryW': (BOOL, [PTR, PTR]),
         'GetFileInformationByHandle': (BOOL, [HANDLE, PTR]),
         'GetFileInformationByHandleEx': (BOOL, [HANDLE, C.c_int32, PTR, DWORD]),
+        'SetFileInformationByHandle': (BOOL, [HANDLE, C.c_int32, PTR, DWORD]),
         'GetVolumeInformationByHandleW': (BOOL, [HANDLE, PTR, DWORD, PTR, PTR, PTR, PTR, DWORD]),
         'GetFinalPathNameByHandleW': (DWORD, [HANDLE, PTR, DWORD, DWORD]),
         'GetDriveTypeW': (DWORD, [PTR]),

@@ -304,10 +304,12 @@ class WindowsCodexTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_peer_failure_matrix_zero_bytes(self):
-        for case in ('pid_zero', 'pid_missing', 'pid_wrong', 'pid_query', 'peer_sid', 'peer_elevated',
-                     'self_elevated', 'query_denied', 'unknown_identity', 'pid_reused', 'peer_changes'):
-            with self.subTest(case=case):
+        cases = ('pid_zero', 'pid_missing', 'pid_wrong', 'pid_query', 'peer_sid', 'peer_elevated',
+                 'self_elevated', 'query_denied', 'unknown_identity', 'pid_reused', 'peer_changes')
+        for case, stage in ((case, stage) for case in cases for stage in ('process', 'token', 'queryable')):
+            with self.subTest(case=case, stage=stage):
                 self.rebuild()
+                self.k.restricted_process_stage = stage
                 if case == 'pid_zero': self.k.peer = 0
                 if case == 'pid_missing': self.k.peer = 404
                 if case == 'pid_wrong': self.k.peer_bytes = 8
@@ -519,7 +521,7 @@ class WindowsCodexTests(unittest.TestCase):
             deleted = codex_withdraw.QueueDeleteClient(lambda _: '0.162.1').delete(
                 self.home, thread=thread, item=thread, root_identity='synthetic', before_send=lambda _: self.fail('write boundary'))
             self.assertEqual((deleted.state, deleted.reason), ('not_attempted', 'windows_provider_not_enabled'))
-            self.assertEqual(set(worker.default_transports()), {worker.Provider.CODEX})
+            self.assertEqual(set(worker.default_transports()), {worker.Provider.CODEX,worker.Provider.CLAUDE})
         self.assertEqual(self.k.calls, [])
         with self.assertRaises(OSError): self.p.transport.new_stream()
 

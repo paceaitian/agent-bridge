@@ -172,6 +172,8 @@ def _selectors(endpoints: list[Endpoint]) -> dict[int, str]:
 
 
 def _receiver_class(endpoint: Endpoint) -> str | None:
+    if get_platform().name == 'windows':
+        return None  # No trustworthy launch argv; never call the Linux legacy process facade.
     info = procfs.read_process(endpoint.ref.pid)
     if info is None or info.start_ticks != endpoint.ref.start_ticks:
         return None
@@ -223,6 +225,8 @@ def _resolve(selector: str, endpoints: list[Endpoint]) -> Endpoint:
 def _hold_hint(target: Endpoint, sender_class: str | None) -> str | None:
     if target.ref.provider.value != "claude":
         return None
+    if get_platform().name == 'windows':
+        return "发送方类别未知：对方若是 bypass 会话需批准，默认 5 分钟过期"
     receiver = _receiver_class(target)
     if receiver == "bypass" and sender_class != "bypass":
         return "对方是 bypass 会话、发送方不是：消息会先等对方会话批准（默认 5 分钟过期）"
@@ -1148,7 +1152,7 @@ def cmd_summary(args: argparse.Namespace) -> int:
 def _report_error(args: argparse.Namespace, code: str) -> None:
     message = reason_text(code)
     if code == 'caller_unattributed' and get_platform().name == 'windows':
-        message += '；Windows 仅支持已认出的 Codex 根会话发起；Claude 发起尚未开放，终端手动发起不提供资格，--manual 不能绕过'
+        message += '；Windows 仅支持已认出的 Codex/Claude 会话发起；终端手动发起不提供资格，--manual 不能绕过'
     print(f"{command_name()}: {message} [{code}]", file=sys.stderr)
     if getattr(args, "json_errors", False) and getattr(args, "json", False):
         _print_json({"ok": False, "code": code, "reasonText": message})
@@ -1165,7 +1169,7 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     peers.set_defaults(handler=cmd_peers)
 
     send = commands.add_parser("send", help="把任务交给另一个会话")
-    send.add_argument("--to", required=True, help="目标：codex@会话名、pane（%%3）或会话 ID")
+    send.add_argument("--to", required=True, help="目标：codex@会话名 / claude@会话名、pane（%%3）或会话 ID")
     send.add_argument("-m", "--message", help="任务内容；- 表示从标准输入读取")
     send.add_argument("--file", help="从文件读取任务内容")
     send.add_argument("--title", help="任务标题（默认取内容第一行）")
@@ -1321,8 +1325,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     return _run_command(args)
             except NativeFailure as error:
                 _report_error(args, error.reason)
-                if error.reason in {'target_ambiguous','target_changed','target_names_unverified','target_not_found'}:
-                    print('目标未发送；请刷新 peers，用 codex@id:<完整UUID> 或 owner 别名消歧。', file=sys.stderr)
+                if error.reason in {'target_ambiguous','target_changed','target_names_unverified','target_not_found',
+                                    'discovery_incomplete','claude_discovery_incomplete','alias_target_unavailable'}:
+                    print('目标未发送；请刷新 peers，可加 claude@ / codex@ 前缀明确指定 provider，或用已核实的完整 UUID 消歧。', file=sys.stderr)
                 if error.reason == 'windows_provider_not_enabled':
                     return EXIT_NOT_ENABLED
                 return EXIT_TARGET if error.reason.startswith(('target_', 'alias_')) else EXIT_REJECTED
@@ -1347,7 +1352,21 @@ def _run_command(args: argparse.Namespace) -> int:
             from .platforms.windows.local_transport import WindowsPlatform  # layout: allow 已选择后端的窄能力
             backend = get_platform().transport
             result = codex_discovery.discover(backend) if isinstance(backend, WindowsPlatform) else codex_discovery.Discovery()
-            _print_json(result.document()) if args.json else codex_discovery.print_peers(result)
+            from .platforms.windows.commands import claude_evidence  # layout: allow W3 read-only registry candidates
+            peers = claude_evidence()
+            if args.json:
+                document = result.document()
+                existing = document.get('peers')
+                document['peers'] = (existing if isinstance(existing, list) else []) + peers.document()
+                document['claudeDiscovery'] = {'complete': peers.complete, 'reason': peers.reason}
+                _print_json(document)
+            else:
+                codex_discovery.print_peers(result)
+                print('Windows Claude 原生 peer：' + ('发现完整' if peers.complete else reason_text(peers.reason)))
+                for endpoint in (*peers.endpoints, *peers.duplicates):
+                    label = '  名称：' + json.dumps(endpoint.name, ensure_ascii=False) if endpoint.name else ''
+                    issues = '；'.join(reason_text('target_' + issue) for issue in endpoint.issues)
+                    print('claude@id:' + endpoint.ref.native_id + '  [root] 状态未知' + label + ('  ' + issues if issues else ''))
             return EXIT_OK
     # 任一调用前后补查摘要：提交后未发布（进程被杀、锁超时）的窗口由下一次调用收敛；worker 与 summary 自行处理
     refresh = args.command not in {"worker", "summary"} and not (get_platform().name == 'windows' and args.command == 'wait')

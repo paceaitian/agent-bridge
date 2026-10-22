@@ -193,6 +193,12 @@ class Reader:
 
 def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = None) -> Discovery:
     clock = clock or time.monotonic
+    try:
+        backend.files.codex_home().lstat()
+    except FileNotFoundError:
+        return Discovery(complete=True, reason='complete')
+    except OSError:
+        return Discovery()
     version = backend.codex_cli_version() or 'unknown'
     client: BoundedConnection | None = None
     try:

@@ -11,18 +11,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import re
 from typing import Any
 import unicodedata
 
 from ..platforms import process as procfs
 from ..platforms.factory import get_platform
 from ..platforms.transport_types import ByteStream
-from ..platforms.transport_codec import MAX_INBOX_BUFFER
+from ..platforms.transport_codec import MAX_INBOX_BUFFER, Receipt, parse_receipt
 from ..model import Delivery, Endpoint, Provider
 from . import DeliveryContext, DeliveryOutcome
 
@@ -33,14 +31,6 @@ TAG = "cross-session-message"
 PRIORITY_ENV = "AB_CLAUDE_PRIORITY"
 _PRIORITIES = frozenset({"next", "later", "now"})
 
-_STATUS_MAP: dict[str, Delivery] = {
-    "delivered": Delivery.DELIVERED,
-    "held": Delivery.HELD,
-    "denied": Delivery.DENIED,
-    "expired": Delivery.EXPIRED,
-    "refused": Delivery.REFUSED,
-    "dropped": Delivery.FAILED,
-}
 
 
 MAX_SENDER_NAME_CODEPOINTS = 64
@@ -87,57 +77,6 @@ def build_frame(text: str, context: DeliveryContext, *, priority: str = "next") 
     return line + "\n"
 
 
-@dataclass(frozen=True)
-class Receipt:
-    """接收端回执：原消息 ID 与映射后的投递状态。"""
-
-    message_uuid: str
-    delivery: Delivery
-    reason: str
-
-
-def parse_receipt(frame: object) -> Receipt | None:
-    """解析 `peer_message_status` control 帧；其他帧返回 None。"""
-    if not isinstance(frame, dict):
-        return None
-    if frame.get("type") != "control" or frame.get("action") != "peer_message_status":
-        return None
-    message_uuid = frame.get("orig_msg_id")
-    status = frame.get("status")
-    if not isinstance(message_uuid, str) or not isinstance(status, str):
-        return None
-    delivery = _STATUS_MAP.get(status)
-    if delivery is None:
-        return None
-    if status == "expired" and frame.get("status_detail") == "refused":
-        delivery = Delivery.REFUSED
-    return Receipt(message_uuid=message_uuid.lower(), delivery=delivery, reason=f"claude_{status}")
-
-
-@dataclass(frozen=True)
-class PeerReply:
-    """对方用原生 SendMessage 回复到收件箱的文本（有界截断，作为任务数据保存）。"""
-
-    reply_address: str | None
-    text: str
-
-
-_REPLY_FROM = re.compile(r'<cross-session-message\b[^>]*\bfrom="(?P<from>[^"]*)"')
-
-
-def parse_reply(frame: object, *, limit: int = 4000) -> PeerReply | None:
-    """解析对方发来的 `type=user` 回复帧。"""
-    if not isinstance(frame, dict) or frame.get("type") != "user":
-        return None
-    message = frame.get("message")
-    content = message.get("content") if isinstance(message, dict) else None
-    if not isinstance(content, str):
-        return None
-    match = _REPLY_FROM.search(content)
-    address = frame.get("from") if isinstance(frame.get("from"), str) else None
-    if match is not None:
-        address = match.group("from")
-    return PeerReply(reply_address=address, text=content[:limit])
 
 
 class ClaudePeerTransport:
@@ -251,6 +190,10 @@ class ClaudeInbox:
     """业务层仅持有平台listener，不拥有select/socket/文件清理。"""
     def __init__(self, directory: Path | None = None, *, name: str | None = None) -> None:
         self._backend = get_platform().transport.inbox(directory, name=name)
+
+    @property
+    def backend(self) -> object:
+        return self._backend
 
     @property
     def path(self) -> Path:

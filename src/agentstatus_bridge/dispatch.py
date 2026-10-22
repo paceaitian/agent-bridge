@@ -48,8 +48,8 @@ from .reminders import (
 )
 from .store import Store, StoreError
 from .transports import DeliveryContext, DeliveryOutcome, Transport
-from .transports.claude_peer import Receipt, parse_receipt, parse_reply
-from .platforms.transport_codec import encode_address
+from .platforms.transport_codec import Receipt, parse_receipt, parse_reply
+from .platforms.transport_codec import encode_address, same_address
 from .notification_policy import can_notify, wire_ref
 from .transports.codex_queue import queue_item_state
 
@@ -111,6 +111,9 @@ _UPGRADE_ON_ONLY_CANDIDATE = (Delivery.WRITTEN, Delivery.UNKNOWN)
 _HEX_ID = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
 _UUID_TEXT = re.compile(r"(?<![0-9a-f-])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f-])")
 _ATTEMPT_SEQ = re.compile(r"\battempt=(\d{1,4})\b")
+# 只剥掉外层开标签；引号里的 > 不是标签末尾，所有发送方属性均不参与 ID 关联。
+_REPLY_OPEN = re.compile(r'''\A\s*<cross-session-message(?=[\s>])(?:[^<>"']|"[^"]*"|'[^']*')*>''')
+_REPLY_CLOSE = re.compile(r"</cross-session-message>\s*\Z")
 
 LogFn = Callable[[str, Mapping[str, object]], None]
 
@@ -241,6 +244,7 @@ class Dispatcher:
     queue_state: Callable[[str], Consumption] = queue_item_state
     attempt_queue_state: Callable[[Attempt], Consumption] | None = None
     empty_discovery_complete: Callable[[], bool] | None = None
+    provider_discovery_complete: Callable[[Provider], bool] | None = None
     pending_ready: Callable[[set[str]], bool] | None = None
     pending_observe: Callable[[int], None] | None = None
     # 对外命令名：与 device 同理要 lambda 晚绑定，否则类定义时就固化，测试补丁替换不掉（DESIGN §45.36）
@@ -511,7 +515,7 @@ class Dispatcher:
             self._clear_discovery_wait(attempt.id)
             return "skipped"
         now = self.clock()
-        if get_platform().name == 'windows' and attempt.target.provider is not Provider.CODEX:
+        if get_platform().name == 'windows' and attempt.target.provider not in (Provider.CODEX, Provider.CLAUDE):
             return self._fail(attempt, 'windows_provider_not_enabled', now)
         if self._reminder_outdated(task, attempt, now):
             self._clear_discovery_wait(attempt.id)
@@ -525,7 +529,11 @@ class Dispatcher:
         if problem is not None:
             return self._fail(attempt, f"target_{problem}", now)
         if live is None:
-            if not endpoints and not (self.empty_discovery_complete and self.empty_discovery_complete()):
+            if self.provider_discovery_complete and not self.provider_discovery_complete(attempt.target.provider):
+                self._discovery_wait_since.setdefault(attempt.id, self.monotonic())
+                return "waiting"
+            if (self.provider_discovery_complete is None and not endpoints
+                    and not (self.empty_discovery_complete and self.empty_discovery_complete())):
                 self._discovery_wait_since.setdefault(attempt.id, self.monotonic())
                 return "waiting"  # 整体发现失败（tmux/proc 不可用），不据此判定目标不在
             self._clear_discovery_wait(attempt.id)
@@ -534,7 +542,6 @@ class Dispatcher:
                 return "waiting"
             self._missing_since.pop(attempt.id, None)
             return self._fail(attempt, "target_gone", now)
-        self._clear_discovery_wait(attempt.id)
         self._missing_since.pop(attempt.id, None)
         if get_platform().name == 'windows' and (
                 not attempt.target.data_root or live.ref.data_root != attempt.target.data_root):
@@ -549,9 +556,14 @@ class Dispatcher:
         # 6 分钟、最大 58 分钟。上游接收路径本就没有「对方忙就不入队」的条件；忙时消息进原生队列，
         # 对方读它的时机由上面的优先级分档表达。忙闲仍用于显示与查询提示，不再充当输入调度器。
         provider = live.ref.provider
-        if provider is Provider.CLAUDE and self.reply_address is None:
-            return "waiting"  # Claude 回执只能由持有收件箱的 worker 接收
         transport = self.transports.get(provider)
+        ready = getattr(transport, 'ready', None) if get_platform().name == 'windows' else None
+        if provider is Provider.CLAUDE and (self.reply_address is None
+                or callable(ready) and not ready(self.reply_address)):
+            if get_platform().name == 'windows':
+                self._discovery_wait_since.setdefault(attempt.id, self.monotonic())
+            return "waiting"  # Claude 回执只能由持有收件箱的 worker 接收
+        self._clear_discovery_wait(attempt.id)
         if transport is None:
             return "waiting"
         if get_platform().name == 'windows':
@@ -645,7 +657,7 @@ class Dispatcher:
             if current is None or current.delivery is not Delivery.SENDING:
                 raise StoreError('boundary_record_failed')
             self.store.add_event(attempt.task_id, 'native_send_boundary', now=self.clock(),
-                                 attempt_seq=attempt.seq, detail={'provider': 'codex'})
+                                 attempt_seq=attempt.seq, detail={'provider': attempt.target.provider.value})
 
     # ---- 回执与回复 ----
 
@@ -733,7 +745,7 @@ class Dispatcher:
             (
                 item
                 for item in self.endpoints(fresh=True)
-                if item.socket_path and encode_address(item.socket_path) == reply_address
+                if item.socket_path and same_address(encode_address(item.socket_path), reply_address)
             ),
             None,
         )
@@ -746,7 +758,12 @@ class Dispatcher:
         ]
         if not related:
             return None
-        lowered = text.lower()
+        body = text
+        wrapper = _REPLY_OPEN.match(body)
+        if wrapper is not None:
+            # parse_reply 可能已截断长回复的尾部，不能依赖闭标签仍然存在。
+            body = _REPLY_CLOSE.sub("", body[wrapper.end():], count=1)
+        lowered = body.lower()
         mentioned = set(_HEX_ID.findall(lowered)) | {
             item.replace("-", "") for item in _UUID_TEXT.findall(lowered)
         }

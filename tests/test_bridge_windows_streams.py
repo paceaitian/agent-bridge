@@ -102,8 +102,10 @@ class StreamTests(unittest.TestCase):
         self.k.peer=101
         with self.assertRaises(OSError): self.unix_stream()
         self.k.peer=100
-        for update in ('pid','sid','elevated','generation','empty','count'):
+        cases=('pid','sid','elevated','generation','empty','count')
+        for update,stage in ((update,stage) for update in cases for stage in ('process','token','queryable')):
             old=dict(self.k.processes)
+            self.k.restricted_process_stage=stage
             self.k.peer=100;self.k.peer_written=True;self.k.peer_bytes=0
             expected=self.expected
             if update=='pid': expected=replace(expected,pid=101)
@@ -112,7 +114,8 @@ class StreamTests(unittest.TestCase):
             if update=='generation': expected=replace(expected,generation_value='134362090001712231')
             if update=='empty': self.k.peer_written=False
             if update=='count': self.k.peer_bytes=2
-            with self.subTest(update=update),self.assertRaises(OSError): self.unix_stream(expected)
+            with self.subTest(update=update,stage=stage),self.assertRaises(OSError):
+                with self.add_stream(self.unix_stream(expected)): pass
             self.k.processes=old
         self.k.peer_written=True;self.k.peer_bytes=0
         with self.add_stream(self.unix_stream()) as stream:

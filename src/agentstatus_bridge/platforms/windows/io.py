@@ -9,6 +9,7 @@ import ctypes as C
 from dataclasses import dataclass
 import math
 import sys
+import threading
 import time
 from typing import Any
 
@@ -30,20 +31,22 @@ class Pending:
 # If a driver refuses cancellation, bounded return must not free live buffers.
 # No new pipe IO until quarantined operations complete; not an unbounded queue.
 _quarantine: list[Pending] = []
+_quarantine_lock = threading.RLock()
 
 
 def reap() -> bool:
-    for pending in list(_quarantine):
-        api = pending.api
-        ok = api.k.GetOverlappedResult(pending.handle, C.byref(pending.overlap), C.byref(pending.count), False)
-        if ok or api.last_error() != 996:
-            api.close(pending.overlap.event)
-            if pending.owned:
-                api.close(pending.handle)
-            if pending.resources is not None:
-                pending.resources.close()
-            _quarantine.remove(pending)
-    return not _quarantine
+    with _quarantine_lock:
+        for pending in list(_quarantine):
+            api = pending.api
+            ok = api.k.GetOverlappedResult(pending.handle, C.byref(pending.overlap), C.byref(pending.count), False)
+            if ok or api.last_error() != 996:
+                api.close(pending.overlap.event)
+                if pending.owned:
+                    api.close(pending.handle)
+                if pending.resources is not None:
+                    pending.resources.close()
+                _quarantine.remove(pending)
+        return not _quarantine
 
 
 def remaining_ms(deadline: float) -> int:
@@ -61,6 +64,16 @@ def unix_address(address: str) -> A.SOCKADDR_UN:
     if not raw or len(raw) >= 108 or b'\0' in raw:
         raise OSError('windows_socket_path_invalid')
     return A.SOCKADDR_UN(1, raw)
+
+
+def local_pipe(address: str) -> bool:
+    """One local leaf, optionally under Windows' LOCAL namespace; never UNC."""
+    if not isinstance(address, str) or not address.startswith('\\\\.\\pipe\\'):
+        return False
+    leaf = address[9:]
+    if leaf[:6].upper() == 'LOCAL\\':
+        leaf = leaf[6:]
+    return bool(leaf) and not any(c in leaf for c in '\\/\x00:') and leaf not in {'.', '..'}
 
 
 class WinIO:
@@ -169,7 +182,7 @@ class WinIO:
             self.wait_socket(handle, deadline, write=False)
 
     def open_pipe(self, address: str) -> int:
-        if not address.startswith('\\\\.\\pipe\\') or not address[9:] or any(c in address[9:] for c in '\\/:\0'):
+        if not local_pipe(address):
             raise OSError('windows_pipe_path_invalid')
         if not reap():
             raise OSError('windows_cancel_pending')
@@ -179,7 +192,7 @@ class WinIO:
                                None, 3, 0x40000000 | 0x110000, None))
 
     def create_pipe(self, address: str) -> int:
-        if not address.startswith('\\\\.\\pipe\\') or any(c in address[9:] for c in '\\/:\0'):
+        if not local_pipe(address):
             raise OSError('windows_pipe_path_invalid')
         if not reap():
             raise OSError('windows_cancel_pending')
@@ -199,6 +212,7 @@ class WinIO:
         buf = C.create_string_buffer(data if isinstance(data, bytes) else max(1, data))
         quarantined = False
         pending = False
+        cancel_observed = False
         try:
             if operation == 'accept':
                 ok = self.api.k.ConnectNamedPipe(handle, C.byref(overlap))
@@ -208,7 +222,9 @@ class WinIO:
                 ok = fn(handle, buf, length, C.byref(count), C.byref(overlap))
             if not ok:
                 error = self.api.last_error()
-                if error == 535 and operation == 'accept':
+                if error in (535, 232) and operation == 'accept':
+                    # CPython PipeListener/bpo-14725: a client may have written
+                    # and closed already; consume buffered data before disconnect.
                     return 0
                 if error in (109, 233) and operation == 'read':
                     return b''
@@ -218,6 +234,16 @@ class WinIO:
                 wait = self.api.k.WaitForSingleObject(event, remaining_ms(deadline))
                 if wait != 0:
                     if wait == 258:
+                        if operation == 'accept':
+                            self.api.k.CancelIoEx(handle, C.byref(overlap))
+                            self.api.k.WaitForSingleObject(event, 1000)
+                            done = self.api.k.GetOverlappedResult(handle, C.byref(overlap), C.byref(count), False)
+                            cancel_observed = True
+                            if done:
+                                pending = False
+                                return 0  # Cancellation lost to a valid connection; do not reaccept.
+                            if self.api.last_error() != 996:
+                                pending = False
                         raise TimeoutError('windows_io_deadline')
                     raise WinFailure(self.api.last_error())
                 ok = self.api.k.GetOverlappedResult(handle, C.byref(overlap), C.byref(count), False)
@@ -234,21 +260,26 @@ class WinIO:
             return buf.raw[:count.value] if operation == 'read' else int(count.value)
         finally:
             if pending:
-                self.api.k.CancelIoEx(handle, C.byref(overlap))
-                # Completion observation, not cancellation request, frees buffers.
-                self.api.k.WaitForSingleObject(event, 1000)  # bounded cleanup grace
-                done = self.api.k.GetOverlappedResult(handle, C.byref(overlap), C.byref(count), False)
+                if not cancel_observed:
+                    self.api.k.CancelIoEx(handle, C.byref(overlap))
+                    # Completion observation, not cancellation request, frees buffers.
+                    self.api.k.WaitForSingleObject(event, 1000)  # one bounded cleanup grace
+                    done = self.api.k.GetOverlappedResult(handle, C.byref(overlap), C.byref(count), False)
+                else:
+                    done = False  # Already observed IO_INCOMPLETE; retain without a second grace.
                 if not done and self.api.last_error() == 996:
-                    _quarantine.append(Pending(self.api, handle, overlap, buf, count))
+                    with _quarantine_lock:
+                        _quarantine.append(Pending(self.api, handle, overlap, buf, count))
                     quarantined = True
             if not quarantined:
                 self.api.close(event)
 
     def close_pipe(self, handle: int, resources: Any = None) -> bool:
-        for pending in _quarantine:
-            if pending.handle == handle and pending.api is self.api:
-                pending.resources = resources
-                pending.owned = True
-                return False
-        self.api.close(handle)
-        return True
+        with _quarantine_lock:
+            for pending in _quarantine:
+                if pending.handle == handle and pending.api is self.api:
+                    pending.resources = resources
+                    pending.owned = True
+                    return False
+            self.api.close(handle)
+            return True

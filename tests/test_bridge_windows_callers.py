@@ -125,9 +125,13 @@ class CallerTests(unittest.TestCase):
 
     def test_trace_preserves_prefix_and_identifies_each_boundary(self):
         self.chain();p=self.p.process
-        trace=p.trace(100)
-        self.assertEqual([r.identity.pid for r in trace.records],[100,201,200])
-        self.assertEqual(trace.termination,'process_identity_unverified')
+        for stage, reason in (('process', 'process_unverified'), ('token', 'process_unverified'),
+                              ('queryable', 'process_identity_unverified')):
+            self.k.restricted_process_stage = stage
+            trace=p.trace(100)
+            self.assertEqual([r.identity.pid for r in trace.records],[100,201,200])
+            self.assertEqual(trace.termination,reason)
+        self.k.restricted_process_stage = 'process'
         self.k.processes.pop(4)
         self.assertEqual(p.trace(100).termination,'process_exited')
         self.k.processes[4]=(0,134362090001912230,self.k.sid,False,'pwsh.exe')
@@ -275,7 +279,7 @@ class CallerTests(unittest.TestCase):
                                     caller_class=None,now=1003,cwd=self.root)
 
     def test_poll_only_and_review_target_contracts_both_platforms(self):
-        claude=EndpointRef(Provider.CLAUDE,uuid(2),300,'win-filetime:1')
+        claude=EndpointRef(Provider.GROK,uuid(2),300,'win-filetime:1')  # W3 migrates the unsupported-provider guard to Grok.
         with self.scope():
             self.assertFalse(can_notify(claude))
             self.assertTrue(can_notify(replace(claude,provider=Provider.CODEX)))
@@ -292,8 +296,8 @@ class CallerTests(unittest.TestCase):
             self.assertEqual(receipt_options(claude,no_notify=True),{})
             self.assertEqual(receipt_options(claude,no_notify=False),{})
 
-    def test_all_result_routes_and_poll_output_never_queue_claude(self):
-        origin=EndpointRef(Provider.CLAUDE,uuid(2),300,'win-filetime:1')
+    def test_all_result_routes_and_poll_output_never_queue_unsupported_grok(self):
+        origin=EndpointRef(Provider.GROK,uuid(2),300,'win-filetime:1')
         with self.scope(),Store.open(self.state) as store:
             for kind in (ReportKind.RESULT,ReportKind.BLOCKED,ReportKind.FAILED,ReportKind.APPROVE,ReportKind.CHANGES):
                 task,attempt=self.task(store,origin=origin,options={'notify':True,'receiptMode':'poll_only'})
@@ -313,7 +317,7 @@ class CallerTests(unittest.TestCase):
                 self.assertIn('回执方式：poll_only',out.getvalue())
 
     def test_auto_review_rejected_atomically_and_codex_still_queues(self):
-        claude=EndpointRef(Provider.CLAUDE,uuid(2),300,'win-filetime:1')
+        claude=EndpointRef(Provider.GROK,uuid(2),300,'win-filetime:1')
         with self.scope(),Store.open(self.state) as store:
             task,attempt=self.task(store,reviewer=claude)
             with self.assertRaisesRegex(reports.ReportError,'target_no_inbox'):
@@ -326,7 +330,7 @@ class CallerTests(unittest.TestCase):
             self.assertIs(outcome.followups[0].role,Role.REVIEW)
 
     def test_accept_close_each_recipient_and_reminder_constructor(self):
-        claude=EndpointRef(Provider.CLAUDE,uuid(2),300,'win-filetime:1')
+        claude=EndpointRef(Provider.GROK,uuid(2),300,'win-filetime:1')
         with self.scope(),Store.open(self.state) as store:
             for state in (closure.ACCEPTED,closure.CLOSED):
                 task,attempt=self.task(store,target=claude)
@@ -371,6 +375,34 @@ class CallerTests(unittest.TestCase):
             self.assertEqual({k:v for k,v in before.items() if not k.endswith(('-wal','-shm'))},after)
             self.assertEqual(self.k.messages,[])
 
+    def test_w3_claude_result_review_closure_and_reminder_use_native_routes(self):
+        native=EndpointRef(Provider.CLAUDE,uuid(2),300,'win-filetime:1')
+        with self.scope(),Store.open(self.state) as store:
+            self.assertTrue(can_notify(native))
+            self.assertEqual(receipt_options(native,no_notify=False),{'receiptMode':'push'})
+            self.assertEqual(receipt_options(native,no_notify=True),{'receiptMode':'poll_only'})
+            for kind in (ReportKind.RESULT,ReportKind.BLOCKED,ReportKind.FAILED,ReportKind.APPROVE,ReportKind.CHANGES):
+                task,attempt=self.task(store,origin=native,options={'notify':True,'receiptMode':'push'})
+                if kind in (ReportKind.APPROVE,ReportKind.CHANGES):
+                    attempt=store.add_attempt(task.id,role=Role.REVIEW,target=attempt.target,body='fixture',refs=[],now=1002,
+                                             sender=None,sender_class=None)
+                    store.begin_send(attempt.id,now=1002,pid=100,start_ticks='s')
+                    store.finish_send(attempt.id,delivery=Delivery.QUEUED,reason='fixture',provider_ref=None,detail={},now=1002)
+                outcome=self.report(store,task,attempt,kind)
+                self.assertEqual(len(outcome.followups),1)
+                self.assertEqual(outcome.followups[0].target,native)
+                self.assertIs(outcome.followups[0].role,Role.NOTICE)
+                self.assertTrue(reminders.reminder_candidate(task))
+            task,attempt=self.task(store,reviewer=native)
+            outcome=self.report(store,task,attempt,ReportKind.RESULT)
+            self.assertEqual(len(outcome.followups),1)
+            self.assertIs(outcome.followups[0].role,Role.REVIEW)
+            for state in (closure.ACCEPTED,closure.CLOSED):
+                task,_=self.task(store,target=native)
+                outcome=closure.queue_closures(store,task,store.attempts(task.id),state,now=1003,
+                    decider='fixture',reason=None,sender=None,sender_class=None)
+                self.assertEqual(len(outcome.queued),1)
+
     def test_wait_absent_no_directory_created_and_write_gate_stays_nine(self):
         with self.scope():
             self.assertEqual(self.run_cli('wait','no-task','--timeout','0')[0],8)
@@ -381,7 +413,7 @@ class CallerTests(unittest.TestCase):
             self.assertFalse(any(m['method']=='thread/queue/add' for m in self.k.messages))
 
     def test_send_preflight_poll_is_explicit_and_persisted_without_opening_gate(self):
-        origin=EndpointRef(Provider.CLAUDE,uuid(2),300,'win-filetime:1')
+        origin=EndpointRef(Provider.GROK,uuid(2),300,'win-filetime:1')
         target=Endpoint(EndpointRef(Provider.CODEX,uuid(1),200,'win-filetime:2'))
         caller=endpoints.Caller(Endpoint(origin),None,agent_env=True,via='controlled-fixture')
         with (self.scope(),patch.object(cli,'discover',return_value=[target]),

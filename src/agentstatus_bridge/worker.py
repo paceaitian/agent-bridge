@@ -123,11 +123,16 @@ def ensure_worker(root: Path | None = None) -> bool:
     return True
 
 
-def default_transports() -> dict[Provider, Transport]:
+def default_transports(*, inbox: Callable[[], object | None] | None = None) -> dict[Provider, Transport]:
     """各 provider 的投递通道；只读 provider（适配器 inbox=False）不在其中（DESIGN §45.34）。"""
     if get_platform().name == 'windows':
-        from .platforms.windows.codex_delivery import CodexTransport  # layout: allow Windows只有RPC Codex，无Claude listener
-        return {Provider.CODEX: CodexTransport()}
+        from .platforms.windows.codex_delivery import CodexTransport  # layout: allow Windows RPC Codex
+        from .transports.claude_windows import Transport as ClaudeTransport  # layout: allow W3 authenticated native pipe
+        from .platforms.windows.local_transport import WindowsPlatform  # layout: allow explicit W3 backend
+        backend = get_platform().transport
+        if not isinstance(backend, WindowsPlatform):
+            return {Provider.CODEX: CodexTransport()}
+        return {Provider.CODEX: CodexTransport(), Provider.CLAUDE: ClaudeTransport(backend, inbox)}
     transports: dict[Provider, Transport] = {
         Provider.CODEX: CodexQueueTransport(),
         Provider.CLAUDE: ClaudePeerTransport(),
@@ -199,7 +204,7 @@ def run_worker(
             log("store_error", {"code": error.code})
             raise
         with opened as store:
-            inbox = None if platform.name == 'windows' else _open_inbox(inbox_directory)
+            inbox = _open_inbox(inbox_directory)
             try:
                 pruned = store.prune(now=time.time())
             except StoreError as error:
@@ -215,13 +220,14 @@ def run_worker(
             sources = None if platform.name == 'windows' else DiscoverySources(native_metadata=MetadataCache())
             attempt_queue_state = None
             empty_complete = None
+            provider_complete = None
             selected_discover = discover_fn
             pending_backoff = None
             if platform.name == 'windows':
                 from .platforms.windows.pending_backoff import PendingBackoff  # layout: allow Windows待投递独立退避
                 pending_backoff = PendingBackoff()
                 from .platforms.windows.codex_consumption import state  # layout: allow Windows存在性必须同成功投递根
-                from .platforms.windows.codex_discovery import WorkerDiscovery  # layout: allow 完整空集合不是发现失败
+                from .platforms.windows.commands import WorkerDiscovery  # layout: allow per-provider discovery completeness
                 from .platforms.windows.local_transport import WindowsPlatform  # layout: allow W2专用认证后端
                 attempt_queue_state = state
                 if selected_discover is None:
@@ -229,12 +235,15 @@ def run_worker(
                         raise OSError('windows_provider_not_enabled')
                     selected_discover = sampling = WorkerDiscovery(platform.transport)
                     empty_complete = sampling.complete
+                    provider_complete = sampling.provider_complete
             dispatcher = Dispatcher(
                 store=store,
                 discover=selected_discover or (lambda: discover(sources)),
-                transports=transports or default_transports(),
+                transports=transports or (default_transports(inbox=lambda: inbox.backend if inbox else None)
+                                          if platform.name == 'windows' else default_transports()),
                 attempt_queue_state=attempt_queue_state,
                 empty_discovery_complete=empty_complete,
+                provider_discovery_complete=provider_complete,
                 pending_ready=pending_backoff.ready if pending_backoff else None,
                 pending_observe=pending_backoff.observe if pending_backoff else None,
                 reply_address=inbox.address if inbox is not None else None,
@@ -243,11 +252,20 @@ def run_worker(
             )
             idle_since: float | None = None
             failures = 0
+            inbox_retry = time.monotonic() + 10
             try:
                 while not stopping:
                     try:
+                        if platform.name == 'windows' and inbox is not None and not inbox.healthy():
+                            dispatcher.reply_address = None
+                            stale, inbox = inbox, None
+                            stale.close()
+                        if platform.name == 'windows' and inbox is None and time.monotonic() >= inbox_retry:
+                            inbox = _open_inbox(inbox_directory)
+                            dispatcher.reply_address = inbox.address if inbox else None
+                            inbox_retry = time.monotonic() + 10
                         dispatcher.run_once()
-                        if inbox is not None and not inbox.healthy():
+                        if platform.name != 'windows' and inbox is not None and not inbox.healthy():
                             # 收件箱文件被外部清理：重建后更新回复地址
                             inbox.close()
                             inbox = _open_inbox(inbox_directory)

@@ -37,6 +37,7 @@ from agentstatus_bridge.model import (
 )
 from agentstatus_bridge.store import Store, StoreError
 from agentstatus_bridge.transports import DeliveryContext, DeliveryOutcome
+from agentstatus_bridge.platforms.transport_codec import encode_address
 from bridge_support import RecordingTransport, endpoint, ref
 
 
@@ -314,9 +315,9 @@ class DispatchTests(unittest.TestCase):
         self.assertIn("from=codex@lead device=testbox", text.splitlines()[0])
         self.assertEqual(self._attempt(attempt.id).delivery, Delivery.WRITTEN)
 
-    def _claude_written(self):
+    def _claude_written(self, socket_path: str = "/run/test/peer.sock"):
         target = ref(Provider.CLAUDE, "claude-session")
-        self.endpoints = [endpoint(target, socket_path="/run/test/peer.sock")]
+        self.endpoints = [endpoint(target, socket_path=socket_path)]
         task, attempt = self._task(target)
         self._run()
         return task, self._attempt(attempt.id)
@@ -425,12 +426,113 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(self._attempt(allowed.id).delivery, Delivery.QUEUED)
         self.assertEqual(len(self.codex.calls), 1)
 
-    def _reply(self, text: str) -> dict[str, object]:
+    def _reply(self, text: str, *, address: str = "uds:/run/test/peer.sock", attributes: str = "") -> dict[str, object]:
         return {
             "type": "user",
-            "from": "uds:/run/test/peer.sock",
-            "message": {"role": "user", "content": f'<cross-session-message from="uds:/run/test/peer.sock">\n{text}\n</cross-session-message>'},
+            "from": address,
+            "message": {"role": "user", "content": f'<cross-session-message from="{address}"{attributes}>\n{text}\n</cross-session-message>'},
         }
+
+    def test_windows_pipe_attributes_do_not_count_as_reply_ids(self) -> None:
+        pipe = r"\\.\pipe\LOCAL\cc-msg-0123456789abcdef0123456789abcdef"
+        task, attempt = self._claude_written(pipe)
+        records = []
+        self.dispatcher.log = lambda event, fields: records.append((event, dict(fields)))
+        for address in ("uds:" + pipe, encode_address(pipe)):
+            for list_content in (False, True):
+                with self.subTest(address=address, list_content=list_content):
+                    self.store.transition_delivery(attempt.id, expected=(Delivery.DELIVERED,),
+                                                   new=Delivery.WRITTEN, reason="test", now=self.now)
+                    frame = self._reply("收到", address=address)
+                    text = frame["message"]["content"]
+                    if list_content:
+                        frame["message"]["content"] = [{"type": "text", "text": text}]
+                    self.assertEqual(self._attempt(attempt.id).delivery, Delivery.WRITTEN)
+                    self.assertEqual(self.dispatcher.handle_frame(frame), "reply")
+                    self.assertEqual((self._attempt(attempt.id).delivery, self._attempt(attempt.id).delivery_reason),
+                                     (Delivery.DELIVERED, "receiver_replied"))
+                    self.assertEqual(records[-1][1]["association"], "only_candidate")
+                    replies = [e for e in self.store.events(task.id) if e["kind"] == "peer_reply"]
+                    self.assertEqual(replies[-1]["detail"]["text"], text, "入账仍保留原回复，不修改解析或存储")
+        self.assertEqual(len([e for e in self.store.events(task.id) if e["kind"] == "peer_reply"]), 4)
+
+    def test_from_session_uuid_and_other_sender_attributes_are_not_body_ids(self) -> None:
+        task, attempt = self._claude_written()
+        records = []
+        self.dispatcher.log = lambda event, fields: records.append((event, dict(fields)))
+        frame = self._reply("收到", attributes=(
+            ' from-session="11111111-2222-4333-8444-555555555555"'
+            ' from-name=\'name > aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\' from-mode="unknown"'))
+        self.assertEqual(self.dispatcher.handle_frame(frame), "reply")
+        self.assertEqual(records[-1][1]["association"], "only_candidate")
+        self.assertEqual(self._attempt(attempt.id).delivery_reason, "receiver_replied")
+        self.assertEqual(len([e for e in self.store.events(task.id) if e["kind"] == "peer_reply"]), 1)
+
+    def test_reply_body_ids_win_over_ids_in_sender_attributes(self) -> None:
+        pipe = r"\\.\pipe\LOCAL\cc-msg-0123456789abcdef0123456789abcdef"
+        task, first = self._claude_written(pipe)
+        other_task, other = self._task(first.target)
+        self._run()
+        address = encode_address(pipe)
+        records = []
+        self.dispatcher.log = lambda event, fields: records.append((event, dict(fields)))
+        for body in (f"msg={first.message_id}", f"消息 {message_uuid(first.message_id)}", f"task={task.id}"):
+            with self.subTest(body=body):
+                frame = self._reply(body, address=address,
+                                    attributes=f' from-session="{message_uuid(other.message_id)}" from-name="{other_task.id}"')
+                self.assertEqual(self.dispatcher.handle_frame(frame), "reply")
+                self.assertEqual(records[-1][1]["association"], "task_id" if body.startswith("task=") else "message_id")
+                self.assertEqual(self._attempt(first.id).delivery, Delivery.DELIVERED)
+                self.assertEqual(self._attempt(other.id).delivery, Delivery.WRITTEN)
+        self.assertNotIn("peer_reply", [e["kind"] for e in self.store.events(other_task.id)])
+
+    def test_reply_attempt_number_is_read_only_from_body(self) -> None:
+        task, first = self._claude_written()
+        second = self.store.add_attempt(task.id, role=Role.HANDOFF, target=first.target,
+                                        body="再发", refs=[], now=self.now, sender=None, sender_class=None)
+        self._run()
+        records = []
+        self.dispatcher.log = lambda event, fields: records.append((event, dict(fields)))
+        frame = self._reply(f"task={task.id} attempt={second.seq}", attributes=f' from-name="attempt={first.seq}"')
+        self.assertEqual(self.dispatcher.handle_frame(frame), "reply")
+        self.assertEqual(records[-1][1]["association"], "task_attempt")
+        self.assertEqual(self._attempt(first.id).delivery, Delivery.WRITTEN)
+        self.assertEqual(self._attempt(second.id).delivery_reason, "receiver_replied")
+
+    def test_windows_reply_unknown_body_id_still_does_not_fall_back(self) -> None:
+        pipe = r"\\.\pipe\LOCAL\cc-msg-0123456789abcdef0123456789abcdef"
+        task, attempt = self._claude_written(pipe)
+        records = []
+        self.dispatcher.log = lambda event, fields: records.append((event, dict(fields)))
+        for body in ("task=" + "f" * 32, "消息 ffffffff-ffff-4fff-8fff-ffffffffffff"):
+            with self.subTest(body=body):
+                frame = self._reply(body, address="uds:" + pipe, attributes=f' from-name="{attempt.message_id}"')
+                self.assertIsNone(self.dispatcher.handle_frame(frame))
+                self.assertEqual(records[-1], ("reply_unmatched", {"mentionedIds": 1}))
+                self.assertEqual(self._attempt(attempt.id).delivery, Delivery.WRITTEN)
+        self.assertNotIn("peer_reply", [e["kind"] for e in self.store.events(task.id)])
+
+    def test_plain_reply_text_keeps_id_and_only_candidate_rules(self) -> None:
+        task, attempt = self._claude_written()
+        for text, association in (("收到", "only_candidate"), (f"task={task.id}", "task_id"),
+                                  (f"msg={attempt.message_id}", "message_id")):
+            with self.subTest(text=text):
+                resolved = self.dispatcher.resolve_reply("uds:/run/test/peer.sock", text)
+                self.assertIsNotNone(resolved)
+                self.assertEqual(resolved.association, association)
+                self.assertEqual(resolved.text, text)
+        # 正文中引用的标签不是最外层标签，里面真正提到的 ID 仍会被扫描。
+        self.assertIsNone(self.dispatcher.resolve_reply("uds:/run/test/peer.sock",
+            '引用：<cross-session-message from-session="ffffffff-ffff-4fff-8fff-ffffffffffff">收到</cross-session-message>'))
+
+    def test_truncated_long_reply_still_ignores_complete_opening_tag(self) -> None:
+        pipe = r"\\.\pipe\LOCAL\cc-msg-0123456789abcdef0123456789abcdef"
+        task, attempt = self._claude_written(pipe)
+        self.assertEqual(self.dispatcher.handle_frame(self._reply("收到" * 2200, address="uds:" + pipe)), "reply")
+        self.assertEqual(self._attempt(attempt.id).delivery_reason, "receiver_replied")
+        replies = [e for e in self.store.events(task.id) if e["kind"] == "peer_reply"]
+        self.assertEqual(len(replies[0]["detail"]["text"]), 4000)
+        self.assertFalse(replies[0]["detail"]["text"].endswith("</cross-session-message>"))
 
     def test_reply_naming_a_task_is_associated_exactly(self) -> None:
         target = ref(Provider.CLAUDE, "claude-session")

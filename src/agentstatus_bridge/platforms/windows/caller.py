@@ -38,8 +38,6 @@ def _identify(*, pid: int | None, environ: Mapping[str, str] | None,
     marked = any(env.get(key) for key in MARKERS)
     refused = Caller(None, None, agent_env=marked, rejection='platform_unverified')
     thread, session = env.get('CODEX_THREAD_ID'), env.get('CODEX_SESSION_ID')
-    if thread and session and thread != session:
-        return Caller(None, None, agent_env=True, rejection='subagent')
     process, transport = platform.process, platform.transport
     if not isinstance(process, WindowsProcess) or not isinstance(transport, WindowsPlatform):
         return refused
@@ -47,6 +45,17 @@ def _identify(*, pid: int | None, environ: Mapping[str, str] | None,
     if not chain.records:
         return refused
     agents = [row for row in chain.records if _name(row) in AGENTS]
+    if agents and _name(agents[0]) == 'claude':
+        from .claude_discovery import inspect  # layout: allow W3 root proof uses native registry plus kernel pipe peer
+        nearest = agents[0].identity
+        endpoint, _ = inspect(transport, nearest.pid)
+        if (endpoint.ref.start_ticks != nearest.stored_generation()
+                or env.get('CLAUDE_CODE_SESSION_ID') not in (None, '', endpoint.ref.native_id)
+                or any(process.same_generation(row.identity) is not Presence.CURRENT for row in chain.records)):
+            return refused
+        return Caller(endpoint, None, 'windows-claude', True)
+    if thread and session and thread != session:
+        return Caller(None, None, agent_env=True, rejection='subagent')
     if thread or session:
         if not thread or thread != session or native_id(thread) != thread:
             return refused

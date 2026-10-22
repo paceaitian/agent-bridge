@@ -212,7 +212,7 @@ class WindowsTests(unittest.TestCase):
               patch.dict(os.environ,{'CODEX_HOME':str(self.root/'absent-home')})):
             self.assertEqual(endpoints.discover(),[])
             self.assertEqual(endpoints.codex_title_report(),{'state':'discovery_unverified'})
-            self.assertEqual(version.call_count,1)  # unknown version permits discovery, absent root still prevents connect
+            self.assertEqual(version.call_count,0)  # absent home is complete empty; no provider subprocess or connect
         self.assertFalse(any(n=='connect' for n,_ in self.k.calls))
         for module_name in ('test_bridge_windows','test_bridge_windows_streams'):
             module=importlib.import_module(module_name)
@@ -288,6 +288,7 @@ class WindowsTests(unittest.TestCase):
         with self.assertRaises(OSError): p.legacy()
 
     def test_reused_generation_precedes_sid_and_elevation_and_uses_wait(self):
+        self.k.restricted_process_stage = 'token'  # queryable birth; token is unavailable to this user
         identity=ProcessIdentity('windows',101,'win-filetime','134362090001712229')
         for sid,elevated in [(self.k.sid,True),(bytes.fromhex('01010000000000052b000000'),False)]:
             self.k.processes[101]=(0,134362090001712231,sid,elevated,'reused')
@@ -595,7 +596,7 @@ class WindowsTests(unittest.TestCase):
         self.assertFalse(stop_requested(self.p.files,self.root,identity))
 
     def test_windows_business_gates_before_any_side_effect(self):
-        commands=[['send','--to','claude@x','-m','x'],['send','--to','grok@x','-m','x'],
+        commands=[['send','--to','grok@x','-m','x'],
                   ['withdraw','a','--attempt','1']]
         with (using_platform(self.p),patch.object(cli,'_refresh_summary',side_effect=AssertionError('refresh')),
                 patch.object(cli,'discover',side_effect=AssertionError('discovery'))):
@@ -605,8 +606,7 @@ class WindowsTests(unittest.TestCase):
                 self.assertEqual(code,9)
                 self.assertIn('windows_provider_not_enabled',out.getvalue())
                 self.assertIn('尚未写入任务',out.getvalue())
-            self.assertEqual(set(worker.default_transports()),{Provider.CODEX})
-            self.assertNotIn(Provider.CLAUDE,worker.default_transports())
+            self.assertEqual(set(worker.default_transports()),{Provider.CODEX,Provider.CLAUDE})
             self.assertNotIn(Provider.GROK,worker.default_transports())
         self.assertEqual(self.k.calls,[])
         self.assertEqual(list(self.root.iterdir()),[])

@@ -147,8 +147,10 @@ class WiringTests(unittest.TestCase):
         self.assertIsNone(win.transport.socket_identity(Path('/not-read')))
         with self.assertRaises(OSError):
             win.transport.new_stream()
-        with self.assertRaises(OSError):
-            win.transport.inbox()
+        # W3 construction is still pure: native IO begins only at open().
+        inbox = win.transport.inbox()
+        self.assertIs(inbox.files, win.files)
+        self.assertFalse(inbox.healthy())
 
     def test_root_hash_and_epoch_match_fixed_linux_object_vectors(self):
         f = make_platform('linux').files

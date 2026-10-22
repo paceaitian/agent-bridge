@@ -42,6 +42,10 @@ KNOWN_PACKAGES = frozenset({PACKAGE, "agentstatus"})
 
 # 搬移登记表：「旧模块:名字 → 新模块:名字」，模块名相对包根
 MOVED: tuple[str, ...] = (
+    "transports.claude_peer:Receipt → platforms.transport_codec:Receipt",
+    "transports.claude_peer:PeerReply → platforms.transport_codec:PeerReply",
+    "transports.claude_peer:parse_receipt → platforms.transport_codec:parse_receipt",
+    "transports.claude_peer:parse_reply → platforms.transport_codec:parse_reply",
     "platforms.windows.codex_sql:pinned_file → platforms.windows.private_file:pinned_file",
     "endpoints:Caller → caller_values:Caller",
     "paths:STATE_DIR_ENV → platforms.path_values:STATE_DIR_ENV",

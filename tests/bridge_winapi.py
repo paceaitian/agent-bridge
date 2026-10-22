@@ -103,6 +103,10 @@ class Kernel:
         self.sid = bytes.fromhex('01010000000000052a000000')
         self.processes = {100: (0, 134362090001712230, self.sid, False, 'python.exe')}
         self.current = 100
+        # Denying same-user elevated peers at OpenProcess is an unverified
+        # fixture assumption, NOT Windows qualification. Security tests must
+        # also cover token denial and queryable peers so downstream guards run.
+        self.restricted_process_stage = 'process'  # also token/queryable
         self.files, self.locks = {}, {}
         self.short_write = None
         self.in_job = True
@@ -153,16 +157,25 @@ class Kernel:
         record = self.handles.pop(handle)
         if 'fd' in record:
             os.close(record['fd'])
+        if record.get('delete_on_close'):
+            path = Path(record['path'])
+            path.relative_to(self.root)  # fixture-only exact leaf; never an external deletion
+            path.unlink()
         self.locks.pop(handle, None)
         return 1
 
     def GetCurrentProcess(self): return self.current
     def GetCurrentProcessId(self): return self.current
+    def restricted_process(self, pid):
+        me, other = self.processes[self.current], self.processes[pid]
+        return other[2] != me[2] or other[3] and not me[3]
     def OpenProcess(self, access, inherit, pid):
         assert access == 0x101000 and not inherit
         if pid not in self.processes:
             self.error = 87
             return 0
+        if self.restricted_process_stage == 'process' and self.restricted_process(pid):
+            return self.fail(5)
         return self.alloc('process', pid=pid)
     def GetProcessTimes(self, handle, creation, exit_, kernel, user):
         fact = self.processes[self.record(handle)['pid']]
@@ -187,6 +200,8 @@ class Kernel:
     def OpenProcessToken(self, handle, access, out):
         assert access == 8
         pid = handle if handle == self.current else self.record(handle)['pid']
+        if self.restricted_process_stage == 'token' and self.restricted_process(pid):
+            return self.fail(5)
         put(out, S.H, self.alloc('token', pid=pid))
         return 1
     def GetTokenInformation(self, handle, kind, buf, size, needed):
@@ -359,6 +374,17 @@ class Kernel:
         info.nNumberOfLinks = stat.st_nlink if p.is_file() else 1
         return 1
     def GetFileInformationByHandleEx(self, handle, kind, out, size):
+        if kind == 18:
+            if size != 24:
+                raise AssertionError('FILE_ID_INFO size')
+            record = self.record(handle)
+            meta = self.files.get(record['path'], {})
+            info = C.cast(out, C.POINTER(S.FILE_ID_INFO)).contents
+            info.VolumeSerialNumber = meta.get('volume64', 2082046436356788024)
+            number = meta.get('file_id128', os.fstat(record['fd']).st_ino)
+            for index, value in enumerate(number.to_bytes(16, 'little')):
+                info.FileId[index] = value
+            return 1
         assert kind == 9 and size == 8
         info = S.BY_HANDLE_FILE_INFORMATION()
         self.GetFileInformationByHandle(handle, C.byref(info))
@@ -366,6 +392,16 @@ class Kernel:
         meta = self.files.get(self.record(handle)['path'], {})
         result.FileAttributes = meta.get('tag_attributes', info.dwFileAttributes)
         result.ReparseTag = meta.get('tag', 0xA000000C if info.dwFileAttributes & 0x400 else 0)
+        return 1
+    def SetFileInformationByHandle(self, handle, kind, value, size):
+        record = self.record(handle)
+        if kind != 4 or size != 1:
+            raise AssertionError('unexpected disposition class/size')
+        if not record.get('access', 0) & 0x10000:
+            return self.fail(5)
+        if C.cast(value, C.POINTER(C.c_ubyte)).contents.value != 1:
+            raise AssertionError('DeleteFile must be TRUE')
+        record['delete_on_close'] = True
         return 1
     def GetVolumeInformationByHandleW(self, handle, name, length, serial, maxlen, flags, fs, fslen):
         kind = self.files.get(self.record(handle)['path'], {}).get('fs', 'NTFS')
@@ -538,6 +574,9 @@ class Kernel:
         C.memmove(buf,data,len(data));put(count,S.U32,len(data))
         return 1
     def ConnectNamedPipe(self, handle, overlap):
+        code = self.record(handle).get('connect_error')
+        if code is not None:
+            return self.fail(code)  # 232: buffered closed client; 231: busy, never success.
         if self.io_pending:
             self.pending[handle]=(overlap,self.buffer(C.create_string_buffer(1)),None,1)
             return self.fail(997)

@@ -44,6 +44,10 @@ class WindowsPlatform(UnsupportedPlatform):
         except OSError:
             return None
 
+    def inbox(self, directory: Path | None = None, *, name: str | None = None):
+        from .claude_peer import Inbox  # layout: allow W3 listener is built only by an explicit worker action
+        return Inbox(self.files, name=name)
+
     @contextmanager
     def codex_read_scope(self, version: str) -> Iterator[None]:
         token = self._read.set(True)

@@ -131,7 +131,8 @@ class NamingTests(unittest.TestCase):
 
     def test_command_reuses_one_discovery_before_store(self):
         before=self.result()
-        with patch.object(B,'evidence',return_value=before),patch.object(B,'sample',side_effect=AssertionError('resampled')):
+        with (patch.object(B,'evidence',return_value=before),patch.object(B,'sample',side_effect=AssertionError('resampled')),
+              patch.object(B,'claude_evidence',return_value=B.claude.Discovery(complete=True,reason='complete'))):
             selected=B.resolve('原生甲')
             self.assertEqual(selected.ref.native_id,uuid(1))
             self.assertEqual(selected.ref.data_root,before.root_identity)
@@ -580,7 +581,7 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(self.run_cli('close',task.id)[0],0)
             with patch.object(cli,'cmd_withdraw',return_value=0) as unopened:
                 for cmd in (('withdraw',task.id,'--attempt','1'),
-                            ('send','--to','claude@x','-m','fixture'),('send','--to','grok@x','-m','fixture')):
+                            ('send','--to','grok@x','-m','fixture')):
                     self.assertEqual(self.run_cli(*cmd)[0],9)
                 unopened.assert_not_called()
             with Store.open(self.state) as store:
@@ -591,14 +592,15 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(len(self.adds()),1)
             self.assertNotIn('PRIVATE_NATIVE_NAME',self.adds()[0]['params']['input'][0]['text'])
 
-    def test_worker_once_uses_codex_no_claude_listener_and_recorded_context(self):
+    def test_worker_once_uses_native_transports_and_recorded_context(self):
         binary=self.root/'python-base.exe';binary.touch();self.k.images[100]=str(binary)
         with (self.scope(),patch.object(sys,'_base_executable',str(binary)),
-              patch.object(worker,'_open_inbox',side_effect=AssertionError('W3 not open')),
+              patch.object(worker,'_open_inbox',return_value=None) as inbox,
               patch.object(worker.time,'sleep',return_value=None),
               patch.object(worker,'Dispatcher',wraps=Dispatcher) as built):
             self.assertEqual(worker.run_worker(root=self.state,once=True),0)
-            self.assertEqual(set(worker.default_transports()),{Provider.CODEX})
+            inbox.assert_called_once()
+            self.assertEqual(set(worker.default_transports()),{Provider.CODEX,Provider.CLAUDE})
             self.assertIsInstance(worker.default_transports()[Provider.CODEX],T.CodexTransport)
             self.assertIsNotNone(built.call_args.kwargs['empty_discovery_complete'])
             self.assertIs(built.call_args.kwargs['attempt_queue_state'],Q.state)
@@ -634,7 +636,7 @@ class DeliveryTests(unittest.TestCase):
               patch.object(worker.time, 'monotonic', side_effect=lambda: tick[0]),
               patch.object(worker.time, 'time', side_effect=lambda: 1000+tick[0]),
               patch.object(worker.time, 'sleep', side_effect=sleep),
-              patch.object(worker, '_open_inbox', side_effect=AssertionError('no real socket')),
+              patch.object(worker, '_open_inbox', return_value=None),
               patch.object(worker, 'Dispatcher', side_effect=create),
               patch.object(pacing, 'PendingBackoff', side_effect=lambda: original_backoff(clock=lambda: tick[0])),
               patch('agentstatus_bridge.dispatch.os.getpid', return_value=100)):
@@ -643,7 +645,7 @@ class DeliveryTests(unittest.TestCase):
                 task, attempt = store.create_task(title='fixture', flow=Flow.HANDOFF, origin=None,
                     origin_class=None, reviewer=None, target=target.ref, body='fixture', refs=[], now=1000)
             self.k.override = lambda m, r: {'id': m['id'], 'error': {}}
-            with patch.object(D, 'discover', side_effect=sampled):
+            with patch('agentstatus_bridge.platforms.windows.commands.discover', side_effect=sampled):
                 self.assertEqual(worker.run_worker(root=self.state, loop_seconds=2), 0)
             self.assertEqual(samples[:5], [0, 2, 6, 14, 30])
             self.assertLess(len(samples), 30)
@@ -1052,8 +1054,7 @@ class AuditTests(unittest.TestCase):
                 cli._report_error(args,'caller_unattributed')
             message=json.loads(out.getvalue())['reasonText']
             if platform.name=='windows':
-                self.assertIn('Windows 仅支持已认出的 Codex 根会话',message)
-                self.assertIn('Claude 发起尚未开放',message)
+                self.assertIn('Codex/Claude',message)
                 self.assertIn('--manual 不能绕过',message)
             else:self.assertEqual(message,cli.reason_text('caller_unattributed'))
             self.assertIn(message,err.getvalue())
