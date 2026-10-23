@@ -134,7 +134,8 @@ class ReleaseTests(unittest.TestCase):
         ci=load('verify-bridge-windows')
         self.assertEqual(set(ci.MODULES),{'test_bridge_windows','test_bridge_windows_streams','test_bridge_windows_codex','test_bridge_windows_discovery',
             'test_bridge_registration','test_bridge_labels','test_bridge_hints','test_bridge_windows_native','test_bridge_windows_callers',
-            'test_bridge_windows_delivery','test_bridge_windows_boundaries'})
+            'test_bridge_windows_delivery','test_bridge_windows_boundaries','test_bridge_windows_roots',
+            'test_bridge_windows_roots_rework'})
         for name in ci.MODULES:self.assertTrue((ROOT/'tests'/f'{name}.py').is_file())
         native=(ROOT/'tests/test_bridge_windows_native.py').read_text()
         self.assertIn('if api.token(api.k.GetCurrentProcess()).elevated:',native)

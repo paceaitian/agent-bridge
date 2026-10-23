@@ -109,6 +109,8 @@ SIGNATURES = {
     'kernel32': {
         'GetCurrentProcess': (HANDLE, []), 'GetCurrentProcessId': (DWORD, []),
         'OpenProcess': (HANDLE, [DWORD, BOOL, DWORD]), 'CloseHandle': (BOOL, [HANDLE]),
+        'ReadProcessMemory': (BOOL, [HANDLE, PTR, PTR, C.c_size_t, PTR]),
+        'IsWow64Process': (BOOL, [HANDLE, PTR]),
         'GetProcessTimes': (BOOL, [HANDLE, PTR, PTR, PTR, PTR]),
         'QueryFullProcessImageNameW': (BOOL, [HANDLE, DWORD, PTR, PTR]),
         'GetExitCodeProcess': (BOOL, [HANDLE, PTR]),
@@ -141,6 +143,7 @@ SIGNATURES = {
         'GetConsoleWindow': (HANDLE, []),
         'SetHandleInformation': (BOOL, [HANDLE, DWORD, DWORD]),
     },
+    'ntdll': {'NtQueryInformationProcess': (C.c_int32, [HANDLE, DWORD, PTR, DWORD, PTR])},
     'advapi32': {
         'OpenProcessToken': (BOOL, [HANDLE, DWORD, PTR]),
         'GetTokenInformation': (BOOL, [HANDLE, DWORD, PTR, DWORD, PTR]),

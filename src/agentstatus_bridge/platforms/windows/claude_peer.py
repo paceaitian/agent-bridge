@@ -59,6 +59,7 @@ class Inbox:
         self._io = WinIO(self.api)
         self._handle: int | None = None
         self._key: OwnKey | None = None
+        self._keys: dict[str, OwnKey] = {}
         self._token = secrets.token_hex(16)
         self._thread: threading.Thread | None = None
         self._started = False
@@ -74,10 +75,27 @@ class Inbox:
         try:
             pid = int(self.api.k.GetCurrentProcessId())
             fact = self.api.process(pid)
-            self._key = OwnKey(PeerFiles(self.files), pid, str(self.path), str(fact.birth), self._token)
             self._handle = self._io.create_pipe(str(self.path))
             self.api.check_private(self._handle)
-            self._key.publish()
+            # Existing roots only. register() adds our same registration to each
+            # destination's root before opening its timed pipe connection.
+            for sessions in self.files.claude_sessions_dirs().roots:
+                try:
+                    if not sessions.is_dir():
+                        continue
+                    files = PeerFiles(self.files, sessions)
+                    with files.root() as root:
+                        self._key = OwnKey(files, pid, str(self.path), str(fact.birth), self._token)
+                        self._key.publish()
+                        self._keys[root] = self._key
+                except OSError:
+                    if self._key is not None:
+                        self._key.close()
+                        self._key = None
+                    continue  # One unusable legacy root must not block other roots.
+                break
+            if not self._keys:
+                raise OSError('claude_inbox_unavailable')
             self._thread = threading.Thread(target=self._serve, name='ab-peer-receipts', daemon=True)
             self._thread.start()
             self._started = True
@@ -87,6 +105,24 @@ class Inbox:
 
     def healthy(self) -> bool:
         return bool(self._thread and self._thread.is_alive() and not self._failed and not self._stop.is_set())
+
+    def register(self, files: PeerFiles, root: str | None) -> None:
+        """打开目标的限时连接前，在已解析的根中准备自有回信登记。"""
+        if not self.healthy():
+            raise OSError('claude_inbox_unavailable')
+        with files.root() as actual:
+            if actual != root:
+                raise OSError('claude_root_changed')
+        if root not in self._keys:
+            pid = int(self.api.k.GetCurrentProcessId())
+            fact = self.api.process(pid)
+            key = OwnKey(files, pid, str(self.path), str(fact.birth), self._token)
+            try:
+                key.publish()
+            except BaseException:
+                key.close()
+                raise
+            self._keys[str(root)] = key
 
     def expect(self, endpoint: Endpoint, message_id: str) -> None:
         if not self.healthy() or not endpoint.socket_path:
@@ -176,6 +212,15 @@ class Inbox:
                 handle, self._handle = self._handle, None
                 self._io.close_pipe(handle)
         finally:
-            if self._key is not None:
-                self._key.close()
+            error = None
+            keys = list(self._keys.values())
+            if self._key is not None and self._key not in keys:
+                keys.append(self._key)
+            for key in keys:
+                try:
+                    key.close()
+                except OSError as failure:
+                    error = failure
             self._token = ''
+            if error is not None:
+                raise error

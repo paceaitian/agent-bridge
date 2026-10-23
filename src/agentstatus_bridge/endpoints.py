@@ -3,7 +3,7 @@
 每个 provider 由一个 `ProviderAdapter` 描述四件事——进程名、怎么发现、怎么按环境变量归属、有没有
 收件通道；加一个 agent 就是加一条注册表项加一个发现函数（DESIGN §45.34）。
 
-- Claude：读 `~/.claude/sessions/<pid>.json` 注册表，核对 PID 启动时刻与消息 socket 属主。
+- Claude：读实际配置根的 `sessions/<pid>.json`，核对 PID 启动时刻与消息 socket 属主（§84）。
 - Codex：扫描 `codex` 进程打开的 rollout 文件确定 thread；终端证据优先 tmux pane，没有 pane 时回退到
   控制终端（DESIGN §45.33，控制终端只是候选门槛、不证明是 TUI）；按启动参数排除 app-server、exec 等
   非交互子命令，既无 pane 又无控制终端的进程也排除（它们不是用户能看到的会话）。0.157 起托管 daemon
@@ -39,7 +39,7 @@ from .codex_argv import _codex_class, _codex_non_interactive, codex_app_server
 from .ids import opaque_id
 from .model import UNRESOLVED_NATIVE_ID, Endpoint, EndpointRef, Provider, Runtime
 from .observer_dbus import ObserverRow, ObserverView, agentstatus_view
-from .paths import claude_sessions_dir, codex_home as default_codex_home, codex_sqlite_home, grok_home
+from .paths import claude_sessions_dirs, codex_home as default_codex_home, codex_sqlite_home, grok_home
 
 MAX_REGISTRY_FILES = 256
 # 允许 observer 证据比注册表状态时刻早多少：实测正常后台窗口里早约 0.09 秒，漏 hook 时差一整轮（§45.37）
@@ -117,7 +117,7 @@ class DiscoverySources:
     """发现所用的数据源；测试可替换为合成目录和假 tmux/D-Bus。"""
 
     proc_root: Path = procfs.DEFAULT_PROC
-    claude_sessions: Path = field(default_factory=claude_sessions_dir)
+    claude_sessions: Path | None = None
     codex_home: Path = field(default_factory=default_codex_home)
     # Codex 状态库所在目录；上游 `CODEX_SQLITE_HOME` 覆盖 codex_home（DESIGN §45.48 R2）
     codex_sqlite_home: Path | None = field(default_factory=codex_sqlite_home)
@@ -160,12 +160,24 @@ def _is_owned_socket(path: str, uid: int) -> bool:
 def _discover_claude(
     sources: DiscoverySources, panes: Mapping[int, PaneInfo], runtime: ObserverView
 ) -> list[Endpoint]:
-    try:
-        files = sorted(
-            entry for entry in sources.claude_sessions.iterdir() if _REGISTRY_NAME.fullmatch(entry.name)
-        )[:MAX_REGISTRY_FILES]
-    except OSError:
-        return []
+    roots = (sources.claude_sessions,) if sources.claude_sessions is not None else claude_sessions_dirs(sources.proc_root)
+    files: list[Path] = []
+    pending = []
+    for root in roots:
+        try:
+            pending.append(iter(entry for entry in root.iterdir() if _REGISTRY_NAME.fullmatch(entry.name)))
+        except OSError:
+            continue
+    # Round-robin under one global budget: legacy debris cannot starve live roots.
+    while pending and len(files) < MAX_REGISTRY_FILES:
+        for entries in tuple(pending):
+            try:
+                files.append(next(entries))
+            except (StopIteration, OSError):
+                pending.remove(entries)
+            if len(files) >= MAX_REGISTRY_FILES:
+                break
+    files.sort()
     endpoints: list[Endpoint] = []
     for path in files:
         try:
@@ -236,7 +248,13 @@ def _discover_claude(
                 issues=tuple(issues),
             )
         )
-    return endpoints
+    groups: dict[int, list[Endpoint]] = {}
+    for item in endpoints:
+        group = groups.setdefault(item.ref.pid, [])
+        if item not in group:
+            group.append(item)
+    return [item if len(group) == 1 else replace(item, issues=(*item.issues, 'ambiguous_thread'))
+            for group in groups.values() for item in group]
 
 
 def _codex_source_kind(value: object) -> str | None:

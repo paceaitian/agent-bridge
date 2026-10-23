@@ -11,6 +11,8 @@ import socket
 import shutil
 from typing import Any
 import uuid
+import time
+from ..claude_roots import OVERRIDE, configured, unique, MAX_ROOTS, RootScan
 
 from ..path_values import STATE_DIR_ENV, BINDING_ENV, DEVICE_ENV, DEVICE_UNSAFE, DEVICE_CHARS
 from ..policy import CLAUDE_SYSTEM_DIRS
@@ -161,8 +163,68 @@ class WindowsPaths:
         raise OSError('windows_provider_not_enabled')
 
     def claude_sessions_dir(self) -> Path:
+        if os.environ.get(OVERRIDE):
+            return local_path(Path(os.environ[OVERRIDE]).expanduser())
         value = os.environ.get('CLAUDE_CONFIG_DIR')
         return local_path(Path(value) if value is not None else Path.home() / '.claude') / 'sessions'
+
+    def claude_sessions_dirs(self, proc_root: Path = Path('/proc')) -> RootScan:
+        if os.environ.get(OVERRIDE):
+            return RootScan((self.claude_sessions_dir(),), exclusive=True)
+        roots = [root / 'sessions' for root in configured(Path.home(), os.environ)]
+        complete, unlocated, live, diagnostics = True, set(), [], []
+        deadline = time.monotonic() + 3
+        try:
+            for pid, _, name in self.api.process_table():
+                if time.monotonic() > deadline:
+                    complete = False
+                    break
+                if name.lower() != 'claude.exe':
+                    continue
+                try:
+                    fact = self.api.process(pid)
+                    value = self.api.claude_config_dir(pid, str(fact.birth))
+                    if value.state == 'unknown':
+                        unlocated.add(pid)
+                        continue
+                    path = Path(value.value) if value.value is not None else Path.home() / '.claude'
+                    if not path.is_absolute():
+                        unlocated.add(pid)
+                        continue
+                    sessions = local_path(path) / 'sessions'
+                    roots.append(sessions)
+                    live.append((pid, sessions))
+                except (OSError, RuntimeError, ValueError):
+                    unlocated.add(pid)
+                    continue
+        except (OSError, RuntimeError, ValueError):
+            complete = False
+        if len(set(roots)) > MAX_ROOTS:
+            complete = False
+        roots = list(unique(roots))
+        unlocated.update(pid for pid, path in live if path not in roots)
+        # PEB is internal/permission-sensitive. Fixed-depth reclaude fallback,
+        # never arbitrary recursion, persistence, root creation or key enumeration.
+        accounts = Path.home() / '.rec/claude/accounts'
+        try:
+            with self.external_directory(accounts):
+                for index, account in enumerate(accounts.iterdir()):
+                    if index >= MAX_ROOTS:
+                        diagnostics.append((accounts, 'fallback_limit'))
+                        break
+                    if account.is_dir():
+                        path = account / 'config/sessions'
+                        if path not in roots:
+                            if len(roots) >= MAX_ROOTS:
+                                diagnostics.append((accounts, 'fallback_limit'))
+                                break
+                            roots.append(path)
+        except FileNotFoundError:
+            pass
+        except (OSError, RuntimeError, ValueError) as error:
+            if getattr(error, 'winerror', None) not in (2, 3):
+                diagnostics.append((accounts, 'fallback_unavailable'))
+        return RootScan(unique(roots), complete, frozenset(unlocated), tuple(live), tuple(diagnostics))
 
     def codex_sqlite_home(self) -> Path | None:
         value = os.environ.get('CODEX_SQLITE_HOME')

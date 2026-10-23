@@ -42,9 +42,10 @@ def project(data: dict[str, Any], pid: int, birth: str, root: str) -> Endpoint:
     if (type(data.get('pid')) is not int or data['pid'] != pid or native_id(session) != session
             or not isinstance(session, str)):
         raise OSError('claude_registry_unverified')
-    if (data.get('kind') not in (None, 'interactive')
-            or 'procStartFt' in data and not generation(data['procStartFt'], birth)):
+    if 'procStartFt' in data and not generation(data['procStartFt'], birth):
         raise Ineligible('claude_registry_ineligible')
+    if data.get('kind') not in (None, 'interactive'):
+        raise Ineligible('claude_kind_ineligible' if 'procStartFt' in data else 'claude_kind_generation_unknown')
     issues: list[str] = []
     if type(data.get('peerProtocol')) is not int or data['peerProtocol'] != 1:
         issues.append('peer_protocol_unsupported')
@@ -59,10 +60,20 @@ def project(data: dict[str, Any], pid: int, birth: str, root: str) -> Endpoint:
 
 
 def inspect(backend: WindowsPlatform, pid: int, *, connect: bool = True,
-            tolerate_pipe: bool = False) -> tuple[Endpoint, dict[str, Any]]:
+            tolerate_pipe: bool = False, sessions: Path | None = None) -> tuple[Endpoint, dict[str, Any]]:
     if type(pid) is not int or not 0 < pid < 2**32:
         raise OSError('claude_process_unverified')
-    files = PeerFiles(backend.files)
+    if sessions is None:
+        matches = []
+        for path in backend.files.claude_sessions_dirs().roots:
+            try:
+                matches.append(inspect(backend, pid, connect=connect, tolerate_pipe=tolerate_pipe, sessions=path))
+            except OSError:
+                continue
+        if len(matches) != 1:
+            raise OSError('claude_registry_unverified')
+        return matches[0]
+    files = PeerFiles(backend.files, sessions)
     with files.root() as root:
         fact = peer_process(backend, pid)
         image = backend.api.process_image(pid, str(fact.birth))
@@ -100,6 +111,8 @@ class Discovery:
     reason: str = 'claude_discovery_incomplete'
     # Excluded from selection, but retained for worker liveness/ambiguity decisions.
     duplicates: tuple[Endpoint, ...] = ()
+    registries: tuple[dict[str, Any], ...] = ()
+    root_diagnostics: tuple[tuple[Path, str], ...] = ()
 
     def select(self, reference: str) -> Endpoint:
         key = reference.removeprefix('claude@')
@@ -130,41 +143,81 @@ class Discovery:
 def discover(backend: WindowsPlatform, *, connect: bool = True) -> Discovery:
     found: list[Endpoint] = []
     complete, started = True, time.monotonic()
+    registries: list[dict[str, Any]] = []
+    count = 0
+    budget_hit = False
     try:
-        files = PeerFiles(backend.files)
+        scan = backend.files.claude_sessions_dirs()
+    except OSError:
+        return Discovery()
+    roots = scan.roots
+    complete = scan.complete
+    unlocated = set(scan.unlocated)
+    located_roots = dict(scan.live)
+    known_noninteractive: set[int] = set()
+    for root in roots:
+        files = PeerFiles(backend.files, root)
+        diagnostic = {'path': str(root), 'readable': False, 'reason': 'unreadable'}
+        registries.append(diagnostic)
         try:
-            files.sessions.lstat()
-        except FileNotFoundError:
-            return Discovery(complete=True, reason='complete')
-        with files.root():
-            names: list[str] = []
-            for index, entry in enumerate(files.sessions.iterdir()):
-                if index >= MAX_RECORDS or time.monotonic() - started > SECONDS:
-                    raise OSError('claude_registry_limit')
-                if RECORD.fullmatch(entry.name):
-                    names.append(entry.name)
-            for name in sorted(names):
-                if time.monotonic() - started > SECONDS:
-                    raise OSError('claude_discovery_timeout')
-                try:
-                    endpoint, _ = inspect(backend, int(Path(name).stem), connect=connect, tolerate_pipe=True)
-                    found.append(endpoint)
-                except Ineligible:
-                    continue
-                except OSError:
-                    # A missing pipe/key/record does NOT prove the process died.
-                    # Only an independent process query may discard a stale PID.
+            try:
+                files.sessions.lstat()
+            except FileNotFoundError:
+                diagnostic['reason'] = 'not_found'
+                # PEB 已定位的根不存在，表示没有注册记录；不等于环境读取失败。
+                continue
+            with files.root():
+                names: list[str] = []
+                for entry in files.sessions.iterdir():
+                    count += 1
+                    if count > MAX_RECORDS or time.monotonic() - started > SECONDS:
+                        budget_hit = True
+                        raise OSError('claude_registry_limit')
+                    if RECORD.fullmatch(entry.name):
+                        names.append(entry.name)
+                diagnostic.update(readable=True, reason='readable')
+                for name in sorted(names):
+                    if time.monotonic() - started > SECONDS:
+                        budget_hit = True
+                        raise OSError('claude_discovery_timeout')
                     try:
-                        peer_process(backend, int(Path(name).stem))
-                    except Ineligible:
+                        endpoint, _ = inspect(backend, int(Path(name).stem), connect=connect,
+                                              tolerate_pipe=True, sessions=root)
+                        found.append(endpoint)
+                    except Ineligible as error:
+                        if error.args == ('claude_kind_ineligible',):
+                            known_noninteractive.add(int(Path(name).stem))
                         continue
                     except OSError:
-                        pass
-                    complete = False
-    except OSError:
+                        pid = int(Path(name).stem)
+                        if pid in located_roots and located_roots[pid] != root:
+                            continue  # 已定位到别处的 PID，不由旧根的损坏残留决定完整性。
+                        try:
+                            peer_process(backend, pid)
+                        except Ineligible:
+                            continue
+                        except OSError:
+                            pass
+                        complete = False
+        except OSError:
+            # Speculative accounts are not authority for unrelated live peers.
+            # Only an as-yet unlocated owner of this root can affect completeness.
+            unlocated.update(pid for pid, path in scan.live if path == root)
+            if budget_hit or scan.exclusive:
+                complete = False
+    for pid in unlocated - known_noninteractive - {endpoint.ref.pid for endpoint in found}:
+        try:
+            fact = peer_process(backend, pid)
+            if PureWindowsPath(backend.api.process_image(pid, str(fact.birth))).name.lower() != 'claude.exe':
+                continue
+        except Ineligible:
+            continue
+        except OSError:
+            pass
         complete = False
     counts = Counter(e.ref.native_id for e in found)
     duplicates = tuple(replace(e, issues=(*e.issues, 'ambiguous_thread'))
                        for e in found if counts[e.ref.native_id] > 1)
     eligible = tuple(e for e in found if counts[e.ref.native_id] == 1)
-    return Discovery(eligible, complete, 'complete' if complete else 'claude_discovery_incomplete', duplicates)
+    return Discovery(eligible, complete, 'complete' if complete else 'claude_discovery_incomplete', duplicates,
+                     tuple(registries), scan.diagnostics)

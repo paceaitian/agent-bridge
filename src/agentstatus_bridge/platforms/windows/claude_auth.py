@@ -39,9 +39,23 @@ def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 class PeerFiles:
     """External roots are never created/repaired; only our CREATE_NEW leaf is writable."""
-    def __init__(self, files: WindowsPaths) -> None:
+    def __init__(self, files: WindowsPaths, sessions: Path | None = None) -> None:
         self.files, self.api = files, files.api
-        self.sessions = files.claude_sessions_dir()
+        self.sessions = sessions if sessions is not None else files.claude_sessions_dir()
+
+    @classmethod
+    def from_root(cls, files: WindowsPaths, identity: str | None,
+                  *, sessions: tuple[Path, ...] | None = None) -> PeerFiles:
+        """Find the existing pinned root; never substitute a different root."""
+        for path in sessions if sessions is not None else files.claude_sessions_dirs().roots:
+            candidate = cls(files, path)
+            try:
+                with candidate.root() as root:
+                    if root == identity:
+                        return candidate
+            except OSError:
+                continue
+        raise OSError('claude_root_changed')
 
     @contextmanager
     def root(self) -> Iterator[str]:

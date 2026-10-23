@@ -42,6 +42,8 @@ def _isolate_host_policy_dirs() -> None:
 
     root = Path(tempfile.mkdtemp(prefix="agentstatus-test-policy-"))
     atexit.register(shutil.rmtree, root, ignore_errors=True)
+    # §84: install BEFORE default discovery can inspect live /proc environ.
+    os.environ['AB_CLAUDE_SESSIONS_DIR'] = str(root / 'isolated-sessions')
     # 回滚门加载真实旧src；按真实拥有者选择隔离目标，新版不能留一个不生效的旧模块patch。
     try:
         from agentstatus_bridge.platforms.linux import files as policy_owner

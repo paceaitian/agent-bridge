@@ -35,5 +35,10 @@ def grok_home() -> Path:
 def claude_sessions_dir() -> Path:
     return get_platform().files.claude_sessions_dir()
 
+
+def claude_sessions_dirs(proc_root: Path = Path('/proc')) -> tuple[Path, ...]:
+    result = get_platform().files.claude_sessions_dirs(proc_root)
+    return result if isinstance(result, tuple) else result.roots
+
 def ensure_private_dir(path: Path) -> Path:
     return get_platform().files.ensure_private_dir(path)

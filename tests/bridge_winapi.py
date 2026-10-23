@@ -124,6 +124,7 @@ class Kernel:
         self.drive_type = 3
         self.logons = {}  # pid -> (AuthenticationId, SessionId, SECURITY_LOGON_TYPE)
         self.images = {}  # explicit executable paths for process image API tests
+        self.environments = {}  # synthetic UTF-16 blocks, never host process memory
         self.lsa_allocations = set()
         self.acls, self.descriptors = {}, {}
         self.descriptor_acls = {}
@@ -170,13 +171,38 @@ class Kernel:
         me, other = self.processes[self.current], self.processes[pid]
         return other[2] != me[2] or other[3] and not me[3]
     def OpenProcess(self, access, inherit, pid):
-        assert access == 0x101000 and not inherit
+        assert access in (0x101000, 0x101010) and not inherit
         if pid not in self.processes:
             self.error = 87
             return 0
         if self.restricted_process_stage == 'process' and self.restricted_process(pid):
             return self.fail(5)
-        return self.alloc('process', pid=pid)
+        return self.alloc('process', pid=pid, access=access)
+    def IsWow64Process(self, handle, out):
+        put(out, S.I32, 0)
+        return 1
+    def NtQueryInformationProcess(self, handle, kind, out, size, returned):
+        assert kind == 0 and size == 48
+        if self.record(handle)['pid'] not in self.environments:
+            return -1073741790
+        data = (S.P * 6)(0, 0x10000, 0, 0, self.record(handle)['pid'], 0)
+        C.memmove(out, data, 48)
+        return 0
+    def ReadProcessMemory(self, handle, address, out, size, returned):
+        record = self.record(handle)
+        assert record['access'] & 0x10
+        if address == 0x10020:
+            data = (0x20000).to_bytes(8, 'little')
+        elif address == 0x20080:
+            data = (0x30000).to_bytes(8, 'little')
+        elif address >= 0x30000:
+            block = self.environments[record['pid']]
+            data = block[address-0x30000:address-0x30000+size].ljust(size, b'\0')
+        else:
+            return self.fail(299)
+        assert len(data) == size
+        C.memmove(out, data, size); put(returned, C.c_size_t, size)
+        return 1
     def GetProcessTimes(self, handle, creation, exit_, kernel, user):
         fact = self.processes[self.record(handle)['pid']]
         t = C.cast(creation, C.POINTER(S.FILETIME)).contents

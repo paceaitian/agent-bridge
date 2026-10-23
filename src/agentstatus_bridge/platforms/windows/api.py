@@ -9,6 +9,8 @@ import uuid
 from time import monotonic, sleep
 
 from . import abi as A
+from .environment import claude_config
+from ..claude_roots import ConfigValue
 
 REPLACE_SECONDS = 2.0
 
@@ -161,6 +163,9 @@ class WinApi:
             if self.last_error() != 18:
                 raise WinFailure(self.last_error())
             return rows
+
+    def claude_config_dir(self, pid: int, birth: str) -> ConfigValue:
+        return claude_config(self, pid, birth)
 
     def local_app_data(self) -> str:
         folder = (C.c_ubyte * 16).from_buffer_copy(uuid.UUID('f1b32785-6fba-4fcf-9d55-7b8e7f157091').bytes_le)

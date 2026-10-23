@@ -162,17 +162,24 @@ def check_task(task, attempts) -> None:
     refs = [task.origin, task.reviewer, *(a.target for a in attempts)]
     files = get_platform().files
     roots: dict[Provider, str | None] = {Provider.CODEX: command.evidence.root_identity or None}
+    claude_roots: set[str] = set()
+    claude_paths = None
     for ref in refs:
         if ref is None:
             continue
-        if ref.provider is Provider.CLAUDE and ref.provider not in roots:
+        if ref.provider is Provider.CLAUDE:
+            if ref.data_root and ref.data_root in claude_roots:
+                continue
             from .claude_auth import PeerFiles  # layout: allow per-provider root proof, no credential read
             backend = get_platform().transport
             if not isinstance(backend, WindowsPlatform):
                 raise NativeFailure('target_root_changed')
             try:
-                with PeerFiles(backend.files).root() as root:
+                if claude_paths is None:
+                    claude_paths = backend.files.claude_sessions_dirs().roots
+                with PeerFiles.from_root(backend.files, ref.data_root, sessions=claude_paths).root() as root:
                     roots[Provider.CLAUDE] = root
+                    claude_roots.add(root)
             except OSError:
                 raise NativeFailure('target_root_changed') from None
         if ref.provider is Provider.CODEX and not roots[Provider.CODEX]:

@@ -17,7 +17,7 @@ from .endpoints import codex_title_report
 from .naming import command_name
 from .platforms.factory import get_platform
 from .platforms.types import SampleState
-from .paths import claude_sessions_dir, device_name, state_dir, state_dir_source
+from .paths import claude_sessions_dirs, device_name, state_dir, state_dir_source
 from .store import Store, StoreError
 from .transports.claude_peer import inbox_directory
 from .transports.codex_native import daemon_diagnostic
@@ -50,6 +50,29 @@ def _runtime_available() -> bool:
     return get_platform().runtime.sample().state in {SampleState.AVAILABLE, SampleState.EMPTY}
 
 
+def registry_checks(rows: list[dict[str, object]]) -> dict[str, object]:
+    found = [row for row in rows if row['reason'] != 'not_found']
+    return {'claudeRegistryReadable': any(row['readable'] is True for row in rows),
+            'claudeRegistries': rows, 'claudeRegistryCount': len(found),
+            'claudeRegistryReason': ('readable' if any(row['readable'] is True for row in rows)
+                                     else 'unreadable' if found else 'not_found')}
+
+
+def linux_registries() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for path in claude_sessions_dirs():
+        reason = 'unreadable'
+        try:
+            with os.scandir(path):
+                reason = 'readable'
+        except FileNotFoundError:
+            reason = 'not_found'
+        except OSError:
+            pass
+        rows.append({'path': str(path), 'readable': reason == 'readable', 'reason': reason})
+    return rows
+
+
 def collect_checks() -> dict[str, object]:
     """收集 doctor 的全部事实；`checks` 的插入顺序就是文字输出的顺序（JSON 用 sort_keys 看不出），原样保留。"""
     if get_platform().name == 'windows':
@@ -63,7 +86,12 @@ def collect_checks() -> dict[str, object]:
         from .platforms.windows.commands import claude_evidence  # layout: allow W3 bounded native metadata, never key contents
         native_claude = claude_evidence()
         checks['claudePeer'] = {'complete': native_claude.complete, 'reason': native_claude.reason,
-                               'eligibleCount': len(native_claude.endpoints), 'authentication': 'not_probed'}
+                               'eligibleCount': len(native_claude.endpoints), 'authentication': 'not_probed',
+                               'rootDiagnostics': [{'path': str(path), 'reason': reason}
+                                                   for path, reason in native_claude.root_diagnostics]}
+        checks.update(registry_checks(list(native_claude.registries)))
+        if not native_claude.complete and not native_claude.registries:
+            checks['claudeRegistryReason'] = 'discovery_incomplete'
         checks['caller'] = caller_diagnostic()
         from .platforms.windows.worker_identity import diagnostic as worker_diagnostic  # layout: allow Windows本地worker证据，无provider外调
         from .platforms.windows.files import WindowsPaths  # layout: allow doctor窄平台分支
@@ -110,7 +138,7 @@ def collect_checks() -> dict[str, object]:
         # 占位保住显示顺序，读完账本后填入
         "codexQueueEvidence": summarize_queue_evidence(None, version),
         "codexRpcEvidence": summarize_rpc_evidence(None),
-        "claudeRegistryReadable": os.access(claude_sessions_dir(), os.R_OK),
+        **registry_checks(linux_registries()),
         "claudeInboxDirectory": inbox_directory().is_dir(),
         # 可读≠有会话：observer 在线、零可见会话时也算可读（DESIGN §59）
         "agentstatusRuntimeAvailable": _runtime_available(),
@@ -148,6 +176,8 @@ def print_checks(checks: dict[str, object]) -> None:
         "workerLockError": "worker 锁文件异常",
         "codexVersion": "Codex CLI 版本",
         "claudeRegistryReadable": "Claude 会话注册表可读",
+        "claudeRegistryCount": "Claude 已发现注册表目录数",
+        "claudeRegistryReason": "Claude 注册表原因",
         "claudeInboxDirectory": "Claude 回执目录存在",
         "agentstatusRuntimeAvailable": "AgentStatus 忙闲状态可读",
         "ledgerOk": "任务账本正常",
@@ -157,6 +187,15 @@ def print_checks(checks: dict[str, object]) -> None:
         "workerLog": "worker 最近日志",
     }
     for key, value in checks.items():
+        if key == 'claudeRegistries' and isinstance(value, list):
+            print('Claude 注册表目录（显式覆盖优先，否则合并发现）：')
+            for row in value:
+                if isinstance(row, dict):
+                    print(f"  {row.get('path')}：" + ('可读' if row.get('readable') else
+                          '不存在' if row.get('reason') == 'not_found' else '不可读'))
+            if not value:
+                print('  未找到注册表目录')
+            continue
         if key == 'caller' and isinstance(value, dict):
             print(f"调用者：agent 已归属={'是' if value.get('attributed') else '否'}；"
                   f"via={value.get('via')}；rejection={value.get('rejection')}；"

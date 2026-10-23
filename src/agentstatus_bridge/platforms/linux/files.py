@@ -9,6 +9,8 @@ import stat
 import tempfile
 import hashlib
 import shutil
+from ..claude_roots import configured, environment_config, MAX_ENV_BYTES, unique
+from .process import read_process, list_pids
 
 from ..policy import CLAUDE_SYSTEM_DIRS, GROK_SYSTEM_DIRS
 
@@ -94,9 +96,38 @@ def grok_home() -> Path:
 
 
 def claude_sessions_dir() -> Path:
-    """Claude 会话注册表目录（2.1.x 固定在 `~/.claude/sessions`）。"""
+    """Primary configured directory; discovery uses the plural API below."""
     configured = os.environ.get(CLAUDE_SESSIONS_ENV)
-    return Path(configured).expanduser() if configured else Path.home() / ".claude/sessions"
+    return Path(configured).expanduser() if configured else Path(
+        os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude'))).expanduser() / 'sessions'
+
+
+def claude_config_dirs(home: Path | None = None, proc_root: Path = Path('/proc')) -> tuple[Path, ...]:
+    """Same-user live Claude environment only; exit/permission races quietly skip."""
+    roots: list[Path] = []
+    for pid in list_pids(proc_root)[:65536]:
+        try:
+            directory = proc_root / str(pid)
+            if directory.stat().st_uid != os.getuid():
+                continue
+            before = read_process(pid, proc_root)
+            if before is None or before.comm != 'claude':
+                continue
+            with (directory / 'environ').open('rb') as stream:
+                value = environment_config(stream.read(MAX_ENV_BYTES + 1)).value
+            if value and read_process(pid, proc_root) == before:
+                path = Path(value)
+                if path.is_absolute():
+                    roots.append(path)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return unique(roots + configured(home or Path.home(), os.environ))
+
+
+def claude_sessions_dirs(proc_root: Path = Path('/proc')) -> tuple[Path, ...]:
+    if os.environ.get(CLAUDE_SESSIONS_ENV):
+        return (claude_sessions_dir(),)
+    return tuple(path / 'sessions' for path in claude_config_dirs(proc_root=proc_root))
 
 
 CLAUDE_SYSTEM_DIR = Path(CLAUDE_SYSTEM_DIRS["linux"])
@@ -158,6 +189,7 @@ class LinuxPaths:
     codex_sqlite_home = staticmethod(codex_sqlite_home)
     grok_home = staticmethod(grok_home)
     claude_sessions_dir = staticmethod(claude_sessions_dir)
+    claude_sessions_dirs = staticmethod(claude_sessions_dirs)
     prepare_database = staticmethod(prepare_database)
     append_log = staticmethod(append_log)
     atomic_write = staticmethod(atomic_write)

@@ -30,7 +30,8 @@ class Transport(ClaudePeerTransport):
             return DeliveryOutcome(Delivery.FAILED, 'claude_inbox_unavailable')
         io, handle, message_started = WinIO(self.backend.api), None, False
         try:
-            live, record = inspect(self.backend, endpoint.ref.pid, connect=False)
+            files = PeerFiles.from_root(self.backend.files, endpoint.ref.data_root)
+            live, record = inspect(self.backend, endpoint.ref.pid, connect=False, sessions=files.sessions)
             if live.ref != endpoint.ref or live.socket_path != endpoint.socket_path:
                 return DeliveryOutcome(Delivery.FAILED, 'claude_target_changed')
             priority = self._priority_for(context)
@@ -39,6 +40,7 @@ class Transport(ClaudePeerTransport):
                 frame = build_frame(text, context, priority=priority).encode('utf-8')
             except ValueError:
                 return DeliveryOutcome(Delivery.FAILED, 'provider_payload_too_large')
+            inbox.register(files, live.ref.data_root)
             deadline = time.monotonic() + 5
             try:
                 handle = io.open_pipe(live.socket_path or '')
@@ -51,7 +53,6 @@ class Transport(ClaudePeerTransport):
             me = self.backend.api.current_token()
             if peer.token.sid != me.sid or peer.token.elevated:
                 raise OSError('claude_peer_mismatch')
-            files = PeerFiles(self.backend.files)
             with files.root() as root:
                 if root != live.ref.data_root:
                     raise OSError('claude_root_changed')

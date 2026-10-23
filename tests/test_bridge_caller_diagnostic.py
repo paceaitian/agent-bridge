@@ -25,7 +25,7 @@ class WindowsClaudeTests(unittest.TestCase):
 
     def collect(self, env=None):
         with (patch.object(D.os, 'getpid', return_value=100),
-              patch.dict(os.environ, env or {}, clear=True),
+              patch.dict(os.environ, {'AB_CLAUDE_SESSIONS_DIR':str(self.sessions), **(env or {})}, clear=True),
               patch.object(claude_auth.PeerFiles, 'token', side_effect=AssertionError('no key read')),
               patch('agentstatus_bridge.store.Store.open', side_effect=AssertionError('no ledger'))):
             result = D.collect()

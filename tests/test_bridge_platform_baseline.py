@@ -144,12 +144,24 @@ def record_linux():
                     data = json.loads(shown)
                     if data.pop('caller') != caller:
                         raise AssertionError('caller projection changed')
+                    if hasattr(doctor, 'registry_checks'):
+                        expected = {'claudeRegistries': [{'path':str(sessions),'readable':True,'reason':'readable'}],
+                                    'claudeRegistryCount':1,'claudeRegistryReason':'readable'}
+                        for key, value in expected.items():
+                            if data.pop(key) != value:
+                                raise AssertionError('multi-root doctor projection changed')
                     shown = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + '\n'
                 else:
                     line = '调用者：agent 已归属=否；via=None；rejection=None；祖先链 termination=root，长度=1；最近 agent=None\n'
                     if shown.count(line) != 1:
                         raise AssertionError('caller text missing or changed')
                     shown = shown.replace(line, '')
+                    if hasattr(doctor, 'registry_checks'):
+                        addition = ('Claude 注册表目录（显式覆盖优先，否则合并发现）：\n'
+                                    f'  {sessions}：可读\nClaude 已发现注册表目录数：1\nClaude 注册表原因：readable\n')
+                        if shown.count(addition) != 1:
+                            raise AssertionError('multi-root doctor text changed')
+                        shown = shown.replace(addition, '')
             outputs.append([list(args), code, norm(shown), norm(err.getvalue())])
             if code not in (0, 6):
                 raise AssertionError(outputs)

@@ -112,6 +112,8 @@ SDK = {
         'GetCurrentProcess': (H, []),
         'GetCurrentProcessId': (U32, []),
         'OpenProcess': (H, [U32, I32, U32]),
+        'ReadProcessMemory': (I32, [H, P, P, C.c_size_t, P]),
+        'IsWow64Process': (I32, [H, P]),
         'CloseHandle': (I32, [H]),
         'GetProcessTimes': (I32, [H, P, P, P, P]),
         'QueryFullProcessImageNameW': (I32, [H, U32, P, P]),
@@ -148,6 +150,7 @@ SDK = {
         'GetConsoleWindow': (H, []),
         'SetHandleInformation': (I32, [H, U32, U32]),
     },
+    'ntdll': {'NtQueryInformationProcess': (I32, [H, U32, P, U32, P])},
     'advapi32': {
         'OpenProcessToken': (I32, [H, U32, P]),
         'GetTokenInformation': (I32, [H, U32, P, U32, P]),
