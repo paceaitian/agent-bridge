@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tarfile
+import textwrap
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -45,6 +46,10 @@ import contextlib, io, json, os, sys
 from pathlib import Path
 from unittest.mock import patch
 import bridge_support
+fixture_environment = json.loads(sys.argv.pop(1))
+with patch.dict(os.environ, fixture_environment):
+'''
+        context = '''
 from bridge_support import ref
 from agentstatus_bridge import cli
 from agentstatus_bridge.endpoints import Caller
@@ -53,10 +58,14 @@ from agentstatus_bridge.store import Store
 from agentstatus_bridge.transports.codex_withdraw import QueueDeleteClient, DeleteResult
 root = Path(os.environ["AB_STATE_DIR"])
 '''
-        result = subprocess.run([sys.executable, "-c", preamble + code, *args], cwd=source,
-            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(source),
-                 "AB_STATE_DIR": str(state), "PYTHONPATH": str(source / "src") + os.pathsep + str(tests),
-                 "CODEX_HOME": str(home), "CODEX_SQLITE_HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1"},
+        fixture_environment = {"AB_STATE_DIR": str(state), "CODEX_HOME": str(home), "CODEX_SQLITE_HOME": str(home)}
+        runner = {key: value for key, value in os.environ.items() if key in {
+            'TMPDIR', 'TMP', 'TEMP', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS',
+            'DBUS_SYSTEM_BUS_ADDRESS', 'TMUX_TMPDIR', 'LANG'}}
+        runner.update(PATH=os.environ.get("PATH", "/usr/bin:/bin"), HOME=str(source),
+                      PYTHONPATH=str(source / "src") + os.pathsep + str(tests), PYTHONDONTWRITEBYTECODE="1")
+        result = subprocess.run([sys.executable, "-c", preamble + textwrap.indent(context + code, '    '),
+                                 json.dumps(fixture_environment), *args], cwd=source, env=runner,
             capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)

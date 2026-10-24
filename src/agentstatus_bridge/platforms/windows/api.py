@@ -219,7 +219,8 @@ class WinApi:
 
     def open_file(self, path: str, *, create: bool = False, write: bool = False,
                   directory: bool = False, exclusive_create: bool = False, read_data: bool = False,
-                  write_dac: bool = False, sharing: int | None = None, metadata_only: bool = False) -> int:
+                  write_dac: bool = False, write_owner: bool = False,
+                  sharing: int | None = None, metadata_only: bool = False) -> int:
         flags = 0x00200000 | (0x02000000 if directory else 0x80)  # no reparse traversal
         # READ_CONTROL alone does not participate in NTFS sharing arbitration.
         # A directory lease needs FILE_LIST_DIRECTORY, not delete privileges.
@@ -228,6 +229,7 @@ class WinApi:
         access |= 0x40000 if write_dac else 0
         if metadata_only:
             access = 0x20000 | (0x40000 if write_dac else 0)
+        access |= 0x80000 if write_owner else 0  # WRITE_OWNER only during owned-state repair
         disposition = 1 if exclusive_create else (4 if create else 3)
         # Directory leases retain identity handles, not a veto on owner renames.
         if sharing is None:
@@ -306,18 +308,39 @@ class WinApi:
             if descriptor.value:
                 self.k.LocalFree(descriptor)
 
-    def check_owner(self, handle: int) -> None:
+    def owner_kind(self, handle: int) -> str:
         principal = self.current_token().sid
         owner, descriptor = A.PTR(), A.PTR()
         status = self.a.GetSecurityInfo(handle, 1, 1, C.byref(owner), None, None, None, C.byref(descriptor))
         if status:
             raise WinFailure(status)
         try:
-            if self._sid(owner) != principal:
-                raise OSError('windows_owner_mismatch')
+            sid = self._sid(owner)
+            if sid == principal:
+                return 'self'
+            return {bytes.fromhex('01020000000000052000000020020000'): 'administrators',
+                    bytes.fromhex('010100000000000512000000'): 'system'}.get(sid, 'other')
         finally:
             if descriptor.value:
                 self.k.LocalFree(descriptor)
+
+    def check_owner(self, handle: int) -> None:
+        if self.owner_kind(handle) != 'self':
+            raise OSError('windows_owner_mismatch')
+
+    def restore_owner(self, handle: int, expected: str) -> None:
+        # No privilege enablement or elevated fallback; the ordinary token
+        # must already have WRITE_OWNER. Recheck on the actual repair handle.
+        current = self.owner_kind(handle)
+        if current == 'self':
+            return  # Another opener restored this same object; DACL checks still follow.
+        if expected not in {'administrators', 'system'} or current != expected:
+            raise OSError('windows_owner_mismatch')
+        sid = C.create_string_buffer(self.current_token().sid)
+        status = self.a.SetSecurityInfo(handle, 1, 1, C.cast(sid, A.PTR), None, None, None)
+        if status:
+            raise WinFailure(status)
+        self.check_owner(handle)
 
     def repair_private(self, handle: int, *, inherit: bool = False) -> None:
         self.check_owner(handle)

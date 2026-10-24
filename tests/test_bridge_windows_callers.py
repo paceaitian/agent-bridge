@@ -6,6 +6,9 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import time
 import unittest
@@ -23,6 +26,55 @@ from agentstatus_bridge.platforms.factory import using_platform, make_platform
 from agentstatus_bridge.platforms.types import Presence
 from agentstatus_bridge.platforms.windows import caller as C, codex_discovery as D, alias_command as A, local_store as L
 from agentstatus_bridge.platforms.windows.target_aliases import AliasFile
+
+
+class HostEnvironmentTests(unittest.TestCase):
+    def test_inherited_session_variables_do_not_poison_claude_caller_modules(self):
+        tree = Path(__file__).resolve().parents[1]
+        env = dict(os.environ, CLAUDE_CODE_SESSION_ID='ffffffff-ffff-4fff-8fff-ffffffffffff',
+                   CODEX_THREAD_ID='eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee',
+                   CODEX_SESSION_ID='dddddddd-dddd-4ddd-8ddd-dddddddddddd')
+        env['PYTHONPATH'] = os.pathsep.join((str(tree / 'src'), str(tree / 'tests')))
+        command = [sys.executable, '-B'] + (['-O'] if sys.flags.optimize else [])
+        command += ['-m', 'unittest', 'test_bridge_windows_claude_cli', 'test_bridge_windows_claude_r2', '-v']
+        run = subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn('Ran 15 tests', run.stderr)
+        self.assertIn('\nOK\n', run.stderr)
+
+    def test_session_guard_drops_routing_but_keeps_runner_and_ci_controls(self):
+        tree = Path(__file__).resolve().parents[1]
+        removed = ('CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_SESSION_ID', 'CLAUDE_CONFIG_DIR',
+                   'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CODEX_THREAD_ID',
+                   'CODEX_SESSION_ID', 'CODEX_COMPANION_SESSION_ID', 'CODEX_HOME', 'CODEX_SQLITE_HOME',
+                   'GROK_SESSION_ID', 'GROK_HOME', 'GROK_HOOK_EVENT', 'TMUX', 'TMUX_PANE',
+                   'AB_STATE_DIR', 'AB_BINDING', 'AB_DEVICE', 'AB_COMMAND', 'AB_CLAUDE_PRIORITY',
+                   'AB_WORKER_START_TOKEN', 'AB_WORKER_BREAKAWAY', 'AB_FUTURE_ROUTING')
+        preserved = ('PATH', 'PYTHONPATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'USERPROFILE', 'SYSTEMROOT',
+                     'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'TMUX_TMPDIR', 'CI', 'GITHUB_ACTIONS',
+                     'AGENTSTATUS_UI_CANARY', 'AGENTSTATUS_WRITE_GOLDEN', 'AB_WRITE_GOLDEN')
+        script = '''import json, os, sys
+sys.path[:0] = sys.argv[1:3]
+removed, preserved = json.loads(sys.argv[3]), json.loads(sys.argv[4])
+before = {key: os.environ.get(key) for key in preserved}
+old_root = os.environ.get('AB_CLAUDE_SESSIONS_DIR')
+import bridge_support
+print(json.dumps({'removed': all(key not in os.environ for key in removed),
+                  'preserved': before == {key: os.environ.get(key) for key in preserved},
+                  'privateRegistry': bool(os.environ.get('AB_CLAUDE_SESSIONS_DIR')) and
+                      os.environ['AB_CLAUDE_SESSIONS_DIR'] != old_root}))
+'''
+        with TemporaryDirectory() as tmp:
+            env = dict(os.environ)
+            env.update({key: str(Path(tmp) / key) for key in removed})
+            env.update(AB_CLAUDE_SESSIONS_DIR=str(Path(tmp) / 'host-registry'), TMUX_TMPDIR=tmp,
+                       CI='fixture', GITHUB_ACTIONS='fixture', AGENTSTATUS_UI_CANARY='fixture',
+                       AGENTSTATUS_WRITE_GOLDEN='fixture', AB_WRITE_GOLDEN='fixture')
+            command = [sys.executable, '-B', '-I'] + (['-O'] if sys.flags.optimize else [])
+            command += ['-c', script, str(tree / 'src'), str(tree / 'tests'), json.dumps(removed), json.dumps(preserved)]
+            run = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), {'removed': True, 'preserved': True, 'privateRegistry': True})
 
 
 class CallerTests(unittest.TestCase):

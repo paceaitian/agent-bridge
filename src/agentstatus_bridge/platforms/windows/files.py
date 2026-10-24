@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager, ExitStack
 from collections.abc import Iterator
 import hashlib
+import json
 import logging
 import ntpath
 import os
@@ -37,6 +38,18 @@ class WindowsPaths:
         self.api = api
         self.acl_repaired = False
         self._recording_repair = False
+        self.repair_reasons: set[str] = set()
+        self._logged_repairs: set[str] = set()
+
+    def _owner_repair(self, handle: int, path: Path) -> str | None:
+        owner = self.api.owner_kind(handle)
+        if owner == 'self':
+            return None
+        # Only this application's state root and descendants; external reads
+        # and other private fixtures keep the original owner requirement.
+        if owner not in {'administrators', 'system'} or not local_path(path).is_relative_to(self.state_dir()):
+            raise OSError('windows_owner_mismatch')
+        return owner
 
     def ensure_private(self, handle: int, path: Path, *, protected: bool = False) -> None:
         """Only owned state, never external Codex/SQL/pipe permissions."""
@@ -49,15 +62,20 @@ class WindowsPaths:
         before = self.api.file_info(handle)  # rejects reparse before mutation
         if before.attributes & 0x10 or before.links != 1:
             raise OSError('windows_file_untrusted')
-        self.api.check_owner(handle)
-        with self.api.owned(self.api.open_file(str(path), metadata_only=True, write_dac=True)) as repair:
+        self.api.check_ntfs(handle)
+        owner = self._owner_repair(handle, path)
+        with self.api.owned(self.api.open_file(str(path), metadata_only=True, write_dac=True,
+                                             write_owner=owner is not None)) as repair:
             after = self.api.file_info(repair)
             if ((after.volume, after.index_high, after.index_low, after.links, after.attributes)
                     != (before.volume, before.index_high, before.index_low, 1, before.attributes)):
                 raise OSError('windows_file_untrusted')
             self.api.check_ntfs(repair)
+            if owner is not None:
+                self.api.restore_owner(repair, owner)
+                self._observe_repair('owner_' + owner)
             self.api.repair_private(repair)
-        self._record_repair(path)
+        self._record_repair(path, reason='owner_' + owner if owner is not None else 'dacl')
 
     def _private_directory(self, handle: int, path: Path) -> int:
         """Takes ownership of handle, returning the verified replacement lease.
@@ -74,7 +92,6 @@ class WindowsPaths:
             except OSError as error:
                 if error.args != ('windows_acl_untrusted',):
                     raise
-            self.api.check_owner(handle)
             def identity(h: int) -> tuple[int, int, int]:
                 info = self.api.file_info(h)
                 if not info.attributes & 0x10 or info.links != 1:
@@ -82,35 +99,47 @@ class WindowsPaths:
                 self.api.check_ntfs(h)
                 return int(info.volume), int(info.index_high), int(info.index_low)
             before = identity(handle)
+            owner = self._owner_repair(handle, path)
             self.api.close(handle)
             current = None
             with self.api.owned(self.api.open_file(str(path), directory=True, write_dac=True, sharing=7,
-                                                  metadata_only=True)) as repair:
+                                                  metadata_only=True, write_owner=owner is not None)) as repair:
                 if identity(repair) != before:
                     raise OSError('windows_file_untrusted')
+                if owner is not None:
+                    self.api.restore_owner(repair, owner)
+                    self._observe_repair('owner_' + owner)
                 self.api.repair_private(repair, inherit=True)
             current = self.api.open_file(str(path), directory=True)
             assert current is not None
             if identity(current) != before:
                 raise OSError('windows_file_untrusted')
             self.api.check_private(current, protected=True)
-            self._record_repair(path)
+            self._record_repair(path, reason='owner_' + owner if owner is not None else 'dacl')
             return current
         except BaseException:
             if current is not None:
                 self.api.close(current)
             raise
 
-    def _record_repair(self, path: Path) -> None:
+    def _observe_repair(self, reason: str) -> None:
         self.acl_repaired = True
-        logging.getLogger(__name__).warning('windows_private_acl_repaired')
+        self.repair_reasons.add(reason)
+
+    def _record_repair(self, path: Path, *, reason: str = 'dacl') -> None:
+        self._observe_repair(reason)
+        # Owner restoration alone is observable, but is not a completed DACL repair.
+        if reason not in self._logged_repairs:
+            logging.getLogger(__name__).warning('windows_private_acl_repaired reason=%s', reason)
+            self._logged_repairs.add(reason)
         # Content-free, persistent observation; never asserts the old bytes were
         # trustworthy. Non-state fixture paths only set the process observation.
         if (not self._recording_repair and path.is_relative_to(self.state_dir())
                 and path != self.state_dir() / ACL_OBSERVATION):
             self._recording_repair = True
             try:
-                self.atomic_write(self.state_dir(), b'{"previousAclUntrusted":true}\n',
+                payload = json.dumps({'previousAclUntrusted': True, 'reasons': sorted(self.repair_reasons)}).encode() + b'\n'
+                self.atomic_write(self.state_dir(), payload,
                                   name=ACL_OBSERVATION, prefix='.acl.')
             finally:
                 self._recording_repair = False

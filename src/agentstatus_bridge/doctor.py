@@ -73,6 +73,36 @@ def linux_registries() -> list[dict[str, object]]:
     return rows
 
 
+STORAGE_SUBREASONS = frozenset({
+    'windows_owner_mismatch', 'windows_acl_untrusted', 'windows_file_untrusted',
+    'windows_directory_required', 'windows_reparse_unsupported',
+    'windows_elevated_unsupported', 'windows_filesystem_unsupported',
+    'windows_volume_unsupported', 'windows_path_unsupported', 'windows_path_unverified',
+    'windows_identity_unknown', 'windows_lock_conflict', 'schema_too_new',
+})
+STORAGE_WINERRORS = frozenset({2, 3, 5, 32, 33, 1307, 1314})
+
+
+def storage_subreason(error: BaseException) -> str:
+    """Closed causes only; never project exception text, paths, SQL or SIDs."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        if isinstance(current, sqlite3.Error):
+            return 'sqlite_error'
+        for item in current.args:
+            if isinstance(item, str) and item in STORAGE_SUBREASONS:
+                return item
+        code = getattr(current, 'winerror', None)
+        if type(code) is int and code in STORAGE_WINERRORS:
+            return 'winerror_' + str(code)
+        current = current.__cause__ or current.__context__
+    return 'unknown'
+
+
 def collect_checks() -> dict[str, object]:
     """收集 doctor 的全部事实；`checks` 的插入顺序就是文字输出的顺序（JSON 用 sort_keys 看不出），原样保留。"""
     if get_platform().name == 'windows':
@@ -105,9 +135,10 @@ def collect_checks() -> dict[str, object]:
             with Store.open() as local:
                 checks['ledgerReadable'] = True
                 checks['summary'] = summary.status(state_dir(), local)
-        except (StoreError, OSError):
+        except (StoreError, OSError) as error:
             checks['ledgerReadable'] = False
             checks['storageReason'] = 'windows_storage_unverified'
+            checks['storageSubreason'] = storage_subreason(error)
         if isinstance(files, WindowsPaths):
             checks['privateAclRepairObserved'] = files.acl_observation()
         return checks
@@ -182,6 +213,8 @@ def print_checks(checks: dict[str, object]) -> None:
         "agentstatusRuntimeAvailable": "AgentStatus 忙闲状态可读",
         "ledgerOk": "任务账本正常",
         "ledgerError": "账本错误",
+        "storageReason": "存储状态原因",
+        "storageSubreason": "存储故障子原因",
         "archivedWithNativeRisk": "已关闭但对方可能仍在执行的任务",
         "summaryState": "协作摘要",
         "workerLog": "worker 最近日志",

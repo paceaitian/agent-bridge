@@ -19,6 +19,28 @@ RECEIVER = EndpointRef(Provider.CLAUDE, '2aa904d4-0000-4000-8000-000000000002', 
 
 
 class LocalDisplayTests(unittest.TestCase):
+    def test_unusable_id_keeps_legacy_display_without_placeholder_suffix(self):
+        for native in ('-', '', ' ', '\t', ' - '):
+            for label, pane in (('中文 name', None), (None, '%5'), (None, None)):
+                with self.subTest(native=native, label=label, pane=pane):
+                    ref = replace(ORIGIN, native_id=native, label=label, pane=pane)
+                    self.assertEqual(endpoint_text(ref, id_prefix='-'), ref.display())
+                    self.assertNotIn('〔', endpoint_text(ref))
+        # Opaque historical IDs are still usable; display does not validate UUID syntax.
+        self.assertEqual(endpoint_text(replace(ORIGIN, native_id='thread-old')), 'codex@回复 W3-ONE〔thread-o〕')
+
+    def test_short_prefix_uses_eight_chars_or_the_whole_short_id(self):
+        short_name = replace(ORIGIN, label='01a1')
+        for prefix in ('', '0', '01a1', '01a15e9', 'unrelated'):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(endpoint_text(short_name, id_prefix=prefix), 'codex@01a1〔01a15e9f〕')
+        self.assertEqual(endpoint_text(short_name, id_prefix=ORIGIN.native_id[:12]),
+                         'codex@01a1〔01a15e9f-000〕')
+        small = replace(ORIGIN, native_id='abcd')
+        self.assertEqual(endpoint_text(small, id_prefix='ab'), 'codex@回复 W3-ONE〔abcd〕')
+        self.assertEqual(endpoint_text(replace(small, label='abcd'), id_prefix='ab'), 'codex@abcd')
+        self.assertEqual(endpoint_text(replace(small, label=None)), 'codex@abcd')
+
     def test_names_ids_panes_and_unicode(self):
         for ref, expected in (
             (ORIGIN, 'codex@回复 W3-ONE〔01a15e9f〕'),

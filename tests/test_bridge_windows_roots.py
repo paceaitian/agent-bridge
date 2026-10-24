@@ -94,6 +94,53 @@ class MultiRootTests(unittest.TestCase):
         self.k.environments[200]=b'x\0'* (1024*1024)
         with self.assertRaisesRegex(OSError,'limit'): self.k.api.claude_config_dir(200,BIRTH)
 
+    def test_unaligned_environment_terminator_at_and_across_page_end(self):
+        self.roots()
+        raw = self.k.environments[200]
+        for extra in (0, 2):
+            with self.subTest(terminator_crosses=bool(extra)):
+                base = 0x31000 - len(raw) + extra
+                self.k.environment_addresses[200] = base
+                before = len(self.k.calls)
+                try:
+                    value = self.k.api.claude_config_dir(200, BIRTH)
+                except OSError as error:
+                    self.fail('readable nonaligned fixture was rejected: ' + str(error))
+                self.assertEqual(value.value, str(self.sessions.parent))
+                reads = [args for name, args in self.k.calls[before:]
+                         if name == 'ReadProcessMemory' and args[1] >= base]
+                self.assertEqual(len(reads), 2 if extra else 1)
+                self.assertTrue(all(args[3] <= 4096 - args[1] % 4096 for args in reads))
+                self.assertEqual(reads[0][3], len(raw) - extra)
+
+    def test_environment_unmapped_tail_fails_instead_of_padding_a_terminator(self):
+        self.roots()
+        self.k.environment_addresses[200] = 0x30ff0
+        self.k.environments[200] = b'x\0' * 8  # fills the last 16 mapped bytes without a terminator
+        self.k.environment_limits[200] = 16
+        with self.assertRaises(OSError) as caught:
+            self.k.api.claude_config_dir(200, BIRTH)
+        self.assertEqual(caught.exception.winerror, 299)
+        self.assertEqual(self.k.handles, {})
+
+    def test_process_replaced_during_environment_read_is_rejected(self):
+        self.roots()
+        original = self.k.ReadProcessMemory
+        replaced = []
+        def read(handle, address, *args):
+            result = original(handle, address, *args)
+            if address >= 0x30000 and not replaced:
+                row = self.k.processes[200]
+                self.k.processes[200] = (row[0], int(BIRTH) + 1, *row[2:])
+                replaced.append(True)
+            return result
+        with patch.object(self.k, 'ReadProcessMemory', side_effect=read):
+            with self.assertRaisesRegex(OSError, 'windows_process_reused') as caught:
+                self.k.api.claude_config_dir(200, BIRTH)
+        self.assertEqual(caught.exception.winerror, 1168)
+        self.assertEqual(replaced, [True])
+        self.assertEqual(self.k.handles, {})
+
     def test_changed_root_does_not_select_first_other_account_or_create_external_roots(self):
         self.roots(); self.second()
         before={p for p in self.root.rglob('*')}

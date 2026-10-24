@@ -350,6 +350,27 @@ class CapacityTests(unittest.TestCase):
             self.assertEqual(self.store.get_attempt(work.id).work, Work.AWAITING_ACK)
             self.assertEqual(len(self.store.attempts(task.id)), 1)
 
+    def test_review_only_noncapacity_error_rolls_back_without_origin_fallback(self):
+        for reason in ('store_write_failed', 'message_too_large'):
+            with self.subTest(reason=reason):
+                task, work = self.task(review=True)
+                original = self.store.add_attempt
+                before_events = self.store.events(task.id)
+                before_revision = self.store.ledger_revision()
+                def add(*args, **kwargs):
+                    if kwargs['role'] is Role.REVIEW:
+                        raise StoreError(reason)
+                    return original(*args, **kwargs)  # NOTICE would succeed; it cannot mask the review bug.
+                with patch.object(self.store, 'add_attempt', side_effect=add) as calls:
+                    with self.assertRaises(StoreError) as caught:
+                        self.report(task, work)
+                self.assertEqual(caught.exception.code, reason)
+                self.assertEqual([call.kwargs['role'] for call in calls.call_args_list], [Role.REVIEW])
+                self.assertEqual(self.store.get_attempt(work.id).work, Work.AWAITING_ACK)
+                self.assertEqual(len(self.store.attempts(task.id)), 1)
+                self.assertEqual(self.store.events(task.id), before_events)
+                self.assertEqual(self.store.ledger_revision(), before_revision)
+
     def test_skip_event_failure_also_rolls_back(self):
         task, work = self.task()
         self.fill(task, 64)

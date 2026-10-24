@@ -125,6 +125,8 @@ class Kernel:
         self.logons = {}  # pid -> (AuthenticationId, SessionId, SECURITY_LOGON_TYPE)
         self.images = {}  # explicit executable paths for process image API tests
         self.environments = {}  # synthetic UTF-16 blocks, never host process memory
+        self.environment_addresses = {}  # pid -> optional non-page-aligned base
+        self.environment_limits = {}  # pid -> readable bytes from base; default ends at the last mapped page
         self.lsa_allocations = set()
         self.acls, self.descriptors = {}, {}
         self.descriptor_acls = {}
@@ -191,13 +193,21 @@ class Kernel:
     def ReadProcessMemory(self, handle, address, out, size, returned):
         record = self.record(handle)
         assert record['access'] & 0x10
+        pid = record['pid']
+        base = self.environment_addresses.get(pid, 0x30000)
         if address == 0x10020:
             data = (0x20000).to_bytes(8, 'little')
         elif address == 0x20080:
-            data = (0x30000).to_bytes(8, 'little')
-        elif address >= 0x30000:
-            block = self.environments[record['pid']]
-            data = block[address-0x30000:address-0x30000+size].ljust(size, b'\0')
+            data = base.to_bytes(8, 'little')
+        elif address >= base:
+            block = self.environments[pid]
+            limit = self.environment_limits.get(pid, ((base + len(block) + 4095) // 4096) * 4096 - base)
+            offset = address - base
+            if offset + size > limit:
+                return self.fail(299)
+            # Zero padding models only the readable tail of the final mapped
+            # page; an unmapped next page must not manufacture a terminator.
+            data = block[offset:offset+size].ljust(size, b'\0')
         else:
             return self.fail(299)
         assert len(data) == size
@@ -294,7 +304,16 @@ class Kernel:
         return 1
     def SetSecurityInfo(self, handle, kind, flags, owner, group, dacl, sacl):
         record = self.record(handle)
-        assert record['access'] & 0x40000, 'WRITE_DAC required'
+        if flags == 1:
+            if not record['access'] & 0x80000:
+                return 5  # WRITE_OWNER is an access requirement, not an exact-mask oracle.
+            assert (kind, group, dacl, sacl) == (1, None, None, None)
+            if not owner or C.string_at(owner, self.GetLengthSid(owner)) != self.sid:
+                return 1307  # ordinary token may assign its own SID only in this fixture
+            self.files.setdefault(record['path'], {})['owner'] = self.sid
+            return 0
+        if not record['access'] & 0x40000:
+            return 5  # WRITE_DAC required
         assert (kind, flags, owner, group, sacl) == (1, 0x80000004, None, None, None)
         revision, _, size, count, _ = struct.unpack('<BBHHH', C.string_at(dacl,8))
         assert revision == 2 and dacl and 8 <= size <= 1024
@@ -363,6 +382,9 @@ class Kernel:
         self._attributes(sa)
         assert sharing in (0,3,7) and flags & 0x200000, 'no directory pin/reparse guard'
         p = Path(text(path))
+        if self.files.get(str(p), {}).get('deny_owner') and access & 0x80000:
+            self.error = 5
+            return S.INVALID_HANDLE_VALUE
         # Owner metadata rights do not imply FILE_LIST_DIRECTORY/data access.
         if self.files.get(str(p),{}).get('deny_data') and access & 0xc0000001:
             self.error=5

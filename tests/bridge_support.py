@@ -18,6 +18,24 @@ import types
 from typing import Any
 import unittest
 
+
+def _isolate_host_session_environment() -> None:
+    """Drop inherited identity/routing inputs before importing bridge code.
+
+    Keep runner paths, private runtime/DBus locations, CI controls and golden
+    switches; tests needing session inputs must explicitly patch them in.
+    """
+    names = {'CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_SESSION_ID', 'CLAUDE_CONFIG_DIR', 'TMUX', 'TMUX_PANE'}
+    for name in tuple(os.environ):
+        upper = name.upper()
+        if upper.endswith('_WRITE_GOLDEN'):
+            continue  # verify must still detect/reject inherited golden writes
+        if upper in names or upper.startswith(('AB_', 'CLAUDE_CODE_', 'CODEX_', 'GROK_')):
+            os.environ.pop(name, None)
+
+
+_isolate_host_session_environment()
+
 from agentstatus_bridge import summary
 from agentstatus_bridge.endpoints import DiscoverySources
 from agentstatus_bridge.model import Attempt, Delivery, Endpoint, EndpointRef, Flow, Provider, Runtime, Task
