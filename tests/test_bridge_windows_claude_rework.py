@@ -238,6 +238,9 @@ class ReworkTests(unittest.TestCase):
                   patch.object(commands.claude, 'discover', return_value=result), redirect_stdout(output)):
                 self.assertEqual(cli.main(['peers']), 0)
             self.assertIn('测试名称', output.getvalue())
+            self.assertIn('claude@测试名称〔'+ep.ref.native_id[:8]+'〕', output.getvalue())
+            self.assertIn('target=claude@id:'+ep.ref.native_id, output.getvalue())
+            self.assertIsNone(ep.ref.label)
             self.assertIn('发现完整' if complete else '发现不完整', output.getvalue())
             self.assertNotIn('claude_discovery_incomplete', output.getvalue())
 

@@ -17,6 +17,7 @@ from .local_transport import WindowsPlatform
 from .target_aliases import AliasFile, AliasSet, ALIAS
 from .thread_names import names, fields_valid
 from ...model import Endpoint, EndpointRef, Provider
+from ...display import endpoint_text
 
 PAGE_SIZE, MAX_LOADED = 256, 4096
 NO_PANE_WARNING = ('可能没有窗口在显示；若窗口已关闭，可 codex resume 查看；'
@@ -296,7 +297,7 @@ def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = No
 
 
 def print_peers(result: Discovery) -> None:
-    print('Windows Codex 候选；W2-5 实机与独立审计尚未通过。' + NO_PANE_WARNING)
+    print(NO_PANE_WARNING)
     if not result.complete:
         print(result.reason)
     for row in result.rows:
@@ -304,7 +305,11 @@ def print_peers(result: Discovery) -> None:
         if row.eligible and not row.names_verified:
             suffix += '/名称未核实'
         target = result.target_name(row) if row.eligible else '不可投递 '+row.thread[:8]
-        print(f'{target}  {row.label}  [{suffix}] 状态未知')
+        selected_id = target.removeprefix('codex@').removeprefix('id:')
+        prefix = selected_id if row.thread.startswith(selected_id) else None
+        # 只构造展示值；目标选择仍使用上面的原 target，JSON 与发现身份不变。
+        ref = EndpointRef(Provider.CODEX, row.thread, 0, '', label=row.label)
+        print(f'{endpoint_text(ref, id_prefix=prefix)}  target={target}  [{suffix}] 状态未知')
     for name in result.aliases.unavailable:
         print(f'别名 {name}  别名目标当前不可用')
     if result.aliases.reason != 'ok':

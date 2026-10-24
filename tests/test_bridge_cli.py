@@ -52,6 +52,59 @@ USER = Caller(None, None)
 
 
 class CliTests(unittest.TestCase):
+    def test_named_local_outputs_include_ids_without_changing_json_or_selectors(self) -> None:
+        impl = 'codex@impl〔impl-thr〕'
+        lead = 'codex@lead〔lead-thr〕'
+        review = 'claude@review〔review-s〕'
+        self.caller = as_agent(LEAD)
+        code, out, err = self.run_cli('send', '--to', 'codex@impl', '-m', 'fixture', '--no-wait')
+        self.assertEqual(code, 0, err)
+        self.assertIn('已交给 '+impl, out)
+        with self.store() as store:
+            task_id = store.list_tasks()[0].id
+        self.assertIn(impl, self.run_cli('tasks')[1])
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        code, out, err = self.run_cli('report', task_id, '--result', '--note', 'OK')
+        self.assertEqual(code, 0, err)
+        self.assertIn('已排队通知发起方 '+lead, out)
+        self.caller = as_agent(LEAD)
+        code, out, err = self.run_cli('retry', task_id)
+        self.assertEqual(code, 0, err)
+        self.assertIn('→ '+impl, out)
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        self.assertEqual(self.run_cli('report', task_id, '--result')[0], 0)
+        self.caller = as_agent(LEAD)
+        code, out, err = self.run_cli('accept', task_id)
+        self.assertEqual(code, 0, err)
+        self.assertIn('已排队结束回执 → '+impl, out)
+        text = self.run_cli('status', task_id)[1]
+        self.assertIn('发起：'+lead, text)
+        self.assertIn('→ '+impl, text)
+        document = json.loads(self.run_cli('status', task_id, '--json')[1])
+        self.assertEqual(document['origin']['name'], 'codex@lead')
+        self.assertEqual(document['attempts'][0]['target']['name'], 'codex@impl')
+        # Review report, status reviewer and close all go through the local formatter.
+        task_id = self.send('--review-by', 'claude@review')
+        self.mark_sent(task_id)
+        self.caller = as_agent(IMPL)
+        code, out, err = self.run_cli('report', task_id, '--result')
+        self.assertEqual(code, 0, err)
+        self.assertIn('已排队发给复核方 '+review, out)
+        self.assertIn('复核（'+review+'）', self.run_cli('status', task_id)[1])
+        self.mark_sent(task_id)
+        self.caller = as_agent(LEAD)
+        code, out, err = self.run_cli('close', task_id)
+        self.assertEqual(code, 0, err)
+        self.assertIn(impl, out)
+        self.assertIn(review, out)
+        # Linux peers already has an ID column and copyable selector; no bracketed selector.
+        peers = self.run_cli('peers')[1]
+        self.assertIn('codex@impl', peers)
+        self.assertIn('impl-thr', peers)
+        self.assertNotIn('〔', peers)
+
     def test_linux_empty_reviewer_and_local_controls_keep_legacy_behavior(self) -> None:
         code,out,err=self.run_cli('send','--to','codex@impl','--review-by','',
                                   '-m','fixture','--no-wait','--json')
@@ -1392,7 +1445,7 @@ class CliTests(unittest.TestCase):
         self.endpoints = [REVIEW, LEAD]
         code, out, _ = self.run_cli("status", task_id)
         self.assertEqual(code, 0)
-        self.assertIn("当前未发现 codex@impl 的会话（可能已退出", out)
+        self.assertIn("当前未发现 codex@impl〔impl-thr〕 的会话（可能已退出", out)
         self.assertNotIn("已不在", out)
         self.assertIn(f"{CMD} retry {task_id[:8]} --force", out)
         document = json.loads(self.run_cli("status", task_id, "--json")[1])

@@ -18,7 +18,7 @@ MODULES = ('test_bridge_windows', 'test_bridge_windows_streams',
            'test_bridge_windows_roots',
            'test_bridge_windows_roots_rework',
            'test_bridge_registration', 'test_bridge_labels', 'test_bridge_hints',
-           'test_bridge_windows_native')
+           'test_bridge_windows_native', 'test_bridge_local_display')
 
 
 def main() -> int:

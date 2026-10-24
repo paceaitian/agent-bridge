@@ -42,6 +42,22 @@ from bridge_support import RecordingTransport, endpoint, ref
 
 
 class DispatchTests(unittest.TestCase):
+    def test_local_names_do_not_change_protocol_sender_name_or_header(self) -> None:
+        origin = ref(Provider.CLAUDE, '2aa904d4-0000-4000-8000-000000000002', label='vm claude')
+        target = ref(Provider.CODEX, '01a15e9f-0000-4000-8000-000000000001', label='实现 窗口')
+        self.endpoints = [endpoint(target)]
+        task, attempt = self._task(target, origin=origin)
+        self._run()
+        self.assertEqual(len(self.codex.calls), 1)
+        _target, text, context = self.codex.calls[0]
+        self.assertEqual(context.sender_name, 'claude@vm claude')
+        self.assertEqual(text.splitlines()[0], f'[AgentStatus 协作] task={task.id} attempt=1 '
+                         f'msg={attempt.message_id} role=handoff from=claude@vm-claude device=testbox')
+        from agentstatus_bridge.transports.claude_peer import build_frame
+        frame = json.loads(build_frame(text, context))
+        self.assertIn('from-name="claude@vm claude"', frame['message']['content'])
+        self.assertNotIn('〔', frame['message']['content'])
+
     def test_linux_pending_uses_discovery_cache(self) -> None:
         from unittest.mock import Mock
         self._task(ref())

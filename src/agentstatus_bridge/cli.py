@@ -19,6 +19,7 @@ import time
 from . import __version__, summary
 from .platforms import process as procfs
 from .codex_metadata import command_scope
+from .display import endpoint_text
 from .endpoints import (
     Caller,
     DiscoverySources,
@@ -505,7 +506,7 @@ def cmd_send(args: argparse.Namespace) -> int:
             document["hint"] = hint
             _print_json(document)
         else:
-            print(f"任务 {short(task.id)} 已交给 {target.ref.display()}：{DELIVERY_LABELS[current.delivery]}")
+            print(f"任务 {short(task.id)} 已交给 {endpoint_text(target.ref)}：{DELIVERY_LABELS[current.delivery]}")
             warning = _no_pane_warning([current])
             if warning is not None:
                 print(warning)
@@ -551,7 +552,7 @@ def cmd_tasks(args: argparse.Namespace) -> int:
         for task in tasks:
             attempts = store.attempts(task.id)
             view = describe(task, attempts)
-            target = view.current.target.display() if view.current else "-"
+            target = endpoint_text(view.current.target) if view.current else "-"
             hint = hints.get(task.id, _NO_HINT)
             withdrawals = _withdrawal_document(store, task)
             withdrawal_note = ""
@@ -657,7 +658,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         print(f"已记录：{EVENT_LABELS[kind.value]}（任务 {short(outcome.task.id)} #{outcome.attempt.seq}）")
         for followup in outcome.followups:
             label = "已排队发给复核方" if followup.role is Role.REVIEW else "已排队通知发起方"
-            print(f"{label} {followup.target.display()}")
+            print(f"{label} {endpoint_text(followup.target)}")
         for warning in warnings:
             print(f"提示：{warning}")
     return exit_code
@@ -976,7 +977,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
         except StoreError as error:
             raise CliError(error.code, _exit_for_store_error(error.code)) from error
         started = _start_worker()
-        print(f"已排队第 {attempt.seq} 次{ROLE_LABELS[attempt.role]} → {attempt.target.display()}（任务 {short(attempt.task_id)}）")
+        print(f"已排队第 {attempt.seq} 次{ROLE_LABELS[attempt.role]} → {endpoint_text(attempt.target)}（任务 {short(attempt.task_id)}）")
         if attempt.seq >= ATTEMPT_WARNING_THRESHOLD:
             print(f"提示：{reason_text('attempts_near_limit')}")
         if args.force and not undelivered and not rework:
@@ -1380,9 +1381,11 @@ def _run_command(args: argparse.Namespace) -> int:
                 codex_discovery.print_peers(result)
                 print('Windows Claude 原生 peer：' + ('发现完整' if peers.complete else reason_text(peers.reason)))
                 for endpoint in (*peers.endpoints, *peers.duplicates):
-                    label = '  名称：' + json.dumps(endpoint.name, ensure_ascii=False) if endpoint.name else ''
+                    # 原生名称只在 Endpoint.name 中；保留原 JSON 字符串转义，仅投影到本机文字。
+                    label = json.dumps(endpoint.name, ensure_ascii=False)[1:-1] if endpoint.name else None
                     issues = '；'.join(reason_text('target_' + issue) for issue in endpoint.issues)
-                    print('claude@id:' + endpoint.ref.native_id + '  [root] 状态未知' + label + ('  ' + issues if issues else ''))
+                    print(endpoint_text(endpoint.ref, label=label) + '  target=claude@id:' + endpoint.ref.native_id
+                          + '  [root] 状态未知' + ('  ' + issues if issues else ''))
             return EXIT_OK
     # 任一调用前后补查摘要：提交后未发布（进程被杀、锁超时）的窗口由下一次调用收敛；worker 与 summary 自行处理
     refresh = args.command not in {"worker", "summary"} and not (get_platform().name == 'windows' and args.command == 'wait')

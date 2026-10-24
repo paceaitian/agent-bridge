@@ -139,6 +139,17 @@ def record_linux():
             with redirect_stdout(out), redirect_stderr(err):
                 code = cli.main(list(args))
             shown = out.getvalue()
+            # §85 only changes local tasks/status endpoint text. Require the exact
+            # new text before projecting it out; keep the frozen W1 JSON, wire,
+            # files, locks, effects and every other byte unchanged. Old src still records.
+            if hasattr(cli, 'endpoint_text') and '--json' not in args and args[0] in ('tasks', 'status'):
+                old = 'codex@fixture\tlabel'
+                new = old + '〔019a0000〕'
+                if args[0] == 'tasks':
+                    old, new = f'{old:<28}', f'{new:<28}'
+                if shown.count(new) != 1:
+                    raise AssertionError('local endpoint ID projection missing or changed')
+                shown = shown.replace(new, old)
             if args[0] == 'doctor' and has_caller:
                 if '--json' in args:
                     data = json.loads(shown)

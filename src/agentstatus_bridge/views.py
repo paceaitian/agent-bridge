@@ -13,6 +13,7 @@ import time
 from typing import Any
 
 from .closure import ClosureOutcome
+from .display import endpoint_text
 from .ids import short
 from .labels import (
     CONSUMPTION_LABELS,
@@ -244,8 +245,8 @@ def _print_task(
     cmd = command_name()
     title = f"「{task.title}」" if task.title else ""
     print(f"任务 {short(task.id)} {title} {PHASE_LABELS[view.phase]}：{reason_text(view.reason)}")
-    flow = "交接" if task.flow is Flow.HANDOFF else f"实现 → 复核（{task.reviewer.display() if task.reviewer else '?'}）"
-    origin = task.origin.display() if task.origin else "用户"
+    flow = "交接" if task.flow is Flow.HANDOFF else f"实现 → 复核（{endpoint_text(task.reviewer) if task.reviewer else '?'}）"
+    origin = endpoint_text(task.origin) if task.origin else "用户"
     print(f"流程：{flow}；发起：{origin}；创建于 {_age(task.created_at, now)}")
     if get_platform().name == 'windows' and task.options.get('receiptMode') == 'poll_only':
         print('回执方式：poll_only；用 status / wait 读取，不推送通知。')
@@ -264,7 +265,7 @@ def _print_task(
         if consumption:
             delivery = f"{delivery}，{consumption}"
         work = "" if attempt.role is Role.NOTICE else f"；工作：{WORK_LABELS[attempt.work]}"
-        print(f"  #{attempt.seq} {role_label(attempt)} → {attempt.target.display()}：{delivery}{work}")
+        print(f"  #{attempt.seq} {role_label(attempt)} → {endpoint_text(attempt.target)}：{delivery}{work}")
         for line in _describe_result(attempt.result):
             print(f"      {line}")
         if show_body:
@@ -272,7 +273,7 @@ def _print_task(
                 print(f"      | {line}")
     if hint.stopped_at is not None and view.current is not None:
         print(
-            f"提示：{view.current.target.display()} 这一轮已在 {_clock(hint.stopped_at)} 结束，但还没有汇报"
+            f"提示：{endpoint_text(view.current.target)} 这一轮已在 {_clock(hint.stopped_at)} 结束，但还没有汇报"
             f"（可能忘了运行 {cmd} report，或在等人回复）；可去对方会话查看或请它补报；确需重发用 "
             f"{cmd} retry {short(task.id)} --force（对方可能已在执行），不再需要可 {cmd} close {short(task.id)}"
         )
@@ -293,7 +294,7 @@ def _print_task(
         else:
             action = f"确已退出可恢复该会话后 {cmd} retry {ref} --force 重发（对方可能已处理过），或加 --to 改派"
         print(
-            f"提示：当前未发现 {current.target.display()} 的会话（可能已退出，也可能暂时无法识别），还没有汇报，"
+            f"提示：当前未发现 {endpoint_text(current.target)} 的会话（可能已退出，也可能暂时无法识别），还没有汇报，"
             f"先去确认；{action}；不再需要可 {cmd} close {ref}"
         )
     step = _next_step(task, attempts)
@@ -346,7 +347,7 @@ def _closure_document(outcome: ClosureOutcome) -> dict[str, object]:
 
 def _print_closure(outcome: ClosureOutcome) -> None:
     if outcome.queued:
-        names = "、".join(item.target.display() for item in outcome.queued)
+        names = "、".join(endpoint_text(item.target) for item in outcome.queued)
         print(f"已排队结束回执 → {names}（进对方原生队列，不需要汇报）")
     for recipient, _capacity in outcome.skipped:
-        print(f"排队容量已满，未给 {recipient.target.display()} 排结束回执")
+        print(f"排队容量已满，未给 {endpoint_text(recipient.target)} 排结束回执")

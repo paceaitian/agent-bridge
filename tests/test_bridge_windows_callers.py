@@ -34,6 +34,27 @@ class CallerTests(unittest.TestCase):
     discover = fixture.DiscoveryTests.discover
     alias_row = fixture.DiscoveryTests.alias_row
 
+    def test_report_keeps_local_name_and_wire_id_visible_together(self):
+        from agentstatus_bridge import envelope
+        from agentstatus_bridge.notification_policy import wire_ref
+        origin = EndpointRef(Provider.CODEX, '01a15e9f-0000-4000-8000-000000000001',
+                             201, 'win-filetime:1', label='回复 W3-ONE')
+        with self.scope(), Store.open(self.state) as store:
+            task, attempt = self.task(store, origin=origin)
+            text = envelope.render(task, attempt, sender=wire_ref(origin).token(), device='testbox')
+            self.assertIn(' from=codex@01a15e9f device=', text.splitlines()[0])
+            args = cli.build_parser().parse_args(['report', task.id, '--attempt', '1', '--result', '--note', 'OK'])
+            with (patch.object(cli, 'discover', return_value=[]),
+                  patch.object(cli, 'identify_caller', return_value=endpoints.Caller(Endpoint(attempt.target), None, agent_env=True)),
+                  patch.object(cli, 'permission_class', return_value=None),
+                  patch.object(cli, '_start_worker', return_value=False), redirect_stdout(io.StringIO()) as out):
+                code = cli.cmd_report(args)
+            self.assertEqual(code, 0)
+            self.assertIn('已排队通知发起方 codex@回复 W3-ONE〔01a15e9f〕', out.getvalue())
+            followup = store.attempts(task.id)[-1]
+            self.assertEqual(followup.target.label, '回复 W3-ONE')
+            self.assertEqual(views._ref_document(followup.target)['name'], 'codex@回复 W3-ONE')
+
     def chain(self):
         self.k.processes[100] = (201,134362090001712230,self.k.sid,False,'python.exe')
         self.k.processes[201] = (200,134362090001612230,self.k.sid,False,'pwsh.exe')

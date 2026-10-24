@@ -120,7 +120,7 @@ class ClosureCliTests(unittest.TestCase):
         code, out, err = self.run_cli("accept", task_id)
         self.assertEqual(code, cli.EXIT_OK, err)
         # 括号里的说明也钉住：§45.42 取消忙时扣留后不能再写「对方空闲后发送」（Codex 复审 F02）
-        self.assertIn("已排队结束回执 → codex@impl、claude@review（进对方原生队列，不需要汇报）", out)
+        self.assertIn("已排队结束回执 → codex@impl〔impl-thr〕、claude@review〔review-s〕（进对方原生队列，不需要汇报）", out)
         closures = self.closures(task_id)
         self.assertEqual(len(closures), 2)
         self.assertTrue(closures[0].target.same_session(IMPL.ref) and closures[1].target.same_session(REVIEW.ref))
@@ -208,7 +208,7 @@ class ClosureCliTests(unittest.TestCase):
         self.assertEqual(self.run_cli("close", task_id)[0], cli.EXIT_OK)
         code, out, _ = self.run_cli("status", task_id)
         self.assertEqual(code, cli.EXIT_OK)
-        self.assertIn("#2 结束回执 → codex@impl：桥内排队", out)
+        self.assertIn("#2 结束回执 → codex@impl〔impl-thr〕：桥内排队", out)
         self.assertIn("排队结束回执", out)
         self.assertNotIn("通知发起方", out)
         code, out, _ = self.run_cli("status", task_id, "--json")
@@ -259,7 +259,7 @@ class ClosureCliTests(unittest.TestCase):
             code, out, err = self.run_cli("close", task_id)
         self.assertEqual(code, cli.EXIT_OK, err)
         self.assertIn("已排队结束回执 → codex@impl", out)
-        self.assertIn("排队容量已满，未给 claude@review 排结束回执", out)
+        self.assertIn("排队容量已满，未给 claude@review〔review-s〕 排结束回执", out)
 
     def test_other_ledger_errors_roll_back_the_whole_decision(self) -> None:
         for command in (("accept", ), ("close", )):
