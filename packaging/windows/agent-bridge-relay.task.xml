@@ -1,21 +1,38 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  ab 跨设备 relay 的 Windows 计划任务模板（DESIGN §88.10）：当前用户登录后、InteractiveToken、Limited（LeastPrivilege）、
-  IgnoreNew、无执行时限、失败一分钟重启。不用 S4U/SYSTEM/最高权限，不塞进 RMUX/CloudCLI。
-  @USER@ 换成 DOMAIN\user（或 COMPUTER\user），@AB_EXE@ 换成已安装 release 的原生 ab 入口绝对路径（不经 MSYS/sh）。
-  注册属于 P5.2 运维窗口（另需授权），例如：
-    Register-ScheduledTask -TaskName agent-bridge-relay -Xml (Get-Content -Raw agent-bridge-relay.task.xml)
+  ab 跨设备 relay 的 Windows 计划任务模板（DESIGN §88.10、§89）：当前用户登录后、InteractiveToken、Limited（LeastPrivilege）、
+  IgnoreNew、无执行时限。不用 S4U/SYSTEM/最高权限，不塞进 RMUX/CloudCLI。
+  启动链 conhost.exe headless → cmd.exe /d /c → 已安装的 ab.cmd：交互令牌任务直接拉控制台程序会在桌面留一个常驻窗口、
+  关窗即停 relay；headless conhost 不显示窗口（P5.2 实机测试，AS-20261026-008）。ab.cmd 路径跨升级不变，升级后只需重启任务。
+  conhost 会把自己的命令行切分后逐项重新转义，所以 ab.cmd 路径单独成一个参数（含空格时由 conhost 加引号，cmd 按规则 1 保留）；
+  路径不得含 " & ( ) @ ^ | < > % ! 这些 cmd 特殊字符，注册前校验。
+  登录触发器只负责登录即启动；看门狗是起点在过去、每 5 分钟无期限重复的时间触发器（登录触发器的重复要等触发器真正触发，
+  在已登录的会话里注册当下不生效）。两个触发器都省略 Enabled（默认 true），避开微软两份文档对它与 StartBoundary 先后的分歧。
+  实测 conhost 吞掉 relay 的退出码，relay 非零退出触发不了失败重启（RestartOnFailure 保留，覆盖任务或 conhost 自身的失败）。
+  relay 在跑时 IgnoreNew 跳过；在已登录、设备醒着、前一实例确已结束的前提下，意外退出后约 5 分钟内拉回。
+  停用或需运维处理的停止状态下，relay 每次启动后立即退出。长期停用联邦时请一并 Disable-ScheduledTask。
+  conhost 的 headless 参数没有正式文档；若被安全软件拦截，表现为任务启动失败或 relay 不在线，以 ab federation status 排查。
+  替换：@USER@ → DOMAIN\user（或 COMPUTER\user）；@SYSTEMROOT@ → %SystemRoot% 的实际值（如 C:\Windows）；
+  @AB_CMD@ → 安装器生成的 ab.cmd 绝对路径（%USERPROFILE%\.local\bin\ab.cmd）。替换值要做 XML 转义。
+  注册属于 P5.2 运维窗口（另需授权），例如（PowerShell 5.1 读无 BOM 的 UTF-8 文件要显式指定编码）：
+    Register-ScheduledTask -TaskName agent-bridge-relay -Xml (Get-Content -Raw -Encoding UTF8 agent-bridge-relay.task.xml)
   relay 启动时自己核真实令牌非提权；High 上下文在开库前拒绝（relay_elevated），任务配置不能替代这道核验。
 -->
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>ab cross-device relay (DESIGN §88.10)</Description>
+    <Description>ab cross-device relay (DESIGN §88.10, §89)</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
-      <Enabled>true</Enabled>
       <UserId>@USER@</UserId>
     </LogonTrigger>
+    <TimeTrigger>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
@@ -42,8 +59,8 @@
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>@AB_EXE@</Command>
-      <Arguments>federation relay</Arguments>
+      <Command>@SYSTEMROOT@\System32\conhost.exe</Command>
+      <Arguments>--headless "@SYSTEMROOT@\System32\cmd.exe" /d /c "@AB_CMD@" federation relay</Arguments>
     </Exec>
   </Actions>
 </Task>

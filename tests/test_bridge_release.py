@@ -139,7 +139,9 @@ class ReleaseTests(unittest.TestCase):
             'test_bridge_windows_roots_rework','test_bridge_windows_storage','test_bridge_local_display',
             # P5 联邦（DESIGN §88.18）：可移植附件、Windows 交付模型、编解码与部署模板；联邦库用例因提权 CI 不进选择集
             'test_bridge_federation_codec','test_bridge_federation_attachments','test_bridge_federation_windows',
-            'test_bridge_federation_packaging'})
+            'test_bridge_federation_packaging',
+            # §89：relay 子进程通道的关闭顺序用真实本地子进程验证，Windows 也要跑
+            'test_bridge_federation_transport_close'})
         for name in ci.MODULES:self.assertTrue((ROOT/'tests'/f'{name}.py').is_file())
         native=(ROOT/'tests/test_bridge_windows_native.py').read_text()
         self.assertIn('if api.token(api.k.GetCurrentProcess()).elevated:',native)

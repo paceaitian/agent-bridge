@@ -691,7 +691,7 @@ def run_relay(root: Path, *, once: bool = False, connector: Callable[[], Any] | 
         rt = open_runtime(root)
         try:
             relay = Relay(rt.store, rt.ident, rt.config, rt.paths,
-                          connect=connector or ssh_connector(rt.config, root),
+                          connect=connector or ssh_connector(rt.config, root, windows=rt.paths.windows),
                           directory=directory_source(rt), on_work=worker_starter(root))
             if once:
                 return relay.connect_and_run(cycles=1, wait=lambda _s: None)

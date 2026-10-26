@@ -927,6 +927,55 @@ class RelayRuntimeTests(unittest.TestCase):
                 fed_commands._require_unelevated()  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(caught.exception.code, "relay_elevated")
 
+    def test_relay_passes_platform_windows_flag_to_ssh_connector(self) -> None:
+        """§89：relay 命令按运行时平台给 ssh 连接工厂传 windows，Windows 上 ssh 才会带 CREATE_NO_WINDOW。"""
+        for windows in (True, False):
+            seen: dict[str, Any] = {}
+
+            def connector(config: Any, root: Path, *, windows: bool = False) -> Any:
+                seen["windows"] = windows
+                return lambda: None
+
+            class FakeRelay:
+                def __init__(self, *args: Any, connect: Any, **kwargs: Any) -> None:
+                    seen["connect"] = connect
+
+                def connect_and_run(self, **kwargs: Any) -> str:
+                    return "ok"
+
+            rt = SimpleNamespace(store=None, ident=None, config=None, close=lambda: None,
+                                 paths=RelayPaths(Path("/nonexistent"), windows=windows))
+            with self.subTest(windows=windows), tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(fed_commands, "_require_unelevated"), \
+                    patch.object(fed_commands, "open_runtime", return_value=rt), \
+                    patch.object(fed_commands, "directory_source", return_value=lambda: {}), \
+                    patch.object(fed_commands, "worker_starter", return_value=lambda: None), \
+                    patch.object(fed_commands, "ssh_connector", side_effect=connector), \
+                    patch.object(fed_commands, "Relay", FakeRelay):
+                self.assertEqual(fed_commands.run_relay(Path(tmp), once=True), "ok")
+                self.assertIs(seen["windows"], windows)
+
+    def test_ssh_connector_hides_the_ssh_window_only_on_windows(self) -> None:
+        """§89：Windows 上 ssh 子进程用 CREATE_NO_WINDOW（0x08000000）；其他平台创建标志为 0。"""
+        from agentstatus_bridge.federation import relay as relay_module
+
+        config = FederationConfig(enabled=True, hub_id=HUB, device_id=DEV_A, device_name="vm", host="h",
+                                  user="ab-relay", expected_state_root="/x", identity_file="/k",
+                                  known_hosts_file="/kh")
+        for windows, flags in ((True, 0x08000000), (False, 0)):
+            calls: list[dict[str, Any]] = []
+
+            def popen(argv: Any, **kwargs: Any) -> Any:
+                calls.append(kwargs)
+                return Mock(stdin=Mock(), stdout=Mock())
+
+            with self.subTest(windows=windows), tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(relay_module.subprocess, "Popen", side_effect=popen):
+                relay_module.ssh_connector(config, Path(tmp), windows=windows)()
+                self.assertEqual([call["creationflags"] for call in calls], [flags])
+                self.assertEqual((calls[0]["stdin"], calls[0]["stdout"], calls[0]["stderr"]),
+                                 (subprocess.PIPE, subprocess.PIPE, subprocess.DEVNULL))
+
     def test_relay_single_instance_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

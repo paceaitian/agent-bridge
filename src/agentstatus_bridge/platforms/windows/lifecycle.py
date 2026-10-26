@@ -104,13 +104,16 @@ class WindowsLifecycle:
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags)
             return subprocess.Popen(argv, cwd=str(directory), env=dict(launch), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags)
+        # BREAKAWAY|CREATE_NO_WINDOW|NEW_PROCESS_GROUP，不用 DETACHED_PROCESS：没有控制台的进程再拉控制台子进程
+        # （worker 投递 Codex 前的 `codex --version`）时，系统会给子进程新开可见控制台，桌面会话里闪出 WT 窗口
+        # （DESIGN §89）；无窗口控制台由这些子进程继承，worker 自己的控制台也不受父窗口关闭影响
         try:
-            return create(0x01000208)
+            return create(0x09000200)
         except OSError as error:
             if getattr(error, 'winerror', None) != 5:
                 raise
             launch[BREAKAWAY_ENV] = 'denied_fallback'
-            return create(0x00000208)
+            return create(0x08000200)
 
     def install_stop(self, handler: Callable[[int, FrameType | None], None]) -> dict[int, object]:
         return {number: signal.signal(number, handler) for number in (signal.SIGINT, signal.SIGTERM)}

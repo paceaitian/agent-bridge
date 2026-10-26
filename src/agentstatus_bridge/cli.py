@@ -1676,7 +1676,7 @@ def cmd_federation(args: argparse.Namespace) -> int:
             device_id=args.device_id, name=name, identity_file=args.identity_file,
             known_hosts_file=args.known_hosts_file, ssh_executable=args.ssh_executable)
         print(f"跨设备协作已启用：本机登记为 {config.device_name}（{'新建联邦库' if created else '沿用既有联邦库'}）")
-        print(f"relay 需要以服务方式运行：{command_name()} federation relay（模板见 docs/deployment.md）")
+        print(f"relay 需要以服务方式运行：{command_name()} federation relay（Linux 用 systemd 用户服务、Windows 用登录计划任务，见 docs/federation-deployment.md §3）")
         return EXIT_OK
     if action == "disable":
         fed.disable(root)

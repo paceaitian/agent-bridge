@@ -144,23 +144,37 @@ class HubConnection:
 class SubprocessTransport(StreamTransport):
     """SSH 子进程上的帧通道；关闭时结束子进程（不读 stderr，日志不含 SSH 错误文本）。"""
 
+    TERMINATE_GRACE_S = 5.0
+
     def __init__(self, process: subprocess.Popen[bytes]) -> None:
         assert process.stdout is not None and process.stdin is not None
         super().__init__(process.stdout, process.stdin)
         self.process = process
 
     def close(self) -> None:
-        super().close()
+        # 先终止并回收子进程，再关流：后台读线程可能正阻塞在 readline 上、持有读端的锁，先关读端会一直等下去，
+        # terminate 永远轮不到；写端 flush 也可能因对端不读而阻塞（Codex AS89-C-P2-04）。子进程退出后管道断开，
+        # 读线程读到 EOF 释放锁；远端按异常断开处理（hub 的 CAS 与重推本就覆盖断连）
         if self.process.poll() is None:
             self.process.terminate()
             try:
-                self.process.wait(timeout=5)
+                self.process.wait(timeout=self.TERMINATE_GRACE_S)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+                try:
+                    self.process.wait(timeout=self.TERMINATE_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    pass  # kill 之后仍未回收只可能是系统异常；不在关闭路径上无限等
+        super().close()
 
 
-def ssh_connector(config: FederationConfig, state_root: Path) -> Callable[[], FederationTransport]:
-    """生成 SSH 连接工厂：专用 -F 配置写在私有 state 下（0600），argv 不经 shell。"""
+def ssh_connector(config: FederationConfig, state_root: Path, *,
+                  windows: bool = False) -> Callable[[], FederationTransport]:
+    """生成 SSH 连接工厂：专用 -F 配置写在私有 state 下（0600），argv 不经 shell。
+
+    Windows 上 ssh 用 CREATE_NO_WINDOW：relay 无论由 headless 控制台还是无控制台的父进程拉起，
+    ssh 都不会另开可见窗口（DESIGN §89）。
+    """
 
     def connect() -> FederationTransport:
         path = state_root / SSH_CONFIG_NAME
@@ -168,7 +182,7 @@ def ssh_connector(config: FederationConfig, state_root: Path) -> Callable[[], Fe
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(ssh_config_text(config))
         process = subprocess.Popen(ssh_argv(config, path), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL)
+                                   stderr=subprocess.DEVNULL, creationflags=0x08000000 if windows else 0)
         return SubprocessTransport(process)
 
     return connect

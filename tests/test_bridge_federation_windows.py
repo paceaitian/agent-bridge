@@ -31,9 +31,10 @@ SELECTOR = ROOT / "scripts" / "verify-bridge-windows.py"
 ORIGIN = "a" * 32
 INSTANCE = "i" * 32
 TASK = "t" * 32
-# Windows CI 选择集必须包含的联邦模块（P2-15）：可移植的附件冻结/落地、Windows 分支模型、协议编解码与部署模板
+# Windows CI 选择集必须包含的联邦模块（P2-15）：可移植的附件冻结/落地、Windows 分支模型、协议编解码、部署模板与通道关闭顺序
 FEDERATION_MODULES = ("test_bridge_federation_codec", "test_bridge_federation_attachments",
-                      "test_bridge_federation_windows", "test_bridge_federation_packaging")
+                      "test_bridge_federation_windows", "test_bridge_federation_packaging",
+                      "test_bridge_federation_transport_close")
 
 
 class WindowsDeliveryTests(unittest.TestCase):

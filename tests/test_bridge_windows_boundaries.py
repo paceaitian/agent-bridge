@@ -588,6 +588,9 @@ class BoundaryTests(unittest.TestCase):
                     seen=[]
                     def popen(argv,**kw):
                         seen.append((kw['creationflags'],dict(kw['env'])))
+                        import subprocess as sp
+                        # 三个标准流都是 DEVNULL、不继承句柄：worker 不读写拉起者的终端（Codex AS89-C-P3-02）
+                        self.assertEqual((kw['stdin'],kw['stdout'],kw['stderr'],kw['close_fds']),(sp.DEVNULL,sp.DEVNULL,sp.DEVNULL,True))
                         if len(seen)<=len(failures):raise WinFailure(failures[len(seen)-1])
                         return Mock(pid=100)
                     error=None
@@ -596,7 +599,8 @@ class BoundaryTests(unittest.TestCase):
                             if fixture:self.p.lifecycle.spawn_fixture(binary,self.state)
                             else:self.p.lifecycle.spawn_worker(self.state,{})
                         except OSError as exc:error=exc
-                    self.assertEqual([x[0] for x in seen],[0x1000208,0x208] if failures and failures[0]==5 else [0x1000208])
+                    # §89：无窗口控制台（CREATE_NO_WINDOW），不用 DETACHED；拒绝 breakaway 时只去掉该位
+                    self.assertEqual([x[0] for x in seen],[0x9000200,0x8000200] if failures and failures[0]==5 else [0x9000200])
                     self.assertEqual(seen[0][1][W.BREAKAWAY_ENV],'requested')
                     if len(seen)==2:self.assertEqual(seen[1][1][W.BREAKAWAY_ENV],'denied_fallback')
                     self.assertEqual(error is None,failures in ([],[5]))

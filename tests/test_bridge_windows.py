@@ -640,7 +640,7 @@ class WindowsTests(unittest.TestCase):
         self.p.files.atomic_write(self.root,b'pass',name='worker.py',prefix='.worker.')
         with patch('subprocess.Popen') as spawn:
             l.spawn_fixture(self.root/'worker.py',self.root,popen=spawn)
-        self.assertEqual(spawn.call_args.kwargs['creationflags'],0x1000208)
+        self.assertEqual(spawn.call_args.kwargs['creationflags'],0x9000200)  # §89 无窗口控制台
         self.assertTrue(spawn.call_args.kwargs['close_fds'])
         self.assertEqual(spawn.call_args.args[0][0],sys.executable)
         self.assertEqual(self.k.api.context(),{'consoleDetached':True,'inJob':True,'outlivesJob':False})

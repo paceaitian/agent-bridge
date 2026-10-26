@@ -24,7 +24,8 @@ MODULES = ('test_bridge_windows', 'test_bridge_windows_streams',
            'test_bridge_registration', 'test_bridge_labels', 'test_bridge_hints',
            'test_bridge_windows_native', 'test_bridge_local_display',
            'test_bridge_federation_codec', 'test_bridge_federation_attachments',
-           'test_bridge_federation_windows', 'test_bridge_federation_packaging')
+           'test_bridge_federation_windows', 'test_bridge_federation_packaging',
+           'test_bridge_federation_transport_close')
 # Only these skips may appear; any other skip means a module silently did not qualify.
 NATIVE_PREFIX = 'test_bridge_windows_native.'
 POSIX_ONLY = "POSIX-only:"

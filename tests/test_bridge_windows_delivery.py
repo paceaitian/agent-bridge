@@ -533,7 +533,7 @@ class DeliveryTests(unittest.TestCase):
             self.k.images[100]=str(binary)
             def popen(argv,**kw):
                 self.assertEqual(argv,[str(binary),'-m','agentstatus_bridge','worker'])
-                self.assertEqual(kw['creationflags'],0x1000208)
+                self.assertEqual(kw['creationflags'],0x9000200)  # §89 无窗口控制台
                 self.assertTrue(kw['close_fds'])
                 self.assertEqual(kw['cwd'],str(self.state))
                 self.k.processes[101]=(100,134362090001812230,self.k.sid,False,'python.exe')
