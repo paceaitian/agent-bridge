@@ -30,6 +30,10 @@ def open_file_targets(pid: int, proc_root: Path = DEFAULT_PROC) -> list[str]:
     return get_platform().process.legacy().open_file_targets(pid, proc_root)
 
 
+def open_file_scan(pid: int, proc_root: Path = DEFAULT_PROC) -> tuple[list[str], bool]:
+    return get_platform().process.legacy().open_file_scan(pid, proc_root)
+
+
 def launch_tokens(pid: int, proc_root: Path = DEFAULT_PROC) -> list[str]:
     return get_platform().process.legacy().launch_tokens(pid, proc_root)
 

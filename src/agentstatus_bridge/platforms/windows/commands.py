@@ -16,7 +16,7 @@ from . import claude_discovery as claude
 
 WRITES = frozenset({'send', 'report', 'retry', 'pause', 'resume', 'cancel', 'accept', 'close'})
 LIGHT = frozenset({'report', 'accept', 'close', 'pause', 'cancel', 'resume'})
-ALLOWED = WRITES | {'doctor', 'tasks', 'status', 'summary', 'peers', 'wait', 'worker'}
+ALLOWED = WRITES | {'doctor', 'tasks', 'status', 'summary', 'peers', 'wait', 'worker', 'federation'}
 
 
 @dataclass

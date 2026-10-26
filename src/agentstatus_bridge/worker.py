@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 import json
+from typing import Any
 import os
 from pathlib import Path
 import time
@@ -32,6 +33,7 @@ LOG_NAME = "worker.log"
 LOOP_SECONDS = 1.0
 IDLE_EXIT_SECONDS = 120.0
 MAX_CONSECUTIVE_FAILURES = 30
+FEDERATION_PROBE_SECONDS = 30.0  # 运行中 worker 多久再看一次是否已启用联邦
 MAX_LOG_BYTES = 256 * 1024
 
 
@@ -162,6 +164,127 @@ def _publish_summary(store: Store, directory: Path, log: LogFn, *, force: bool) 
     return result
 
 
+def _federation_runtime(directory: Path, log: LogFn) -> tuple[Any, Any, Any] | None:
+    """已启用联邦时打开联邦库（绝不新建）；没有配置/未启用/核对失败返回 None，不影响本机投递（DESIGN §88.1）。"""
+    from .federation.config import CONFIG_NAME  # layout: allow 联邦按需加载，未配置时只看一个文件
+
+    if not (directory / CONFIG_NAME).exists():
+        return None
+    from .federation import config as fed_config  # layout: allow 联邦按需加载
+    from .federation.authority import Identity  # layout: allow 联邦按需加载
+    from .federation.fedstore import FederatedStore  # layout: allow 联邦按需加载
+    from .federation.relay import RelayPaths  # layout: allow 联邦按需加载
+
+    try:
+        config = fed_config.load(directory)
+        if config is None or not config.enabled:
+            return None
+        fed_config.check_state_root(config, directory)
+    except fed_config.ConfigError as error:
+        log("federation_config_error", {"code": error.code})
+        return None
+    try:
+        store = FederatedStore.open(directory)  # 配置在而库缺失：federation_store_missing，不自动建空库
+    except StoreError as error:
+        log("federation_store_error", {"code": error.code})
+        return None
+    try:
+        device_id, hub_id = store.device_id(), store.meta("hubId")
+    except StoreError:
+        device_id = hub_id = None
+    if device_id != config.device_id or hub_id != config.hub_id:
+        # 库与配置的身份不一致（含 rebuild 已改库、配置还没写完的瞬间）：不接联邦，下次探测再看
+        log("federation_store_error", {"code": "federation_identity_mismatch"})
+        store.close()
+        return None
+    appdata = os.environ.get("LOCALAPPDATA")
+    paths = RelayPaths(directory, windows=get_platform().name == "windows",
+                       local_appdata=Path(appdata) if appdata else None)
+    return store, Identity(device_id=config.device_id, device_name=config.device_name, hub_id=config.hub_id), paths
+
+
+def _federation_dispatcher(runtime: tuple[Any, Any, Any], *, discover: Callable[[], list[Endpoint]],
+                           transports: Mapping[Provider, Transport], reply_address: str | None,
+                           log: LogFn, empty_complete: Callable[[], bool] | None = None,
+                           provider_complete: Callable[[Provider], bool] | None = None) -> Any:
+    from .federation.delivery import FederationDispatcher  # layout: allow 联邦按需加载
+
+    store, ident, paths = runtime
+    return FederationDispatcher(store, ident, paths, discover=discover, transports=transports,
+                                reply_address=reply_address, command=command_name(), log=log,
+                                empty_discovery_complete=empty_complete, provider_discovery_complete=provider_complete)
+
+
+def _federation_round(federation: Any, log: LogFn) -> bool:
+    """跑一轮联邦作业；任何异常只记日志，不拖住本机投递。返回是否仍有联邦待办。"""
+    try:
+        federation.run_once()
+        return bool(federation.has_live_work())
+    except Exception as error:  # 联邦库或通道故障与本机库隔离（DESIGN §88.1）
+        log("federation_loop_error", {"error": type(error).__name__, "code": getattr(error, "code", None)})
+        return False
+
+
+def _federation_discovery(discover_fn: Callable[[], list[Endpoint]] | None) -> tuple[
+        Callable[[], list[Endpoint]], Callable[[], bool] | None, Callable[[Provider], bool] | None]:
+    """联邦 worker 的发现函数与本轮完整性回调：默认发现两平台都带完整性；注入的发现函数没有完整性信号。"""
+    if discover_fn is not None:
+        return discover_fn, None, None
+    platform = get_platform()
+    if platform.name == "windows":
+        from .platforms.windows.commands import WorkerDiscovery  # layout: allow per-provider discovery completeness
+        from .platforms.windows.local_transport import WindowsPlatform  # layout: allow W2专用认证后端
+        if not isinstance(platform.transport, WindowsPlatform):
+            return (lambda: discover(None)), None, None
+        sampling = WorkerDiscovery(platform.transport)
+        return sampling, sampling.complete, sampling.provider_complete
+    sources = DiscoverySources(native_metadata=MetadataCache())
+    return (lambda: discover(sources)), sources.complete, sources.provider_complete
+
+
+def _run_federation_only(runtime: tuple[Any, Any, Any], *, inbox_directory: Path | None,
+                         discover_fn: Callable[[], list[Endpoint]] | None,
+                         transports: Mapping[Provider, Transport] | None, loop_seconds: float, once: bool,
+                         log: LogFn, stopping: Callable[[], bool]) -> int:
+    """本机账本不可用时仍处理联邦作业（两库都不可用才退出）；空闲 120 秒退出。"""
+    store = runtime[0]
+    inbox = _open_inbox(inbox_directory)
+    selected, empty_complete, provider_complete = _federation_discovery(discover_fn)
+    federation = _federation_dispatcher(
+        runtime, discover=selected,
+        transports=transports or (default_transports(inbox=lambda: inbox.backend if inbox else None)
+                                  if get_platform().name == "windows" else default_transports()),
+        reply_address=inbox.address if inbox is not None else None,
+        log=log, empty_complete=empty_complete, provider_complete=provider_complete)
+    log("start", {"inbox": inbox is not None, "federationOnly": True})
+    idle_since: float | None = None
+    try:
+        while not stopping():
+            live = _federation_round(federation, log)
+            if federation.stale and not live:
+                break  # 身份已过期：退出，由下次 ab 或 relay 按新配置拉起
+            if inbox is not None:
+                for frame in inbox.poll(loop_seconds):
+                    federation.handle_frame(frame)
+            else:
+                time.sleep(loop_seconds)
+            if once:
+                break
+            now = time.monotonic()
+            if live:
+                idle_since = None
+            elif idle_since is None:
+                idle_since = now
+            elif now - idle_since >= IDLE_EXIT_SECONDS:
+                break
+    finally:
+        if inbox is not None:
+            inbox.close()
+        store.close()
+        log("stop", {"federationOnly": True})
+    return 0
+
+
 def run_worker(
     *,
     root: Path | None = None,
@@ -202,7 +325,12 @@ def run_worker(
             opened = Store.open(directory)
         except StoreError as error:
             log("store_error", {"code": error.code})
-            raise
+            runtime = _federation_runtime(directory, log)
+            if runtime is None:
+                raise
+            return _run_federation_only(runtime, inbox_directory=inbox_directory, discover_fn=discover_fn,
+                                        transports=transports, loop_seconds=loop_seconds, once=once, log=log,
+                                        stopping=lambda: stopping)
         with opened as store:
             inbox = _open_inbox(inbox_directory)
             try:
@@ -250,6 +378,17 @@ def run_worker(
                 command=command_name(),
                 log=log,
             )
+            if sources is not None and selected_discover is None:
+                # Linux 默认发现带本轮完整性：联邦作业据此判「完整的空结果」（目标已退出）；本机 Dispatcher 维持原口径
+                empty_complete, provider_complete = sources.complete, sources.provider_complete
+            runtime = _federation_runtime(directory, log)
+            federation = None if runtime is None else _federation_dispatcher(
+                runtime, discover=dispatcher.discover, transports=dispatcher.transports,
+                reply_address=dispatcher.reply_address, log=log, empty_complete=empty_complete,
+                provider_complete=provider_complete)
+            # worker 先因本机任务起来、之后才 federation enable：定期再看一次配置，接上联邦
+            federation_probe = time.monotonic() + FEDERATION_PROBE_SECONDS
+            federation_live = False
             idle_since: float | None = None
             failures = 0
             inbox_retry = time.monotonic() + 10
@@ -264,7 +403,32 @@ def run_worker(
                             inbox = _open_inbox(inbox_directory)
                             dispatcher.reply_address = inbox.address if inbox else None
                             inbox_retry = time.monotonic() + 10
-                        dispatcher.run_once()
+                        # 两库每轮分别执行：本机库故障不能跳过联邦这一轮，反之亦然（DESIGN §88.1）
+                        local_error: Exception | None = None
+                        local_live = False
+                        try:
+                            dispatcher.run_once()
+                        except Exception as error:  # 下面统一计入连续失败
+                            local_error = error
+                        if federation is None and time.monotonic() >= federation_probe:
+                            federation_probe = time.monotonic() + FEDERATION_PROBE_SECONDS
+                            runtime = _federation_runtime(directory, log)
+                            if runtime is not None:
+                                federation = _federation_dispatcher(
+                                    runtime, discover=dispatcher.discover, transports=dispatcher.transports,
+                                    reply_address=dispatcher.reply_address, log=log, empty_complete=empty_complete,
+                                    provider_complete=provider_complete)
+                                log("federation_attached", {})
+                        federation_live = False
+                        if federation is not None:
+                            federation.reply_address = dispatcher.reply_address
+                            federation_live = _federation_round(federation, log)
+                            if federation.stale and not federation_live:
+                                # rebuild 换了 hub/设备：关掉旧运行时，下一轮按新配置重开，不把旧路由接到新 hub
+                                log("federation_detached", {"reason": "runtime_stale"})
+                                federation.store.close()
+                                federation = runtime = None
+                                federation_probe = time.monotonic()
                         if platform.name != 'windows' and inbox is not None and not inbox.healthy():
                             # 收件箱文件被外部清理：重建后更新回复地址
                             inbox.close()
@@ -273,11 +437,26 @@ def run_worker(
                             log("inbox_reopened", {"inbox": inbox is not None})
                         if inbox is not None:
                             for frame in inbox.poll(loop_seconds):
-                                dispatcher.handle_frame(frame)
+                                if dispatcher.handle_frame(frame) is None and federation is not None:
+                                    try:
+                                        federation.handle_frame(frame)
+                                    except Exception as error:  # 联邦回执失败不影响本机
+                                        log("federation_receipt_error", {"error": type(error).__name__})
                         else:
                             time.sleep(loop_seconds)
-                        live = dispatcher.has_live_work()
-                        mark = store.ledger_revision()
+                        if local_error is None:
+                            try:
+                                local_live = dispatcher.has_live_work()  # 和以前一样在本轮等待之后取，空闲计时不变
+                            except Exception as error:
+                                local_error = error
+                        if local_error is not None:
+                            raise local_error
+                        live = local_live or federation_live
+                        try:
+                            mark: tuple[str, int] | None = summary.ledger_mark(
+                                store, directory, federation=federation.store if federation is not None else None)
+                        except Exception:  # 联邦库不可读：按需重试发布，失败计数照常有界
+                            mark = None
                         if not summary_pending and mark != summary_seen:
                             summary_failures = 0  # 账本有新变化：重新开始计数
                         if summary_pending or mark != summary_seen:
@@ -303,7 +482,8 @@ def run_worker(
                                 "consecutive": failures,
                             },
                         )
-                        if once or failures >= MAX_CONSECUTIVE_FAILURES:
+                        # 联邦还有待办时，本机库的持续故障不让 worker 退出（联邦照常推进，本机恢复后接着处理）
+                        if once or (failures >= MAX_CONSECUTIVE_FAILURES and not federation_live):
                             break
                         time.sleep(min(loop_seconds * failures, 10.0))
                         continue
@@ -319,6 +499,8 @@ def run_worker(
             finally:
                 if inbox is not None:
                     inbox.close()
+                if runtime is not None:
+                    runtime[0].close()
                 log("stop", {"consecutiveFailures": failures})
     finally:
         lifecycle.restore_stop(previous)

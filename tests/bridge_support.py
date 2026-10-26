@@ -124,6 +124,22 @@ def ref(
     )
 
 
+def register_claude_session(reference: EndpointRef) -> Path:
+    """在当前生效的 Claude 会话注册目录写一份与端点同 pid/sessionId/procStart 的记录（联邦根绑定按它核实）。
+
+    调用方应先把 AB_CLAUDE_SESSIONS_DIR 指到本用例的临时目录，免得不同用例的同 PID 记录互相覆盖。
+    """
+    # 函数内导入：回滚门用当前 tests 导入历史 src，历史版本没有 claude_sessions_dirs
+    from agentstatus_bridge.paths import claude_sessions_dirs  # layout: allow 兼容回滚门的历史 src
+
+    root = claude_sessions_dirs()[0]
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{reference.pid}.json"
+    path.write_text(json.dumps({"pid": reference.pid, "sessionId": reference.native_id,
+                                "procStart": reference.start_ticks}), encoding="utf-8")
+    return path
+
+
 def endpoint(
     reference: EndpointRef,
     *,

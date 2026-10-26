@@ -33,12 +33,16 @@ class Header:
     device: str | None = None
 
 
-def render(task: Task, attempt: Attempt, *, sender: str, device: str, command: str | None = None) -> str:
+def render(task: Task, attempt: Attempt, *, sender: str, device: str, command: str | None = None,
+           origin_device: str | None = None, attachment_lines: list[str] | None = None) -> str:
     """生成发给对方的完整文本；`device` 是发送方所在设备（本机投递即本机名，由调用方注入以便测试固定）。
 
     `command` 缺省按本进程入口解析：页脚里的命令必须是对方能直接敲的那个名字（DESIGN §45.36）。
+    联邦任务（DESIGN §88.8）另给 `origin_device`（发起设备 slug，页脚 report/status 都带 `--origin-device`）与
+    `attachment_lines`（接收侧 manifest 渲染的附件段，取代本机「引用文件」段）；两者都缺省时输出与本机逐字相同。
     """
     command = command or command_name()
+    route = f" --origin-device {origin_device}" if origin_device else ""
     lines = [
         f"{HEADER_TAG} task={task.id} attempt={attempt.seq} msg={attempt.message_id}"
         f" role={attempt.role.value} from={sender} device={device}"
@@ -47,7 +51,12 @@ def render(task: Task, attempt: Attempt, *, sender: str, device: str, command: s
         lines.append(f"任务：{task.title}")
     lines.append("")
     lines.append(attempt.body.rstrip())
-    if attempt.refs:
+    if attachment_lines is not None:
+        if attachment_lines:
+            lines.append("")
+            lines.append("附件：")
+            lines.extend(attachment_lines)
+    elif attempt.refs:
         lines.append("")
         lines.append("引用文件：")
         for ref in attempt.refs:
@@ -56,13 +65,13 @@ def render(task: Task, attempt: Attempt, *, sender: str, device: str, command: s
     if attempt.is_closure:
         # 单向同步：只给查看命令，不附汇报命令，避免形成来回（DESIGN §45.31.6）
         lines.append("")
-        lines.append(f"（AgentStatus 协作桥结束回执：不需要 {command} report；详情 {command} status {task.id[:8]}）")
+        lines.append(f"（AgentStatus 协作桥结束回执：不需要 {command} report；详情 {command} status {task.id[:8]}{route}）")
         return "\n".join(lines)
     if attempt.role is Role.NOTICE:
         lines.append("")
-        lines.append(f"（AgentStatus 协作桥通知；查看详情：{command} status {task.id[:8]}）")
+        lines.append(f"（AgentStatus 协作桥通知；查看详情：{command} status {task.id[:8]}{route}）")
         return "\n".join(lines)
-    base = f"{command} report {task.id} --attempt {attempt.seq}"
+    base = f"{command} report {task.id}{route} --attempt {attempt.seq}"
     lines.append("")
     lines.append("---")
     if attempt.role is Role.REVIEW:

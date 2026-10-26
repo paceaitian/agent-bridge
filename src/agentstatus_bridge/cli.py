@@ -15,6 +15,7 @@ import sqlite3
 from pathlib import Path
 import sys
 import time
+from typing import TYPE_CHECKING
 
 from . import __version__, summary
 from .platforms import process as procfs
@@ -59,6 +60,7 @@ from .model import (
     ReportKind,
     Role,
     Task,
+    TaskView,
     Verdict,
     Work,
     describe,
@@ -72,7 +74,7 @@ from .reports import ReportError, ReportInput, apply_report, file_reference
 from .store import ATTEMPT_WARNING_THRESHOLD, DB_NAME, MAX_BODY_BYTES, Store, StoreError
 from .closure import ACCEPTED, CLOSED, ClosureOutcome, queue_closures
 from .dispatch import needs_worker, select_generation
-from .doctor import collect_checks, print_checks
+from .doctor import collect_checks, federation_text, print_checks
 from .views import (
     _no_pane_warning,
     _NO_HINT,
@@ -91,6 +93,11 @@ from .transports import local_codex
 from .transports.codex_queue import cli_version
 from .transports.codex_withdraw import QueueDeleteClient
 from .notification_policy import can_notify, receipt_options
+from .federation.errors import FedCliError
+
+if TYPE_CHECKING:
+    from .federation.commands import Runtime as FedRuntime
+    from .federation.fedstore import FedTask
 
 EXIT_OK = 0
 EXIT_TARGET = 2
@@ -289,6 +296,8 @@ def _observations() -> tuple[list[Endpoint], ObserverView]:
 
 
 def cmd_peers(args: argparse.Namespace) -> int:
+    if args.device or (args.all_devices and get_platform().name == "windows"):
+        return _fed_peers(args)
     endpoints = discover()
     caller = identify_caller(endpoints)
     selectors = _selectors(endpoints)
@@ -314,10 +323,17 @@ def cmd_peers(args: argparse.Namespace) -> int:
             }
         )
     if args.json:
-        _print_json({"peers": rows})
+        document: dict[str, object] = {"peers": rows}
+        if args.all_devices:
+            document["devices"] = _fed_all_devices()
+        _print_json(document)
         return EXIT_OK
+    if args.all_devices:
+        print(f"设备 {device}（本机）：")
     if not rows:
         print("没有发现正在运行的 agent 终端会话（Claude/Codex/Grok）")
+        if args.all_devices:
+            _fed_all_devices_text()
         return EXIT_OK
     # 列宽按最长的目标写法算：同一 pane 里有多个会话时目标会退回 36 字符的完整会话 ID，固定列宽会把后面挤歪
     width = max(28, *(len(str(row["target"])) for row in rows))
@@ -330,7 +346,35 @@ def cmd_peers(args: argparse.Namespace) -> int:
             f"{str(row['target']):<{width}} {item.ref.pane or '-':<5} {RUNTIME_LABELS[item.runtime]:<6}"
             f" {item.ref.native_id[:8]}{mode}{extra}{mark}"
         )
+    if args.all_devices:
+        _fed_all_devices_text()
     return EXIT_OK
+
+
+def _fed_all_devices() -> list[dict[str, object]]:
+    """peers --all-devices 的远端部分；未启用联邦时为空。"""
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    from .federation import directory as fed_directory  # layout: allow 联邦按需加载
+    rt = fed.try_runtime(state_dir())
+    if rt is None:
+        return []
+    try:
+        return list(fed_directory.peer_devices(rt.store, None, now=int(time.time() * 1000)))
+    finally:
+        rt.close()
+
+
+def _fed_all_devices_text() -> None:
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    from .federation import directory as fed_directory  # layout: allow 联邦按需加载
+    rt = fed.try_runtime(state_dir())
+    if rt is None:
+        return
+    try:
+        for line in fed_directory.peer_lines(rt.store, None, now=int(time.time() * 1000)):
+            print(line)
+    finally:
+        rt.close()
 
 
 # 本次命令是否真的新拉起过 worker：main 结束时的补拉据此跳过。新 worker 还没拿到锁时再拉一次会多起一个进程（Opus 审计 F2）。
@@ -387,12 +431,50 @@ def _wait_worker_up(root: Path, timeout: float) -> bool:
 
 
 def _revive_worker(store: Store, now: float) -> None:
-    """有待办而 worker 不在（例如异常退出）时重新拉起；查询命令也能让排队恢复流动。"""
+    """有待办而 worker 不在（例如异常退出）时重新拉起；查询命令也能让排队恢复流动。
+
+    本机与跨设备作业同口径（§79「CLI 不排除停泊的 PENDING」）：联邦作业停泊后，查询命令与扩展定时补查也会续上。
+    """
     try:
-        if needs_worker(store, now) and not _worker_up(state_dir()):
+        if (needs_worker(store, now) or _federation_needs_worker(now)) and not _worker_up(state_dir()):
             _ensure_worker()
     except (OSError, StoreError):
         pass
+
+
+def _revive_for_federation() -> None:
+    """没有本机账本、或走了不开本机账本的入口时，只按联邦待办补拉 worker：不建本机库，未配置联邦时不导入联邦实现。"""
+    try:
+        if not _worker_ensured and _federation_needs_worker(time.time()) and not _worker_up(state_dir()):
+            _ensure_worker()
+    except (OSError, StoreError):
+        pass
+
+
+def _federation_needs_worker(now: float) -> bool:
+    """联邦已启用且本机有现在就能处理或待恢复的跨设备作业（与 relay 唤醒同一判定）；未配置时不导入联邦实现。
+
+    只是补拉 worker 的辅助判断：联邦库打不开或任何异常都按「不需要」处理，不影响本机命令（Opus r2-P2-2）。
+    """
+    root = state_dir()
+    if not _fed_configured(root):
+        return False
+    try:
+        from .federation import commands as fed, mirror  # layout: allow 联邦按需加载：未配置的机器不导入联邦实现
+
+        rt = fed.try_runtime(root)
+        if rt is None:
+            return False
+        try:
+            now_ms = int(now * 1000)
+            # 与本机 needs_worker(reminders=True) 同口径：可处理/待恢复的作业与已到期提醒（wake_candidates），
+            # 或 A 上还没到期的发起方提醒（worker 为它驻留，Opus r3-P3-1）
+            return rt.config.enabled and (bool(mirror.wake_candidates(rt.store, rt.ident, now=now_ms))
+                                          or any(True for _ in mirror.reminder_candidates(rt.store, now_ms)))
+        finally:
+            rt.close()
+    except Exception:  # noqa: BLE001 - 辅助判断不能让本机命令失败
+        return False
 
 
 def _read_body(args: argparse.Namespace) -> str:
@@ -449,7 +531,13 @@ def _delivery_exit(delivery: Delivery) -> int:
 
 
 def cmd_send(args: argparse.Namespace) -> int:
-    body = _read_body(args)
+    if args.device or args.review_device:
+        return _fed_send(args)
+    return _local_send(args)
+
+
+def _local_send(args: argparse.Namespace, *, body: str | None = None) -> int:
+    body = _read_body(args) if body is None else body
     cwd = Path.cwd()
     refs = [file_reference(path, cwd=cwd) for path in args.ref]
     endpoints = discover()
@@ -537,6 +625,7 @@ def cmd_tasks(args: argparse.Namespace) -> int:
     with _open_store() as store:
         # 待办而 worker 不在时的补拉由 main 结束时统一做（DESIGN §45.28.3），这里不重复拉起
         tasks = store.list_tasks(include_finished=args.all)
+        federation = _fed_task_list(args.all, now)
         endpoints, observed = _observations() if any(not task.finished for task in tasks) else ([], ObserverView())
         hints = {
             task.id: _target_hint(store.attempts(task.id), endpoints, observed, now)
@@ -544,11 +633,14 @@ def cmd_tasks(args: argparse.Namespace) -> int:
             if not task.finished
         }
         if args.json:
-            _print_json({"tasks": [_task_document(store, task, hint=hints.get(task.id, _NO_HINT)) for task in tasks]})
+            listing: dict[str, object] = {
+                "tasks": [_task_document(store, task, hint=hints.get(task.id, _NO_HINT)) for task in tasks]}
+            if federation is not None:
+                listing["federation"] = federation[0]
+            _print_json(listing)
             return EXIT_OK
         if not tasks:
             print("没有进行中的协作任务" if not args.all else "没有协作任务")
-            return EXIT_OK
         for task in tasks:
             attempts = store.attempts(task.id)
             view = describe(task, attempts)
@@ -570,6 +662,8 @@ def cmd_tasks(args: argparse.Namespace) -> int:
                 f"{short(task.id)}  {PHASE_LABELS[view.phase]:<4} {target:<28}"
                 f" {task.title[:40]}  （{reason_text(view.reason)}{flag}{withdrawal_note}，{_age(task.updated_at, now)}）"
             )
+        for line in federation[1] if federation is not None else []:
+            print(line)
     return EXIT_OK
 
 
@@ -585,6 +679,9 @@ def _task(store: Store, reference: str) -> Task:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    found = _fed_lookup(args, write=False)
+    if found is not None:
+        return _fed_status(args, *found)
     now = time.time()
     with _open_store() as store:
         # 待办而 worker 不在时的补拉由 main 结束时统一做（DESIGN §45.28.3），这里不重复拉起
@@ -613,6 +710,9 @@ _REPORT_KINDS: tuple[tuple[str, ReportKind], ...] = (
 
 def cmd_report(args: argparse.Namespace) -> int:
     kind = next(value for name, value in _REPORT_KINDS if getattr(args, name))
+    found = _fed_lookup(args, write=True)
+    if found is not None:
+        return _fed_report(args, kind, *found)
     endpoints = discover()
     caller = identify_caller(endpoints)
     with _open_store() as store:
@@ -664,7 +764,38 @@ def cmd_report(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _wait_outcome(view: TaskView, until: str) -> int | None:
+    """wait 是否到达：本机与跨设备任务共用同一判定（联邦视图经 views 投影）。"""
+    current = view.current
+    reached: int | None = None
+    if until == "sent":
+        if current is not None and current.delivery in (*HANDED_OVER, Delivery.HELD):
+            reached = EXIT_OK
+    elif until == "ack":
+        if current is not None and current.work in (Work.ACKNOWLEDGED, Work.IN_PROGRESS, Work.RESULT):
+            reached = EXIT_OK
+    if reached is None:
+        if view.phase in _RESULT_PHASES and until in {"result", "ack", "sent"}:
+            reached = EXIT_OK
+        elif view.phase is Phase.NEEDS_ATTENTION and view.reason not in _KEEP_WAITING:
+            if view.reason == "delivery_unknown":
+                reached = EXIT_UNKNOWN
+            elif view.reason in {
+                "blocked_reported",
+                "failure_reported",
+                "changes_requested",
+                "review_verdict_missing",
+            }:
+                reached = EXIT_FAILURE_REPORTED
+            else:
+                reached = EXIT_REJECTED
+    return reached
+
+
 def cmd_wait(args: argparse.Namespace) -> int:
+    found = _fed_lookup(args, write=False)
+    if found is not None:
+        return _fed_wait(args, *found)
     deadline = time.monotonic() + args.timeout
     rounds = 0
     opener = _open_store
@@ -679,29 +810,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
             task = _task(store, args.task)
             attempts = store.attempts(task.id)
             view = describe(task, attempts)
-            current = view.current
-            reached: int | None = None
-            if args.until == "sent":
-                if current is not None and current.delivery in (*HANDED_OVER, Delivery.HELD):
-                    reached = EXIT_OK
-            elif args.until == "ack":
-                if current is not None and current.work in (Work.ACKNOWLEDGED, Work.IN_PROGRESS, Work.RESULT):
-                    reached = EXIT_OK
-            if reached is None:
-                if view.phase in _RESULT_PHASES and args.until in {"result", "ack", "sent"}:
-                    reached = EXIT_OK
-                elif view.phase is Phase.NEEDS_ATTENTION and view.reason not in _KEEP_WAITING:
-                    if view.reason == "delivery_unknown":
-                        reached = EXIT_UNKNOWN
-                    elif view.reason in {
-                        "blocked_reported",
-                        "failure_reported",
-                        "changes_requested",
-                        "review_verdict_missing",
-                    }:
-                        reached = EXIT_FAILURE_REPORTED
-                    else:
-                        reached = EXIT_REJECTED
+            reached = _wait_outcome(view, args.until)
             if reached is not None:
                 if args.json:
                     _print_json(_task_document(store, task))
@@ -716,6 +825,9 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
 
 def cmd_pause(args: argparse.Namespace) -> int:
+    found = _fed_lookup(args, write=True)
+    if found is not None:
+        return _fed_control(args, "pause", *found)
     caller = identify_caller(discover()) if get_platform().name == 'windows' else None
     with _open_store() as store:
         task = _task(store, args.task)
@@ -729,6 +841,9 @@ def cmd_pause(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    found = _fed_lookup(args, write=True)
+    if found is not None:
+        return _fed_control(args, "resume", *found)
     caller = identify_caller(discover()) if get_platform().name == 'windows' else None
     with _open_store() as store:
         task = _task(store, args.task)
@@ -752,6 +867,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
+    found = _fed_lookup(args, write=True)
+    if found is not None:
+        return _fed_control(args, "cancel", *found)
     caller = identify_caller(discover()) if get_platform().name == 'windows' else None
     now = time.time()
     with _open_store() as store:
@@ -796,6 +914,9 @@ def _cancel_ordinary_pending(store: Store, attempts: list[Attempt], *, reason: s
 
 
 def cmd_accept(args: argparse.Namespace) -> int:
+    found = _fed_lookup(args, write=True)
+    if found is not None:
+        return _fed_finish(args, ACCEPTED, *found)
     endpoints = discover()
     caller = identify_caller(endpoints)
     with _open_store() as store:
@@ -835,6 +956,9 @@ _NATIVE_RISK = frozenset({Delivery.WRITTEN, Delivery.QUEUED, Delivery.HELD, Deli
 
 
 def cmd_close(args: argparse.Namespace) -> int:
+    found = _fed_lookup(args, write=True)
+    if found is not None:
+        return _fed_finish(args, CLOSED, *found)
     endpoints = discover()
     caller = identify_caller(endpoints)
     now = time.time()
@@ -878,6 +1002,11 @@ def cmd_close(args: argparse.Namespace) -> int:
 
 
 def cmd_withdraw(args: argparse.Namespace) -> int:
+    found = _fed_lookup(args, write=False)
+    if found is not None:
+        found[0].close()
+        # 写前退出：跨设备任务不触碰任何原生删除（§88.7）
+        raise CliError("federation_withdraw_unsupported", EXIT_NOT_ENABLED)
     caller = identify_caller(discover())
     _check_sender(caller)
     now = time.time()
@@ -963,6 +1092,11 @@ def _rework_body(first: Attempt, current: Attempt, task: Task, extra: str | None
 
 
 def cmd_retry(args: argparse.Namespace) -> int:
+    found = _fed_lookup(args, write=True)
+    if found is not None:
+        return _fed_retry(args, *found)
+    if args.device:
+        raise CliError("target_is_local_device", EXIT_TARGET)
     endpoints = discover()
     caller = identify_caller(endpoints)
     now = time.time()
@@ -1096,6 +1230,8 @@ def _refresh_summary(*, force: bool = False, revive: bool = False) -> summary.Pu
         if get_platform().name == 'windows':
             get_platform().files.ensure_private_dir(root)
         if not (root / DB_NAME).is_file():
+            if revive:
+                _revive_for_federation()  # 只承接跨设备任务的设备可以没有本机库：联邦待办照样补拉（Codex r3-P2-02）
             return None  # 没用过协作桥的机器不创建账本
         with Store.open(root) as store:
             try:
@@ -1138,6 +1274,8 @@ def cmd_summary(args: argparse.Namespace) -> int:
     published: summary.PublishResult | None = None
     if args.refresh or args.if_stale:
         if not ledger:
+            if args.if_stale and get_platform().name != 'windows':
+                _revive_for_federation()  # 扩展定时补查在只有联邦库的设备上也续上跨设备作业；退出码不变
             raise CliError("ledger_absent", EXIT_UNAVAILABLE)
         with _open_store() as store:
             try:
@@ -1166,6 +1304,420 @@ def cmd_summary(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ---- 跨设备（DESIGN §88）：显式 --device/--origin-device，或本机找不到时的唯一联邦命中 ----
+
+
+def _local_task_exists(root: Path, reference: str) -> bool:
+    """本机账本能否解析该任务；找不到才轮到联邦。歧义或账本错误一律交本机路径原样报错（§88.7 命名空间）。"""
+    if not (root / DB_NAME).is_file():
+        return False
+    try:
+        with Store.open(root) as store:
+            store.resolve_task(reference)
+    except StoreError as error:
+        return error.code != "task_not_found"
+    except PermissionError:
+        return True
+    return True
+
+
+def _fed_configured(root: Path) -> bool:
+    """只看配置文件在不在（与摘要同一个文件名）：未配置的机器在这一步就返回，不导入联邦实现（实现决定 D20）。"""
+    return (root / summary.FEDERATION_CONFIG).exists()
+
+
+def _fed_lookup(args: argparse.Namespace, *, write: bool) -> tuple[FedRuntime, FedTask] | None:
+    """显式 --origin-device 只查联邦；否则本机精确任务优先，本机找不到才查联邦唯一索引。
+
+    联邦库损坏/停用不能让已命中的本机任务失败；写命令要求联邦已启用（停用后仍可读历史）。
+    """
+    root = state_dir()
+    origin = getattr(args, "origin_device", None)
+    if origin is None and not _fed_configured(root):
+        return None
+    from .federation import commands as fed  # layout: allow 联邦按需加载：未配置的机器不导入联邦实现
+    if origin is None:
+        if _local_task_exists(root, args.task):
+            return None
+        rt = fed.try_runtime(root)
+        if rt is None:
+            return None
+        try:
+            task = fed.find_task(rt, args.task, None)
+        except FedCliError as error:
+            rt.close()
+            if error.code == "task_ambiguous":
+                raise
+            return None
+    else:
+        rt = fed.open_runtime(root, require_enabled=False)
+        try:
+            task = fed.find_task(rt, args.task, origin)
+        except BaseException:
+            rt.close()
+            raise
+    if write and not rt.config.enabled:
+        rt.close()
+        raise FedCliError("federation_disabled", EXIT_NOT_ENABLED)
+    return rt, task
+
+
+def _fed_relay_missing(rt: FedRuntime) -> bool:
+    """已记入联邦账本；relay 未运行时说明并返回 True（命令返回 6，勿重复执行）。"""
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    try:
+        if fed.relay_running(rt.root):
+            return False
+    except OSError:
+        pass
+    print(f"注意：{reason_text('relay_not_running')}。上面的操作已记入本机联邦账本，请勿重复执行；"
+          f"relay 启动后自动发出（{command_name()} federation status 查看）", file=sys.stderr)
+    return True
+
+
+def _fed_target_text(rt: FedRuntime, target: object) -> str:
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    from .federation.refs import TargetRef  # layout: allow 联邦按需加载
+    assert isinstance(target, TargetRef)
+    remote = target.remote
+    label = remote.display_label or remote.native_id[:8]
+    return f"{fed.device_name(rt, remote.device_id)} 上的 {remote.provider.value}@{label}〔{remote.native_id[:8]}〕"
+
+
+def _fed_peers(args: argparse.Namespace) -> int:
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    from .federation import directory as fed_directory  # layout: allow 联邦按需加载
+    rt = fed.open_runtime(state_dir(), require_enabled=False)
+    try:
+        now_ms = int(time.time() * 1000)
+        reference = None if args.all_devices else args.device
+        try:
+            if args.json:
+                _print_json({"devices": fed_directory.peer_devices(rt.store, reference, now=now_ms)})
+                return EXIT_OK
+            lines = fed_directory.peer_lines(rt.store, reference, now=now_ms)
+        except fed_directory.DirectoryError as error:
+            raise CliError(error.code, EXIT_TARGET) from error
+        if not lines:
+            print("还没有其他设备的目录（relay 连上 hub 后自动同步）")
+        for line in lines:
+            print(line)
+    finally:
+        rt.close()
+    return EXIT_OK
+
+
+def _fed_send(args: argparse.Namespace) -> int:
+    """跨设备 send：A 上 L0 记账即返回；目标在 B 的缓存目录解析，复核方缺省在本机。"""
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    body = _read_body(args)
+    endpoints = discover()
+    caller = identify_caller(endpoints)
+    _check_sender(caller)
+    rt = fed.open_runtime(state_dir())
+    try:
+        target_local = not args.device or fed.is_local_device(rt, args.device)
+        reviewer_local = not args.review_device or fed.is_local_device(rt, args.review_device)
+        if target_local and reviewer_local and args.review_device and not args.review_by:
+            raise CliError("review_device_requires_reviewer")
+    except BaseException:
+        rt.close()
+        raise
+    if target_local and reviewer_local:
+        rt.close()
+        args.device = args.review_device = None
+        return _local_send(args, body=body)  # 两个参与方都在本机：就是本机任务（正文已读，不重读 stdin）
+    try:
+        if target_local:
+            # 本机执行 + 远端复核（T16）：目标按本机资格核验
+            live = _resolve(args.to, endpoints)
+            _check_target(live, allow_shared=bool(args.allow_shared))
+            if caller.endpoint is not None and caller.endpoint.ref.same_session(live.ref):
+                raise CliError("target_is_self")
+            target = fed.local_target(rt, live)
+        else:
+            target = fed.remote_target(rt, args.device, args.to)
+        reviewer = None
+        if args.review_by:
+            if fed.is_local_device(rt, args.review_device):
+                live = _resolve(args.review_by, endpoints)
+                _check_target(live, allow_shared=bool(args.allow_shared))
+                reviewer = fed.local_target(rt, live)
+            else:
+                reviewer = fed.remote_target(rt, args.review_device, args.review_by)
+        elif args.review_device:
+            raise CliError("review_device_requires_reviewer")
+        first_line = body.strip().splitlines()[0] if body.strip() else ""
+        outcome = fed.send(
+            rt, target=target, body=body, title=(args.title or first_line)[:60], ref_paths=list(args.ref),
+            cwd=Path.cwd(), origin=caller.endpoint.ref if caller.endpoint is not None else None,
+            origin_class=permission_class(caller), reviewer=reviewer, allow_shared=bool(args.allow_shared),
+            no_notify=bool(args.no_notify))
+        missing = _fed_relay_missing(rt)
+        task_id = outcome.task.task_id
+        if args.json:
+            _print_json(fed.task_document(rt, outcome.task, now=int(time.time() * 1000)))
+        else:
+            print(f"跨设备任务 {short(task_id)} 已记录，交给 {_fed_target_text(rt, outcome.target)}：等待 relay 发出")
+            if outcome.blobs or outcome.references:
+                print(f"附件：{outcome.blobs} 个随消息传输（{outcome.blob_bytes} B），"
+                      f"{outcome.references} 个超出大小上限只作引用（对方没有这些文件）")
+            cmd = command_name()
+            print(f"查看进展：{cmd} status {short(task_id)}；等待结果：{cmd} wait {short(task_id)}")
+    finally:
+        rt.close()
+    return EXIT_UNAVAILABLE if missing else EXIT_OK
+
+
+def _fed_task_list(include_finished: bool, now: float) -> tuple[list[dict[str, object]], list[str]] | None:
+    """tasks 的联邦部分：未配置返回 None（输出不变）；库不可读只注明，不影响本机行。"""
+    root = state_dir()
+    if not _fed_configured(root):
+        return None
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    rt = fed.try_runtime(root)
+    if rt is None:
+        return [], [f"跨设备任务：联邦库不可读（本机任务不受影响；{command_name()} doctor 查看原因）"]
+    try:
+        now_ms = int(now * 1000)
+        documents: list[dict[str, object]] = []
+        lines: list[str] = []
+        for task in fed.list_tasks(rt, include_finished=include_finished):
+            document = fed.task_document(rt, task, now=now_ms)
+            documents.append(document)
+            view = fed.view_of(rt, task)
+            target = "-"
+            if view.current is not None:
+                row = next((item for item in document["attempts"] if item["seq"] == view.current.seq), None)
+                where = f"{row['targetDeviceName']}:" if row is not None else ""
+                target = where + endpoint_text(view.current.target)
+            role = "本机发起" if task.is_authority else f"发起设备 {document['authorityDeviceName']}"
+            flag = "，需处理：远端离线/传输未恢复" if document["stalled"] else ""
+            lines.append(f"{short(task.task_id)}  {PHASE_LABELS[view.phase]:<4} {target:<28} {task.title[:40]}"
+                         f"  （跨设备·{role}，{reason_text(view.reason)}{flag}，{_age(task.last_sync_at / 1000, now)}）")
+        return documents, lines
+    finally:
+        rt.close()
+
+
+def _fed_status(args: argparse.Namespace, rt: FedRuntime, task: FedTask) -> int:
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    try:
+        now_ms = int(time.time() * 1000)
+        if args.json:
+            _print_json(fed.task_document(rt, task, now=now_ms, include_body=args.body))
+        else:
+            for line in fed.task_lines(rt, task, now=now_ms, show_body=args.body):
+                print(line)
+    finally:
+        rt.close()
+    return EXIT_OK
+
+
+def _fed_report(args: argparse.Namespace, kind: ReportKind, rt: FedRuntime, task: FedTask) -> int:
+    """目标设备上的跨设备汇报：B 上记账后等 A 裁决；A 本机参与方同事务裁决。"""
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    try:
+        endpoints = discover()
+        caller = identify_caller(endpoints)
+        attempt, result = fed.report(
+            rt, task=task, kind=kind, attempt_seq=args.attempt, note=args.note, files=list(args.file),
+            commit=args.commit, manual=args.manual, caller=caller, caller_class=permission_class(caller),
+            cwd=Path.cwd())
+        started: bool | None = True
+        if result.decision == "accepted":
+            started = _start_worker()  # A 本机采纳可能排出本机通知/复核
+        missing = _fed_relay_missing(rt)
+        if result.decision is None:
+            status = "已提交，等待发起设备确认"
+        elif result.decision == "accepted":
+            status = "发起设备已采纳"
+        else:
+            status = f"未采纳：{reason_text(result.reason or result.decision)}"
+        if args.json:
+            document = fed.task_document(rt, rt.store.get_task(task.authority_device, task.task_id) or task,
+                                         now=int(time.time() * 1000))
+            document["report"] = {"reportNo": result.report_no, "operationId": result.operation_id,
+                                  "decision": result.decision, "reason": result.reason}
+            _print_json(document)
+        else:
+            print(f"已记录：{EVENT_LABELS[kind.value]}（跨设备任务 {short(task.task_id)} #{attempt.seq}，"
+                  f"第 {result.report_no} 号报告）；{status}")
+    finally:
+        rt.close()
+    if result.decision == "rejected":
+        return EXIT_REJECTED
+    if _queued_without_worker(started) or missing:
+        return EXIT_UNAVAILABLE
+    return EXIT_OK
+
+
+def _fed_wait(args: argparse.Namespace, rt: FedRuntime, task: FedTask) -> int:
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    deadline = time.monotonic() + args.timeout
+    try:
+        while True:
+            current = rt.store.get_task(task.authority_device, task.task_id) or task
+            view = fed.view_of(rt, current)
+            reached = _wait_outcome(view, args.until)
+            if reached is not None:
+                now_ms = int(time.time() * 1000)
+                if args.json:
+                    _print_json(fed.task_document(rt, current, now=now_ms))
+                else:
+                    for line in fed.task_lines(rt, current, now=now_ms):
+                        print(line)
+                return reached
+            if time.monotonic() >= deadline:
+                if not args.json:
+                    print(f"等待超时：{PHASE_LABELS[view.phase]}（{reason_text(view.reason)}）")
+                return EXIT_TIMEOUT
+            time.sleep(1.0)
+    finally:
+        rt.close()
+
+
+def _fed_control(args: argparse.Namespace, action: str, rt: FedRuntime, task: FedTask) -> int:
+    """pause/resume/cancel：只在发起设备；cancel 对远端只是抑制请求，不是原生撤回。"""
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    try:
+        caller = identify_caller(discover())
+        _, remote_pending = fed.set_control(rt, task, action, caller=caller)
+        text = {"pause": "已暂停发送；已交给对方的消息不受影响", "resume": "继续发送",
+                "cancel": "已请求取消尚未发出的消息"}[action]
+        print(f"跨设备任务 {short(task.task_id)} {text}")
+        if remote_pending:
+            print("对方设备尚未确认：它收到最新状态后抑制还没发出的作业；已发出的不能撤回")
+        if action == "resume":
+            _start_worker()
+        missing = _fed_relay_missing(rt)
+    finally:
+        rt.close()
+    return EXIT_UNAVAILABLE if missing else EXIT_OK
+
+
+def _fed_finish(args: argparse.Namespace, state: str, rt: FedRuntime, task: FedTask) -> int:
+    """accept/close：发起设备本机写终态与结束回执；对方离线不阻塞决定。"""
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    try:
+        caller = identify_caller(discover())
+        outcome = fed.finish(rt, task, state, caller=caller, caller_class=permission_class(caller),
+                             reason=getattr(args, "reason", None), force=bool(getattr(args, "force", False)))
+        if any(item.target_device == rt.ident.device_id for item in outcome.closures):
+            _start_worker()
+        missing = _fed_relay_missing(rt)
+        if getattr(args, "json", False):
+            _print_json({"ok": True, "id": task.task_id, "scope": "federation",
+                         "phase": fed.phase_of(rt, outcome.task)[0].value,
+                         "closure": {"queued": [{"seq": item.seq, "targetDevice": item.target_device}
+                                                for item in outcome.closures],
+                                     "skipped": list(outcome.skipped),
+                                     "remoteUnconfirmed": outcome.remote_unconfirmed}})
+        else:
+            print(f"跨设备任务 {short(task.task_id)} " + ("已验收" if state == ACCEPTED else "已停止追踪"))
+            for closure in outcome.closures:
+                print(f"已排队结束回执 → {_fed_target_text(rt, closure.target)}")
+            for capacity in outcome.skipped:
+                print(f"提示：容量已满（{capacity}），未排结束回执")
+            if outcome.remote_unconfirmed:
+                print("注意：对方设备尚未证明工作消息是否送达；结束回执由对方按实际情况投递或抑制，已交出的工作不能撤回")
+    finally:
+        rt.close()
+    return EXIT_UNAVAILABLE if missing else EXIT_OK
+
+
+def _fed_retry(args: argparse.Namespace, rt: FedRuntime, task: FedTask) -> int:
+    """重发/返工：发起设备上追加新尝试；改派可指向本机会话或 --device 指定设备上的会话。"""
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    try:
+        endpoints = discover()
+        caller = identify_caller(endpoints)
+        new_target = None
+        if args.to:
+            if not fed.is_local_device(rt, args.device):
+                new_target = fed.remote_target(rt, args.device, args.to)
+            else:
+                live = _resolve(args.to, endpoints)
+                _check_target(live, allow_shared=bool(args.allow_shared))
+                new_target = fed.local_target(rt, live)
+        elif args.device:
+            raise CliError("target_explicit_required")
+        outcome = fed.retry(rt, task, caller=caller, message=args.message, force=bool(args.force),
+                            new_target=new_target, allow_shared=bool(args.allow_shared), rework_body=_rework_body)
+        attempt = outcome.attempt
+        local = attempt.target_device == rt.ident.device_id
+        started = _start_worker() if local else True
+        missing = False if local else _fed_relay_missing(rt)
+        print(f"已排队第 {attempt.seq} 次{ROLE_LABELS[Role(attempt.role)]} → {_fed_target_text(rt, attempt.target)}"
+              f"（跨设备任务 {short(task.task_id)}）")
+        if attempt.seq >= ATTEMPT_WARNING_THRESHOLD:
+            print(f"提示：{reason_text('attempts_near_limit')}")
+        if args.force and not outcome.undelivered and not outcome.rework:
+            print("注意：上一条消息可能已送达，对方可能重复执行")
+    finally:
+        rt.close()
+    if _queued_without_worker(started) or missing:
+        return EXIT_UNAVAILABLE
+    return EXIT_OK
+
+
+def cmd_federation(args: argparse.Namespace) -> int:
+    """`federation enable/disable/status/relay/archive`：本机跨设备协作的启停、诊断与 relay 入口。"""
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    from .federation.codec import is_slug  # layout: allow 联邦按需加载
+    root = state_dir()
+    action = args.federation_action
+    if action == "enable":
+        name = args.name or device_name()
+        if not is_slug(name):
+            raise CliError("federation_device_name_invalid")
+        config, created = fed.enable(
+            root, hub_host=args.hub_host, hub_user=args.hub_user, hub_port=args.hub_port, hub_id=args.hub_id,
+            device_id=args.device_id, name=name, identity_file=args.identity_file,
+            known_hosts_file=args.known_hosts_file, ssh_executable=args.ssh_executable)
+        print(f"跨设备协作已启用：本机登记为 {config.device_name}（{'新建联邦库' if created else '沿用既有联邦库'}）")
+        print(f"relay 需要以服务方式运行：{command_name()} federation relay（模板见 docs/deployment.md）")
+        return EXIT_OK
+    if action == "disable":
+        fed.disable(root)
+        print("跨设备协作已停用：relay 会在一秒内退出，worker 不再领取跨设备作业；数据与附件保留，本机协作照常")
+        return EXIT_OK
+    if action == "status":
+        projection = fed.doctor_projection(root)
+        if args.json:
+            _print_json({"federation": projection})
+            return EXIT_OK
+        if projection is None:
+            print(reason_text("federation_not_configured"))
+            return EXIT_OK
+        print(federation_text(projection))
+        return EXIT_OK
+    if action == "rebuild":
+        outcome = fed.rebuild(root, hub_id=args.hub_id, device_id=args.device_id)
+        if outcome["newDevice"]:
+            print("已按新设备身份重建本机联邦库（旧配置已改名留档）；旧任务不迁移")
+        else:
+            print(f"已切换到新 hub：旧 hub 上未结的 {outcome['frozenOutbox']} 条发件已冻结，旧任务的未投作业不再领取；"
+                  "旧任务可在发起设备本机 close，确认对方没收到后再 send 新任务")
+        return EXIT_OK
+    if action == "relay":
+        state = fed.run_relay(root, once=args.once)
+        if state in ("connected", "stopped", "already_running"):
+            return EXIT_OK
+        _report_error(args, state)
+        return EXIT_STORE if state in fed.STOP_STATES else EXIT_UNAVAILABLE
+    found = _fed_lookup(args, write=False)
+    if found is None:
+        raise CliError("task_not_found", EXIT_TARGET)
+    rt, task = found
+    try:
+        count = fed.archive(rt, task)
+    finally:
+        rt.close()
+    print(f"已在本机归档跨设备任务 {short(task.task_id)} 的镜像（抑制 {count} 条未发出的作业）；不改变发起设备上的任务")
+    return EXIT_OK
+
+
 def _report_error(args: argparse.Namespace, code: str) -> None:
     message = reason_text(code)
     if code == 'caller_unattributed' and get_platform().name == 'windows':
@@ -1182,6 +1734,8 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     peers = commands.add_parser("peers", help="列出可交接的会话")
+    peers.add_argument("--device", help="查看另一台设备的缓存目录（跨设备）")
+    peers.add_argument("--all-devices", action="store_true", help="分设备列出本机与其他设备的会话")
     peers.add_argument("--json", action="store_true")
     peers.set_defaults(handler=cmd_peers)
 
@@ -1192,6 +1746,8 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     send.add_argument("--title", help="任务标题（默认取内容第一行）")
     send.add_argument("--ref", action="append", default=[], help="附带引用文件（记录 sha256）")
     send.add_argument("--review-by", help="完成后自动交给该会话复核")
+    send.add_argument("--device", help="目标所在的设备（登记名或完整设备 ID）；不给则是本机会话")
+    send.add_argument("--review-device", help="复核方所在设备（缺省本机；只能是本机或目标设备）")
     send.add_argument("--allow-shared", action="store_true", help="允许投递到被多个进程加载的 thread")
     send.add_argument("--no-wait", action="store_true", help="不等待首次投递结果")
     send.add_argument("--no-notify", action="store_true", help="对方交结果后不回推通知发起会话")
@@ -1205,6 +1761,7 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
 
     status = commands.add_parser("status", help="查看任务详情")
     status.add_argument("task")
+    status.add_argument("--origin-device", help="跨设备任务的发起设备（登记名或完整设备 ID）")
     status.add_argument("--body", action="store_true", help="显示任务正文")
     status.add_argument("--json", action="store_true")
     status.set_defaults(handler=cmd_status)
@@ -1218,6 +1775,7 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
         ),
     )
     report.add_argument("task")
+    report.add_argument("--origin-device", help="跨设备任务的发起设备（消息页脚里已给出）")
     report.add_argument("--attempt", type=int)
     kinds = report.add_mutually_exclusive_group(required=True)
     kinds.add_argument("--ack", action="store_true", help="开始处理（只记账，不通知发起方）")
@@ -1236,6 +1794,7 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
 
     wait = commands.add_parser("wait", help="等待任务到达某个阶段")
     wait.add_argument("task")
+    wait.add_argument("--origin-device", help="跨设备任务的发起设备")
     wait.add_argument("--until", choices=("sent", "ack", "result"), default="result")
     wait.add_argument("--timeout", type=float, default=3600.0)
     wait.add_argument("--json", action="store_true")
@@ -1248,16 +1807,19 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     ):
         command = commands.add_parser(name, help=text)
         command.add_argument("task")
+        command.add_argument("--origin-device", help="跨设备任务的发起设备")
         command.set_defaults(handler=handler)
 
     accept = commands.add_parser("accept", help="验收结果")
     accept.add_argument("task")
+    accept.add_argument("--origin-device", help="跨设备任务的发起设备")
     accept.add_argument("--force", action="store_true", help="没有待验收结果时也标记验收")
     accept.add_argument("--json", action="store_true", help="成功与失败都输出结构化结果（供界面调用）")
     accept.set_defaults(handler=cmd_accept, json_errors=True)
 
     close = commands.add_parser("close", help="停止追踪任务")
     close.add_argument("task")
+    close.add_argument("--origin-device", help="跨设备任务的发起设备")
     close.add_argument("--reason")
     close.set_defaults(handler=cmd_close)
 
@@ -1270,7 +1832,9 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
 
     retry = commands.add_parser("retry", help="重发未送达的消息，或把意见交回返工")
     retry.add_argument("task")
+    retry.add_argument("--origin-device", help="跨设备任务的发起设备")
     retry.add_argument("--to", help="改派到其他会话")
+    retry.add_argument("--device", help="改派目标所在设备（跨设备任务；与 --to 一起用）")
     retry.add_argument("-m", "--message", help="补充说明")
     retry.add_argument("--force", action="store_true", help="上一条可能已送达时仍重发")
     retry.add_argument("--allow-shared", action="store_true")
@@ -1285,6 +1849,31 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     summary_parser.add_argument("--if-stale", action="store_true", help="仅在摘要缺失、损坏或落后于账本时重建")
     summary_parser.add_argument("--json", action="store_true")
     summary_parser.set_defaults(handler=cmd_summary)
+
+    federation = commands.add_parser("federation", help="跨设备协作：启用、停用、状态与 relay")
+    federation_actions = federation.add_subparsers(dest="federation_action", required=True)
+    enable = federation_actions.add_parser("enable", help="首次启用（建联邦库）或停用后重新启用")
+    enable.add_argument("--hub-host", required=True, help="hub 主机名")
+    enable.add_argument("--hub-user", required=True, help="hub 上的受限 relay 用户")
+    enable.add_argument("--hub-port", type=int, default=22)
+    enable.add_argument("--hub-id", required=True, help="hub init 打印的 hubId")
+    enable.add_argument("--device-id", required=True, help="hub add-device 打印的 deviceId")
+    enable.add_argument("--name", help="本机登记名（默认取设备名；须与 hub 登记一致）")
+    enable.add_argument("--identity-file", required=True, help="relay 专用私钥路径（不复用管理 key）")
+    enable.add_argument("--known-hosts-file", required=True, help="relay 专用 known_hosts 路径")
+    enable.add_argument("--ssh-executable", default="ssh")
+    federation_actions.add_parser("disable", help="停用（数据保留，本机协作照常）")
+    fed_status = federation_actions.add_parser("status", help="relay 与联邦库状态（不连 hub、不读 key）")
+    fed_status.add_argument("--json", action="store_true")
+    relay = federation_actions.add_parser("relay", help="运行 relay（通常由用户服务/计划任务拉起）")
+    relay.add_argument("--once", action="store_true", help="只连一次、跑一轮")
+    rebuild = federation_actions.add_parser("rebuild", help="灾难换 hub：hub 换新 hubId 并重新登记本机后使用")
+    rebuild.add_argument("--hub-id", required=True, help="新 hub 的 hubId")
+    rebuild.add_argument("--device-id", help="本机联邦库丢失时 hub 新登记的 deviceId（库完整时保留原 ID，不用给）")
+    archive = federation_actions.add_parser("archive", help="在本机归档跨设备任务的镜像")
+    archive.add_argument("task")
+    archive.add_argument("--origin-device", help="跨设备任务的发起设备")
+    federation.set_defaults(handler=cmd_federation)
 
     doctor = commands.add_parser("doctor", help="检查协作桥运行环境")
     doctor.add_argument("--json", action="store_true")
@@ -1309,6 +1898,11 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ['hub']:
+        # hub 管理与 forced command 入口：不碰本机账本、平台发现与 provider（§88.1）
+        from .federation.hub_cli import main as hub_main  # layout: allow hub 只用标准库与联邦存储
+        return hub_main(raw[1:])
     try:
         windows = get_platform().name == 'windows'
     except ValueError:
@@ -1364,7 +1958,7 @@ def _run_command(args: argparse.Namespace) -> int:
             return error.exit_code
     if get_platform().name == 'windows':
         # main's Windows scope has already checked capability and attribution.
-        if args.command == 'peers':
+        if args.command == 'peers' and not (args.device or args.all_devices):
             from .platforms.windows import codex_discovery  # layout: allow Windows只读候选，Linux路径与构造不加载
             from .platforms.windows.local_transport import WindowsPlatform  # layout: allow 已选择后端的窄能力
             backend = get_platform().transport
@@ -1386,6 +1980,7 @@ def _run_command(args: argparse.Namespace) -> int:
                     issues = '；'.join(reason_text('target_' + issue) for issue in endpoint.issues)
                     print(endpoint_text(endpoint.ref, label=label) + '  target=claude@id:' + endpoint.ref.native_id
                           + '  [root] 状态未知' + ('  ' + issues if issues else ''))
+            _revive_for_federation()  # 这个入口不开本机账本、不走通用补查：只按联邦待办补拉（Codex r3-P2-02）
             return EXIT_OK
     # 任一调用前后补查摘要：提交后未发布（进程被杀、锁超时）的窗口由下一次调用收敛；worker 与 summary 自行处理
     refresh = args.command not in {"worker", "summary"} and not (get_platform().name == 'windows' and args.command == 'wait')
@@ -1403,6 +1998,9 @@ def _run_command(args: argparse.Namespace) -> int:
     except StoreError as error:
         _report_error(args, error.code)
         return _exit_for_store_error(error.code)
+    except FedCliError as error:
+        _report_error(args, error.code)
+        return error.exit_code
     except KeyboardInterrupt:
         return 130
     finally:

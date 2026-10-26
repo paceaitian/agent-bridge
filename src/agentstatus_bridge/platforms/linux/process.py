@@ -78,18 +78,32 @@ def list_pids(proc_root: Path = DEFAULT_PROC) -> list[int]:
 
 def open_file_targets(pid: int, proc_root: Path = DEFAULT_PROC) -> list[str]:
     """列出进程打开的文件路径（只读 fd 链接，不读取文件内容）。"""
+    return open_file_scan(pid, proc_root)[0]
+
+
+def open_file_scan(pid: int, proc_root: Path = DEFAULT_PROC) -> tuple[list[str], bool]:
+    """同一次扫描的 fd 链接目标与完整性：(目标, 是否看全)。
+
+    进程已退出、fd 在列出后关闭都算看全（它确实不再持有）；fd 目录列不出或任一链接读不到（EACCES 等）
+    算没看全，调用方不能据此推断「不持有」。完整性必须来自这同一次扫描，事后再列一次目录证明不了它（Codex r4-P2-01）。
+    """
     fd_dir = proc_root / str(pid) / "fd"
     try:
         names = os.listdir(fd_dir)
+    except (FileNotFoundError, ProcessLookupError):
+        return [], True
     except OSError:
-        return []
+        return [], False
     targets: list[str] = []
+    complete = True
     for name in names:
         try:
             targets.append(os.readlink(fd_dir / name))
-        except OSError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
-    return targets
+        except OSError:
+            complete = False
+    return targets, complete
 
 
 def launch_tokens(pid: int, proc_root: Path = DEFAULT_PROC) -> list[str]:

@@ -698,6 +698,27 @@ class ResolveTests(unittest.TestCase):
             resolve_target(f"codex@{UUID_A[:7]}", self.endpoints)
         self.assertEqual(short.exception.code, "target_not_found")
 
+    def test_provider_id_form_forces_id_match(self) -> None:
+        # 与 Windows、跨设备目标同一写法：本机执行 + 远端复核时目标常照抄 provider@id:<完整ID>
+        def pick(selector: str) -> object:
+            try:
+                return resolve_target(selector, self.endpoints)
+            except ResolveError as error:  # D11：解析失败记为断言失败
+                self.fail(f"{selector} 解析失败：{error.code}")
+
+        self.assertIs(pick(f"codex@id:{UUID_A}"), self.codex)
+        self.assertIs(pick(f"CODEX@id: {UUID_A.upper()}"), self.codex)
+        self.assertIs(pick(f"codex@id:{UUID_A[:8]}"), self.codex)
+        for selector in (f"claude@id:{UUID_A}", "codex@id:", f"codex@id:{UUID_A[:7]}", "claude@id:vm"):
+            with self.subTest(selector), self.assertRaises(ResolveError) as missing:
+                resolve_target(selector, self.endpoints)
+            self.assertEqual(missing.exception.code, "target_not_found")
+        twins = [self.claude, self.other, endpoint(ref(Provider.CLAUDE, "4e24a95f-9999-2222-3333-444444444444",
+                                                        pid=4, pane="%4", label="x"))]
+        with self.assertRaises(ResolveError) as ambiguous:
+            resolve_target("claude@id:4e24a95f", twins)
+        self.assertEqual(ambiguous.exception.code, "target_ambiguous")
+
     def test_ambiguous_and_missing(self) -> None:
         with self.assertRaises(ResolveError) as ambiguous:
             resolve_target("vm", self.endpoints)

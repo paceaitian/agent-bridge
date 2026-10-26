@@ -474,6 +474,8 @@ class WorkerSpawnInventoryTests(unittest.TestCase):
         ("platforms/linux/lifecycle.py", ("run_capture",), "subprocess.run"), # 原git分支，不带errors参数
         ("platforms/linux/lifecycle.py", ("run_capture",), "subprocess.run"), # 原codex分支，errors=replace
         ("platforms/linux/lifecycle.py", ("spawn_worker",), "subprocess.Popen"),                  # 唯一的后台自调用
+        # §88.10 relay 的 SSH 子进程：连 hub 而非自调用，不需要 AB_STATE_DIR/AB_COMMAND；-F 专用配置、IdentityAgent none
+        ("federation/relay.py", ("connect", "ssh_connector"), "subprocess.Popen"),
     ]
 
     @staticmethod
@@ -511,7 +513,8 @@ class WorkerSpawnInventoryTests(unittest.TestCase):
 
     def test_background_spawn_is_owned_by_ensure_worker(self) -> None:
         background = [site for site in self.inventory() if site[2] in self.BACKGROUND_CALLS]
-        self.assertEqual(background, [("platforms/linux/lifecycle.py", ("spawn_worker",), "subprocess.Popen"),
+        self.assertEqual(background, [("federation/relay.py", ("connect", "ssh_connector"), "subprocess.Popen"),
+                                      ("platforms/linux/lifecycle.py", ("spawn_worker",), "subprocess.Popen"),
                                       ("platforms/windows/lifecycle.py", ("_spawn", "create"), "subprocess.Popen")])
         self.assertEqual([site for site in self.inventory() if site[2]=='.spawn_worker'],
                          [('worker.py', ('ensure_worker',), '.spawn_worker')])

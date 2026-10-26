@@ -130,6 +130,17 @@ class DiscoverySources:
     native_metadata: MetadataCache = field(default_factory=discovery_cache, compare=False)
     native_report: dict[str, object] = field(default_factory=dict, compare=False)
     platform: BridgePlatform = field(default_factory=get_platform, compare=False)
+    # 最近一次发现里没看全的 provider（目录读失败、预算截断、/proc 不可列举）；每次发现开始时清空。
+    # 确定无效的单条记录照常跳过、不算没看全（P5 联邦按它判「完整的空结果」与目录完整性）
+    incomplete: set[str] = field(default_factory=set, compare=False)
+
+    def provider_complete(self, provider: Provider) -> bool:
+        """最近一次发现是否看全了这个 provider。"""
+        return provider.value not in self.incomplete
+
+    def complete(self) -> bool:
+        """最近一次发现是否看全了全部 provider。"""
+        return not self.incomplete
 
     def __post_init__(self) -> None:
         # 保留显式注入的旧接缝；默认采样经组合根，不在类定义时做IO。
@@ -166,17 +177,25 @@ def _discover_claude(
     for root in roots:
         try:
             pending.append(iter(entry for entry in root.iterdir() if _REGISTRY_NAME.fullmatch(entry.name)))
+        except (FileNotFoundError, NotADirectoryError):
+            continue  # 这个候选根不存在：正常（没用过这个配置根）
         except OSError:
+            sources.incomplete.add(Provider.CLAUDE.value)
             continue
     # Round-robin under one global budget: legacy debris cannot starve live roots.
     while pending and len(files) < MAX_REGISTRY_FILES:
         for entries in tuple(pending):
             try:
                 files.append(next(entries))
-            except (StopIteration, OSError):
+            except (StopIteration, FileNotFoundError, NotADirectoryError):
+                pending.remove(entries)  # 读完，或候选根不存在（3.12 的 iterdir 到第一次 next 才真正列目录）
+            except OSError:
                 pending.remove(entries)
+                sources.incomplete.add(Provider.CLAUDE.value)
             if len(files) >= MAX_REGISTRY_FILES:
                 break
+    if pending:
+        sources.incomplete.add(Provider.CLAUDE.value)  # 预算截断：还有没读的注册记录
     files.sort()
     endpoints: list[Endpoint] = []
     for path in files:
@@ -184,7 +203,12 @@ def _discover_claude(
             if path.stat().st_size > MAX_REGISTRY_BYTES:
                 continue
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            continue  # 会话刚退出、记录已删
+        except OSError:
+            sources.incomplete.add(Provider.CLAUDE.value)
+            continue
+        except ValueError:
             continue
         if not isinstance(data, dict):
             continue
@@ -203,6 +227,9 @@ def _discover_claude(
         if data.get("kind") not in (None, "interactive"):
             continue
         info = procfs.read_process(pid, sources.proc_root)
+        if info is None and _alive_but_unreadable(pid, sources.proc_root, sources.uid):
+            sources.incomplete.add(Provider.CLAUDE.value)  # 进程还在、却核不了代际：不能当作已退出
+            continue
         if info is None or info.start_ticks != proc_start:
             continue  # 已退出或 PID 复用：注册表残留
         issues: list[str] = []
@@ -469,11 +496,18 @@ def codex_holdings(pid: int, proc_root: Path, home: Path) -> tuple[frozenset[str
     持有判定只有这一份实现，发现、doctor、调用者识别与汇报侧代际核对共用（DESIGN §53.3.4）：rollout 只认
     `<home>/sessions/` 下的 rollout 文件名里的 thread 段；lock 精确比对 `<home>/thread-writer-locks/<thread>.lock`。
     """
+    rollouts, locks, _complete = codex_holdings_scan(pid, proc_root, home)
+    return rollouts, locks
+
+
+def codex_holdings_scan(pid: int, proc_root: Path, home: Path) -> tuple[frozenset[str], frozenset[str], bool]:
+    """codex_holdings 加上这同一次 fd 扫描是否看全（任一 fd 读不到就不全，持有集可能缺项）。"""
     sessions_root = str(home / "sessions") + "/"
     locks_root = str(home / "thread-writer-locks") + "/"
     rollouts: set[str] = set()
     locks: set[str] = set()
-    for target in procfs.open_file_targets(pid, proc_root):
+    targets, complete = procfs.open_file_scan(pid, proc_root)
+    for target in targets:
         if target.startswith(sessions_root):
             match = _ROLLOUT.search(target)
             if match is not None:
@@ -483,18 +517,38 @@ def codex_holdings(pid: int, proc_root: Path, home: Path) -> tuple[frozenset[str
             lock = _WRITER_LOCK.fullmatch(target[len(locks_root):])
             if lock is not None:
                 locks.add(lock.group("uuid"))
-    return frozenset(rollouts), frozenset(locks)
+    return frozenset(rollouts), frozenset(locks), complete
 
 
-def scan_codex_holdings(proc_root: Path, home: Path) -> dict[int, CodexProcess]:
-    """本机全部 codex 进程的持有情况；发现与 doctor 共用（DESIGN §53.3.4）。"""
+def _alive_but_unreadable(pid: int, proc_root: Path, uid: int) -> bool:
+    """进程信息或 fd 读不到时区分「已退出」与「还在、却读不到」；只算同用户进程（别的用户的进程本来就读不全，不阻断发现）。"""
+    try:
+        return os.stat(proc_root / str(pid)).st_uid == uid
+    except OSError:
+        return False  # 已退出
+
+
+def scan_codex_holdings(proc_root: Path, home: Path, *, uid: int | None = None,
+                        unverified: set[int] | None = None) -> dict[int, CodexProcess]:
+    """本机全部 codex 进程的持有情况；发现与 doctor 共用（DESIGN §53.3.4）。
+
+    给了 uid 与 unverified 时，把「同用户、还在、却读不到身份或 fd」的进程记进 unverified：
+    发现据此标 Codex 本轮不完整，不把读不到当成目标已退出（Codex r3-P2-01）。fd 是否看全取自同一次扫描，
+    单个链接读不到、持有集只读到一部分都算（Codex r4-P2-01）。旧调用方不传，行为不变。
+    """
     processes: dict[int, CodexProcess] = {}
     for pid in procfs.list_pids(proc_root):
         info = procfs.read_process(pid, proc_root)
-        if info is None or info.comm != "codex":
+        if info is None:
+            if uid is not None and unverified is not None and _alive_but_unreadable(pid, proc_root, uid):
+                unverified.add(pid)
+            continue
+        if info.comm != "codex":
             continue
         tokens = procfs.launch_tokens(pid, proc_root)
-        rollouts, locks = codex_holdings(pid, proc_root, home)
+        rollouts, locks, complete = codex_holdings_scan(pid, proc_root, home)
+        if uid is not None and unverified is not None and not complete and _alive_but_unreadable(pid, proc_root, uid):
+            unverified.add(pid)
         processes[pid] = CodexProcess(info, codex_app_server(tokens), not _codex_non_interactive(tokens), rollouts, locks)
     return processes
 
@@ -507,7 +561,10 @@ def codex_daemon_mode(processes: Mapping[int, CodexProcess]) -> bool:
 def _discover_codex(
     sources: DiscoverySources, panes: Mapping[int, PaneInfo], runtime: ObserverView
 ) -> list[Endpoint]:
-    processes = scan_codex_holdings(sources.proc_root, sources.codex_home)
+    unverified: set[int] = set()
+    processes = scan_codex_holdings(sources.proc_root, sources.codex_home, uid=sources.uid, unverified=unverified)
+    if unverified:
+        sources.incomplete.add(Provider.CODEX.value)
     # 同一 thread 被几个进程打开 rollout（含非终端进程）：多于一个时消费者不唯一。在过滤非交互进程之前统计，
     # 并随端点按 thread 保留，解析出身份后按该 thread 重算（DESIGN §45.48 R1、Codex F03）；lock 只认候选、不计消费者
     # （别的进程扫 stale 锁会瞬时打开锁文件，DESIGN §53.3.6）
@@ -697,9 +754,13 @@ def _discover_grok(
     registry = sources.grok_home / "active_sessions.json"
     try:
         if registry.stat().st_size > MAX_REGISTRY_BYTES:
+            sources.incomplete.add(Provider.GROK.value)
             return []
         data = json.loads(registry.read_text(encoding="utf-8"))
+    except (FileNotFoundError, NotADirectoryError):
+        return []  # 没有注册表：没有 Grok 会话
     except (OSError, ValueError):
+        sources.incomplete.add(Provider.GROK.value)  # 读不到或整份解析失败：一条记录都没看到
         return []
     if not isinstance(data, list):
         return []
@@ -727,15 +788,21 @@ def _discover_grok(
     endpoints: list[Endpoint] = []
     for pid, sessions in sorted(listed.items()):
         info = procfs.read_process(pid, sources.proc_root)
+        if info is None and _alive_but_unreadable(pid, sources.proc_root, sources.uid):
+            sources.incomplete.add(Provider.GROK.value)  # 进程还在、却读不到身份：不能当作注册表残留
+            continue
         if info is None or info.comm != "grok":
             continue  # 注册表残留，或 PID 已被别的进程复用
         held: set[str] = set()
-        for target in procfs.open_file_targets(pid, sources.proc_root):
+        targets, complete = procfs.open_file_scan(pid, sources.proc_root)
+        for target in targets:
             if not target.startswith(sessions_root):
                 continue
             match = _GROK_EVENTS.search(target)
             if match is not None:
                 held.add(match.group("uuid").lower())
+        if not complete and _alive_but_unreadable(pid, sources.proc_root, sources.uid):
+            sources.incomplete.add(Provider.GROK.value)  # 这次 fd 扫描没看全：持有哪些会话无从核实
         live = [session for session in sessions if session in held]  # 两边都已归一小写
         pane = _pane_for(pid, panes, sources.proc_root)
         state = runtime.pane_runtime(pane.pane_id, Provider.GROK) if pane is not None else None
@@ -888,8 +955,15 @@ def discover(sources: DiscoverySources | None = None) -> list[Endpoint]:
 
 
 def _discover_selected(config: DiscoverySources) -> list[Endpoint]:
+    config.incomplete.clear()
     if config.platform.discovery is not Capability.VERIFIED:
+        config.incomplete.update(provider.value for provider in Provider)
         return []  # Windows W1不扫描provider、不将空持有集当root、不造伪pane。
+    try:
+        with os.scandir(config.proc_root) as entries:
+            next(entries, None)
+    except OSError:
+        config.incomplete.update(provider.value for provider in Provider)  # 三家都靠 /proc 核进程
     titles = config.titles()
     panes = {pid: _with_title(pane, titles.get(pane.pane_id)) for pid, pane in config.panes().items()}
     runtime = config.runtime()
@@ -962,7 +1036,7 @@ def _normalize(value: str) -> str:
 
 
 def resolve_target(selector: str, endpoints: list[Endpoint]) -> Endpoint:
-    """解析 `--to`：pane（%3）、完整会话 ID、provider@tmux会话名、tmux会话名、Claude 会话名或 ID 前缀。
+    """解析 `--to`：provider@id:<ID>、pane（%3）、完整会话 ID、provider@tmux会话名、tmux会话名、Claude 会话名或 ID 前缀。
 
     按以上优先级逐条匹配；某一条命中多个即报歧义，不挑第一个。
     """
@@ -979,6 +1053,18 @@ def resolve_target(selector: str, endpoints: list[Endpoint]) -> Endpoint:
             provider = None
         else:
             label = tail
+    if provider is not None and label.strip().lower().startswith("id:"):
+        # provider@id:<完整ID或≥8位唯一前缀>：强制按会话 ID（与 Windows、跨设备目标同一写法），不落到名字规则
+        wanted = label.strip()[3:].strip().lower()
+        same = [item for item in endpoints if item.ref.provider is provider]
+        found = tuple(item for item in same if wanted and item.ref.native_id.lower() == wanted)
+        if not found and len(wanted) >= 8:
+            found = tuple(item for item in same if item.ref.native_id.lower().startswith(wanted))
+        if len(found) == 1:
+            return found[0]
+        if found:
+            raise ResolveError("target_ambiguous", found)
+        raise ResolveError("target_not_found")
     normalized = _normalize(label)
     lowered = value.lower()
     rules: list[Callable[[Endpoint], bool]] = [

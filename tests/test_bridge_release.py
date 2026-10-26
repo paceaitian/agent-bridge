@@ -16,6 +16,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 def load(name):
     spec=importlib.util.spec_from_file_location(name.replace('-','_'),ROOT/'scripts'/f'{name}.py')
+    assert spec is not None and spec.loader is not None
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     return module
 
@@ -135,7 +136,10 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(set(ci.MODULES),{'test_bridge_windows','test_bridge_windows_streams','test_bridge_windows_codex','test_bridge_windows_discovery',
             'test_bridge_registration','test_bridge_labels','test_bridge_hints','test_bridge_windows_native','test_bridge_windows_callers',
             'test_bridge_windows_delivery','test_bridge_windows_boundaries','test_bridge_windows_roots',
-            'test_bridge_windows_roots_rework','test_bridge_windows_storage','test_bridge_local_display'})
+            'test_bridge_windows_roots_rework','test_bridge_windows_storage','test_bridge_local_display',
+            # P5 联邦（DESIGN §88.18）：可移植附件、Windows 交付模型、编解码与部署模板；联邦库用例因提权 CI 不进选择集
+            'test_bridge_federation_codec','test_bridge_federation_attachments','test_bridge_federation_windows',
+            'test_bridge_federation_packaging'})
         for name in ci.MODULES:self.assertTrue((ROOT/'tests'/f'{name}.py').is_file())
         native=(ROOT/'tests/test_bridge_windows_native.py').read_text()
         self.assertIn('if api.token(api.k.GetCurrentProcess()).elevated:',native)

@@ -1,0 +1,32 @@
+# ab 跨设备 relay（DESIGN §88.10）：普通用户的 systemd user service，只连 hub 收发，不投递；有作业时按需拉起 worker。
+# 安装属于 P5.2 运维窗口（另需授权）：复制到 ~/.config/systemd/user/，先 `ab federation enable …` 建库，
+# 再 `systemctl --user daemon-reload && systemctl --user enable --now agent-bridge-relay.service`。
+# 需要注销后继续运行时另行 `loginctl enable-linger`（按需授权）。
+[Unit]
+Description=ab cross-device relay (DESIGN §88.10)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 用安装器生成的 ab 入口（venv Python shebang，绑回集成状态根与命令名），不经 sh、不依赖交互 shell 的 PATH
+ExecStart=%h/.local/bin/ab federation relay
+# federation disable 后 relay 以 0 退出、不重启；需运维处理的停止状态（hub_state_lost、身份不符等）退出 8、不重启
+Restart=on-failure
+# 自动重连本身 ≥30 秒退避；服务级重启也不快于一分钟
+RestartSec=60s
+RestartPreventExitStatus=8
+# relay 拉起的 worker 与它同一 cgroup：停 relay 只停主进程，worker 按自身 120 秒空闲规则退出；
+# 被强杀时未完成的 intent 恢复为 UNKNOWN，不重投
+KillMode=process
+UMask=0077
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+# 可选的 provider 根显式覆盖（如 CODEX_HOME、CODEX_SQLITE_HOME、AB_CLAUDE_SESSIONS_DIR），一行一个 KEY=VALUE；
+# 默认按本机发现（含多 Claude 配置根），通常不需要
+EnvironmentFile=-%h/.config/agent-bridge/relay.env
+# 不加文件系统沙箱：worker 继承 relay 的挂载命名空间，只读 HOME 会让 Codex/Claude 投递失败
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

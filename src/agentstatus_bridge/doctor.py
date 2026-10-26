@@ -14,6 +14,7 @@ import sqlite3
 from . import __version__, summary
 from .caller_diagnostic import collect as caller_diagnostic
 from .endpoints import codex_title_report
+from .labels import reason_text
 from .naming import command_name
 from .platforms.factory import get_platform
 from .platforms.types import SampleState
@@ -141,6 +142,9 @@ def collect_checks() -> dict[str, object]:
             checks['storageSubreason'] = storage_subreason(error)
         if isinstance(files, WindowsPaths):
             checks['privateAclRepairObserved'] = files.acl_observation()
+        federation = federation_check()
+        if federation is not None:
+            checks['federation'] = federation
         return checks
     version = cli_version()
     root = state_dir()
@@ -190,7 +194,37 @@ def collect_checks() -> dict[str, object]:
         checks["ledgerOk"] = False
         checks["ledgerError"] = error.code
     checks['caller'] = caller_diagnostic()
+    federation = federation_check()
+    if federation is not None:
+        checks['federation'] = federation
     return checks
+
+
+def federation_check() -> dict[str, object] | None:
+    """optional federation 投影（DESIGN §88.12）：未启用为 None；任何失败只落在本投影里，不覆盖本机账本结论。"""
+    try:
+        from .federation.commands import doctor_projection  # layout: allow 联邦按需加载：未配置的机器不导入联邦实现
+        return doctor_projection(state_dir())
+    except Exception:  # 诊断不能因联邦故障而失败
+        return {"enabled": False, "ledgerReadable": False, "transport": "ssh-stdio", "state": "storage_failed",
+                "hubAccepted": False, "lastSeen": None, "reason": "unknown"}
+
+
+def federation_text(projection: dict[str, object]) -> str:
+    """doctor/federation status 的一行中文摘要（只计数，不列路径、不读 key）。"""
+    states = {"disabled": "已停用", "starting": "启动中", "connected": "已连接", "reconnecting": "重连中",
+              "offline": "离线", "auth_failed": "认证失败", "incompatible": "需运维处理", "storage_failed": "存储故障"}
+    state = str(projection.get("state"))
+    parts = [f"跨设备协作：{states.get(state, state)}"]
+    reason = projection.get("reason")
+    if isinstance(reason, str) and reason != "unknown":
+        parts.append(reason_text(reason))
+    for key, label in (("outboxPending", "待传"), ("outboxDeferred", "退避中"),
+                       ("authorityDecisionsPending", "待裁决报告")):
+        value = projection.get(key)
+        if isinstance(value, int) and value:
+            parts.append(f"{label} {value}")
+    return "；".join(parts)
 
 
 def print_checks(checks: dict[str, object]) -> None:
@@ -234,6 +268,9 @@ def print_checks(checks: dict[str, object]) -> None:
                   f"via={value.get('via')}；rejection={value.get('rejection')}；"
                   f"祖先链 termination={value.get('termination')}，长度={value.get('chainLength')}；"
                   f"最近 agent={value.get('nearestAgent')}")
+            continue
+        if key == 'federation' and isinstance(value, dict):
+            print(federation_text(value))  # pyright: ignore[reportUnknownArgumentType]
             continue
         if key == "codexQueueEvidence" and isinstance(value, dict):
             print(queue_evidence_text(value))

@@ -39,6 +39,9 @@ MIRROR_REPOSITORY = "agentstatus"
 MANIFEST_RELPATH = "docs/import-manifest.json"
 PORTABLE_TOOLS = ('scripts/mirror-bridge.py', 'scripts/build-bridge.py',
                   'scripts/verify-bridge-windows.py')
+# relay 服务模板属于 agent-bridge 本身：独立的 agent-bridge 要能自己部署 relay（两项目各自可单独运行）
+PORTABLE_PACKAGING = ('packaging/systemd/agent-bridge-relay.service',
+                      'packaging/windows/agent-bridge-relay.task.xml')
 
 
 def _test_candidates(root: Path) -> list[Path]:
@@ -64,6 +67,7 @@ def portable_paths(root: Path = ROOT) -> list[str]:
         portable_tests.append(path)
     paths.extend(path.relative_to(root).as_posix() for path in portable_tests)
     paths.extend(name for name in PORTABLE_TOOLS if (root/name).is_file())
+    paths.extend(name for name in PORTABLE_PACKAGING if (root/name).is_file())
     paths.extend(path.relative_to(root).as_posix()
                  for path in sorted((root/'scripts/windows').glob('*'))
                  if path.is_file() and path.suffix in {'.py','.ps1'})
@@ -118,7 +122,7 @@ def compare(root: Path, mirror: Path) -> dict[str, object]:
 def _target(mirror: Path, name: str) -> Path:
     parts = PurePosixPath(name).parts
     if (not parts or PurePosixPath(name).is_absolute() or '..' in parts or '\\' in name
-            or str(PurePosixPath(name)) != name or parts[0] not in {'src', 'tests', 'scripts', 'docs'}):
+            or str(PurePosixPath(name)) != name or parts[0] not in {'src', 'tests', 'scripts', 'docs', 'packaging'}):
         raise SystemExit('镜像清单路径不安全')
     target = mirror
     for part in parts:

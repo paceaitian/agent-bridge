@@ -8,12 +8,13 @@ from __future__ import annotations
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 from pathlib import Path
 import re
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import unicodedata
 
 from .platforms.factory import get_platform
@@ -22,7 +23,10 @@ from .ids import opaque_id, short
 from .labels import next_step, reason_text
 from .model import PHASE_LABELS, Attempt, EndpointRef, Phase, Provider, Task, TaskView, describe
 from .paths import device_name
-from .store import Store
+from .store import Store, StoreError
+
+if TYPE_CHECKING:
+    from .federation.fedstore import FederatedStore
 
 SUMMARY_NAME = "summary.json"
 LOCK_NAME = "summary.lock"
@@ -39,6 +43,10 @@ TITLE_CODEPOINTS = 80
 INDEX_TITLE_CODEPOINTS = 40
 LABEL_CODEPOINTS = 64
 ATTENTION_KINDS: tuple[str, ...] = ("result", "decision", "failure")
+# 有联邦实例时的组合新鲜度键（DESIGN §88.8）：两个库的 identity 与修订号同时进入摘要水位
+FEDERATION_CONFIG = "federation.json"
+FEDERATION_DB = "federation.sqlite3"
+FEDERATION_ID_TAG = "summary-fed-v1"
 STATE_LABELS: dict[str, str] = {
     "absent": "未生成",
     "ok": "正常",
@@ -167,13 +175,93 @@ def _observer_binding(
     return {"source": source, "pane": valid_pane, "observerKeys": keys}
 
 
-def read_ledger(store: Store) -> LedgerSnapshot:
-    """在同一 SQLite 读事务里取修订号与全部未结束任务，避免拼出不属于同一时刻的摘要。"""
+def read_ledger(store: Store, federation: FederatedStore | None = None) -> LedgerSnapshot:
+    """在同一 SQLite 读事务里取修订号与全部未结束任务，避免拼出不属于同一时刻的摘要。
+
+    有联邦实例时另在联邦库的读快照里取 identity/修订号与本设备实际执行的联邦投递，组合成同一水位（DESIGN §88.8）；
+    两库没有跨库事务：各自快照里的修订号随数据一起取，期间有新写入时水位偏旧，下一轮按组合键重建。
+    """
     with store.read_snapshot():
         ledger_id, revision = store.ledger_revision()
         tasks = [(task, store.attempts(task.id)) for task in store.list_tasks()]
-        deliveries = store.recent_deliveries(limit=DELIVERY_LIMIT)
-    return LedgerSnapshot(ledger_id, revision, tasks, deliveries)
+        local = store.recent_delivery_rows(limit=DELIVERY_LIMIT)
+    if federation is None:
+        return LedgerSnapshot(ledger_id, revision, tasks, [item for _, item in local])
+    with federation.read_snapshot():
+        instance, fed_revision = federation.revision()
+        remote = federation.recent_deliveries(limit=DELIVERY_LIMIT)
+    composite_id, composite_revision = combine_mark(ledger_id, revision, instance, fed_revision)
+    merged = merge_deliveries(local, [(at / 1000.0, item) for at, item in remote])
+    return LedgerSnapshot(composite_id, composite_revision, tasks, merged)
+
+
+def combine_mark(ledger_id: str, revision: int, fed_instance: str, fed_revision: int) -> tuple[str, int]:
+    """组合新鲜度键：ledgerId=SHA256(规范JSON["summary-fed-v1",本机,联邦实例])，修订号相加（两者都单调）。"""
+    material = json.dumps([FEDERATION_ID_TAG, ledger_id, fed_instance], ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest(), revision + fed_revision
+
+
+def merge_deliveries(*sources: list[tuple[float, dict[str, Any]]]) -> list[dict[str, Any]]:
+    """按内部投递时刻倒序合并去重，最多 DELIVERY_LIMIT 条；时刻不出 JSON。
+
+    同一 messageId 内容相同只留一条；内容不同（pane/provider/role 不一致）两条都不发布：
+    不能借错的 pane 静默别人的一轮（DESIGN §88.8）。
+    """
+    rows = sorted((row for source in sources for row in source), key=lambda row: row[0], reverse=True)
+    seen: dict[str, dict[str, Any]] = {}
+    conflicts: set[str] = set()
+    for _, item in rows:
+        key = str(item.get("messageId"))
+        previous = seen.get(key)
+        if previous is None:
+            seen[key] = item
+        elif previous != item:
+            conflicts.add(key)
+    merged: list[dict[str, Any]] = []
+    emitted: set[str] = set()
+    for _, item in rows:
+        key = str(item.get("messageId"))
+        if key in conflicts or key in emitted:
+            continue
+        emitted.add(key)
+        merged.append(item)
+    return merged[:DELIVERY_LIMIT]
+
+
+def open_federation(directory: Path) -> FederatedStore | None:
+    """有联邦实例（库或配置存在）时打开联邦库供摘要读取；都没有返回 None（摘要水位与旧版逐字相同）。
+
+    配置在而库缺失、或库打不开，都是「所需库不可读」：抛 summary_federation_unavailable，保持上一份摘要。
+    """
+    if not (directory / FEDERATION_DB).exists():
+        if (directory / FEDERATION_CONFIG).exists():
+            raise SummaryError("summary_federation_unavailable")
+        return None
+    from .federation.fedstore import FederatedStore  # layout: allow 联邦按需加载：无联邦实例的机器不导入
+    try:
+        return FederatedStore.open(directory)
+    except StoreError as error:
+        raise SummaryError("summary_federation_unavailable") from error
+
+
+def ledger_mark(store: Store, directory: Path, *, federation: FederatedStore | None = None) -> tuple[str, int]:
+    """publish/status/worker 共用的摘要水位：无联邦实例时就是本机 (ledgerId, revision)。
+
+    federation 给出时直接读这个已打开的联邦库（worker 每秒一轮，不必每次重开库、重做 Windows 私有目录核验）。
+    """
+    ledger_id, revision = store.ledger_revision()
+    opened = federation is None
+    current = open_federation(directory) if opened else federation
+    if current is None:
+        return ledger_id, revision
+    try:
+        instance, fed_revision = current.revision()
+    except StoreError as error:
+        raise SummaryError("summary_federation_unavailable") from error
+    finally:
+        if opened:
+            current.close()
+    return combine_mark(ledger_id, revision, instance, fed_revision)
 
 
 def build_document(snapshot: LedgerSnapshot, *, now: float, device: str) -> dict[str, Any]:
@@ -413,7 +501,15 @@ def publish(store: Store, directory: Path, *, force: bool = False, now: float | 
     """
     try:
         with _lock(directory):
-            snapshot = read_ledger(store)
+            federation = open_federation(directory)
+            try:
+                # 无联邦实例时调用形状与旧版相同
+                snapshot = read_ledger(store) if federation is None else read_ledger(store, federation)
+            except StoreError as error:
+                raise SummaryError("summary_federation_unavailable") from error
+            finally:
+                if federation is not None:
+                    federation.close()
             if not force:
                 existing = load(directory)
                 if (
@@ -457,7 +553,14 @@ def status(directory: Path, store: Store | None) -> dict[str, Any]:
             revision=document["ledgerRevision"], generatedAt=document["generatedAt"], overflow=document["overflow"]
         )
     if store is not None:
-        ledger_id, revision = store.ledger_revision()
+        try:
+            ledger_id, revision = ledger_mark(store, directory)
+        except SummaryError as error:
+            # 所需库不可读：保持上一份摘要并标落后，不以空的新鲜快照覆盖（DESIGN §88.8）
+            result["reason"] = error.code
+            if document is not None:
+                result["state"] = "stale"
+            return result
         result["ledgerRevision"] = revision
         if document is not None and (document["ledgerId"] != ledger_id or document["ledgerRevision"] != revision):
             result["state"] = "stale"

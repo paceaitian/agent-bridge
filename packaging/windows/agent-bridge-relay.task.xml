@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ab 跨设备 relay 的 Windows 计划任务模板（DESIGN §88.10）：当前用户登录后、InteractiveToken、Limited（LeastPrivilege）、
+  IgnoreNew、无执行时限、失败一分钟重启。不用 S4U/SYSTEM/最高权限，不塞进 RMUX/CloudCLI。
+  @USER@ 换成 DOMAIN\user（或 COMPUTER\user），@AB_EXE@ 换成已安装 release 的原生 ab 入口绝对路径（不经 MSYS/sh）。
+  注册属于 P5.2 运维窗口（另需授权），例如：
+    Register-ScheduledTask -TaskName agent-bridge-relay -Xml (Get-Content -Raw agent-bridge-relay.task.xml)
+  relay 启动时自己核真实令牌非提权；High 上下文在开库前拒绝（relay_elevated），任务配置不能替代这道核验。
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>ab cross-device relay (DESIGN §88.10)</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>@USER@</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>@USER@</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>@AB_EXE@</Command>
+      <Arguments>federation relay</Arguments>
+    </Exec>
+  </Actions>
+</Task>

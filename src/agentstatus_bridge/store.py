@@ -723,14 +723,18 @@ class Store:
         明确没送到的（pending/sending/cancelled/failed/denied/expired/refused）不发布。
         同时发布接收端点，消费者据此确认「这条消息确实是发给这个会话的」（审计 F05）。
         """
+        return [item for _, item in self.recent_delivery_rows(limit=limit)]
+
+    def recent_delivery_rows(self, *, limit: int = 64) -> list[tuple[float, dict[str, Any]]]:
+        """同 recent_deliveries，另带内部投递时刻（只供与联邦投递合并排序，不进摘要 JSON；DESIGN §88.8）。"""
         states = [delivery.value for delivery in _MAY_HAVE_ARRIVED]
         marks = ",".join("?" for _ in states)
         rows = self._conn.execute(
-            f"SELECT message_id, role, target, delivery_detail, options FROM attempts WHERE delivery IN ({marks})"
-            " AND delivery_at IS NOT NULL ORDER BY delivery_at DESC LIMIT ?",
+            f"SELECT message_id, role, target, delivery_detail, options, delivery_at FROM attempts"
+            f" WHERE delivery IN ({marks}) AND delivery_at IS NOT NULL ORDER BY delivery_at DESC LIMIT ?",
             (*states, int(limit)),
         ).fetchall()
-        deliveries: list[dict[str, Any]] = []
+        deliveries: list[tuple[float, dict[str, Any]]] = []
         for row in rows:
             message_id = row["message_id"]
             if not isinstance(message_id, str) or not _MESSAGE_RE.fullmatch(message_id):
@@ -752,7 +756,7 @@ class Store:
             # 结束回执单独标出：扩展据此静默它触发的那一轮，普通结果回执照常通知（DESIGN §45.31.7）
             if item["role"] == Role.NOTICE.value and _load_dict(row["options"]).get(NOTICE_KIND_OPTION) == CLOSURE_KIND:
                 item["kind"] = CLOSURE_KIND
-            deliveries.append(item)
+            deliveries.append((float(row["delivery_at"]), item))
         return deliveries
 
     def get_attempt(self, attempt_id: str) -> Attempt | None:

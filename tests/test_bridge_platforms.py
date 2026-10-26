@@ -1,5 +1,6 @@
 """W1-1：类型、平台选择与P/M/R合同。Windows仅空后端，不作实机能力声明。"""
 from dataclasses import replace
+import errno
 import json
 import importlib
 import os
@@ -212,3 +213,53 @@ print('ok')
                 patch.object(observer_dbus,'_observer_rows',return_value=[]) as read:
             source.titles(); source.panes(); source.runtime()
             self.assertEqual((run.call_count,read.call_count),(2,1))
+
+
+@unittest.skipIf(os.name == 'nt', 'Linux /proc 的 fd 链接')
+class OpenFileScanTests(unittest.TestCase):
+    """fd 扫描的完整性取自同一次扫描（Codex r4-P2-01）：退出与 fd 关闭算看全，读不到算没看全。"""
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.proc = FakeProc(Path(self._tmp.name) / 'proc')
+        self.proc.add(42, comm='codex', fds=('/x/a', '/x/b'))
+        self.fd_dir = self.proc.root / '42' / 'fd'
+
+    def scan(self):
+        return process.open_file_scan(42, self.proc.root)
+
+    def test_readable_scan_is_complete(self):
+        targets, complete = self.scan()
+        self.assertEqual((sorted(targets), complete), (['/x/a', '/x/b'], True))  # listdir 不保证顺序
+        self.assertEqual(sorted(process.open_file_targets(42, self.proc.root)), ['/x/a', '/x/b'])
+
+    def test_exited_process_is_complete_and_empty(self):
+        self.assertEqual(process.open_file_scan(4343, self.proc.root), ([], True))
+
+    def test_unlistable_fd_directory_is_incomplete(self):
+        listdir = os.listdir
+        def listing(path):
+            if Path(path) == self.fd_dir:
+                raise PermissionError(errno.EACCES, 'synthetic')
+            return listdir(path)
+        with patch.object(process.os, 'listdir', listing):
+            self.assertEqual(self.scan(), ([], False))
+
+    def test_one_unreadable_link_makes_the_scan_incomplete(self):
+        readlink = os.readlink
+        def read_link(path, *args, **kwargs):
+            if Path(path) == self.fd_dir / '3':
+                raise PermissionError(errno.EACCES, 'synthetic')
+            return readlink(path, *args, **kwargs)
+        with patch.object(process.os, 'readlink', read_link):
+            self.assertEqual(self.scan(), (['/x/b'], False))
+
+    def test_fd_closed_after_listing_is_still_complete(self):
+        readlink = os.readlink
+        def read_link(path, *args, **kwargs):
+            if Path(path) == self.fd_dir / '3':
+                raise FileNotFoundError(errno.ENOENT, 'closed')
+            return readlink(path, *args, **kwargs)
+        with patch.object(process.os, 'readlink', read_link):
+            self.assertEqual(self.scan(), (['/x/b'], True))
