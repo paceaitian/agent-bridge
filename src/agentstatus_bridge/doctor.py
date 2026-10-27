@@ -10,6 +10,7 @@ from collections.abc import Mapping
 import os
 from pathlib import Path
 import sqlite3
+import time
 
 from . import __version__, summary
 from .caller_diagnostic import collect as caller_diagnostic
@@ -225,6 +226,24 @@ def federation_text(projection: dict[str, object]) -> str:
         if isinstance(value, int) and value:
             parts.append(f"{label} {value}")
     return "；".join(parts)
+
+
+def relay_diagnostics_text(projection: dict[str, object] | None) -> list[str]:
+    """Windows relay 诊断三键的文字行（§90.6）。投影里没有这组字段（Linux、relay 未运行或运行未知）时一行也不输出。"""
+    if projection is None or "anchorWatch" not in projection:
+        return []
+    anchor, version, published = (projection.get("anchorWatch"), projection.get("relayVersion"),
+                                  projection.get("relayPublishedAt"))
+    if anchor is None or not isinstance(published, int):
+        return ["relay 发布观察：未知（诊断字段缺失或不合法）"]
+    lines = ["relay 锚点监视：" + ("已启用" if anchor == "active" else "不可用（结束计划任务不会随之停止 relay）"),
+             "relay 版本：" + (version if isinstance(version, str) else "未知")]
+    try:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(published // 1000))
+    except (OverflowError, OSError, ValueError):
+        stamp = str(published)
+    lines.append("relay 诊断发布于：" + stamp)
+    return lines
 
 
 def print_checks(checks: dict[str, object]) -> None:

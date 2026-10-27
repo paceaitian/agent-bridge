@@ -1151,15 +1151,12 @@ class TransportFailureTests(RelayTestCase):
     def test_retention_runs_while_hub_unreachable(self) -> None:
         relay = Relay(self.b.store, self.b.ident, self.b.config, self.b.paths, connect=self.dead,
                       clock=self.clock)
-        checks: list[int] = []
-
-        def should_stop() -> bool:
-            checks.append(1)
-            return len(checks) > 3
+        waits: list[float] = []
 
         with mock.patch.object(retention, "sweep") as sweep:
             try:
-                relay.run_forever(wait=lambda _s: None, should_stop=should_stop)
+                # 第一次断线后进入退避、等过一段即停：留存回收在退避开始前跑一轮（不靠数 should_stop 的调用次数）
+                relay.run_forever(wait=waits.append, should_stop=lambda: bool(waits))
             except OSError as error:  # D11
                 self.fail(f"连不上 hub 时 relay 崩出：{error!r}")
         self.assertEqual(sweep.call_count, 1)  # 断线退避期间也回收过期内容

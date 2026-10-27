@@ -5,6 +5,7 @@ import fcntl
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -91,6 +92,28 @@ class LinuxLifecycle:
     @staticmethod
     def close_lock(fd: int) -> None:
         os.close(fd)
+
+    @staticmethod
+    def probe_lock(path: Path) -> bool:
+        """只读瞬时探测已有锁文件是否被他人持有（DESIGN §90.6）：忙=True、可取=False。
+
+        O_RDONLY、不带 O_CREAT：锁文件或上级目录不存在时抛 FileNotFoundError，绝不新建；共享锁取到即释放。
+        O_NONBLOCK 让 FIFO 不在 open 上阻塞；打开后必须是普通文件且只有一个链接，否则抛 OSError 由调用方判未知
+        （目录也能 flock，不能把它当成「可取」；Codex AS90-I-C-P3-01）。
+        """
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOCTTY)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise OSError("relay_lock_untrusted")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
 
     @staticmethod
     def spawn_worker(directory: Path, env: Mapping[str, str]) -> None:

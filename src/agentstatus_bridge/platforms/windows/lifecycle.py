@@ -58,6 +58,32 @@ class WindowsLifecycle:
         finally:
             self._leases.pop(fd).__exit__(None, None, None)
 
+    def probe_lock(self, path: Path) -> bool:
+        """只读瞬时探测已有锁文件是否被他人持有（DESIGN §90.6）：忙=True、可取=False。
+
+        OPEN_EXISTING、只读数据访问，不经 lease/open_private_file/ensure_private：不建目录或文件、不修 ACL。
+        文件或路径不存在（2/3）抛 FileNotFoundError；其余失败（含拒绝访问）原样上抛，由调用方判未知。
+        句柄不进 _leases，本函数自己关闭。
+        """
+        try:
+            handle = self.api.open_file(str(path), read_data=True)
+        except OSError as error:
+            if getattr(error, 'winerror', None) in (2, 3):
+                raise FileNotFoundError(str(path)) from error
+            raise
+        try:
+            info = self.api.file_info(handle)
+            if info.attributes & 0x10 or info.links != 1:
+                raise OSError('windows_file_untrusted')
+            try:
+                self.api.lock(handle, shared=True)
+            except BlockingIOError:
+                return True
+            self.api.unlock(handle)
+            return False
+        finally:
+            self.api.close(handle)
+
     def worker_environment(self, base: Mapping[str, str]) -> dict[str, str]:
         env: dict[str, str] = {}
         for key, value in base.items():

@@ -102,8 +102,10 @@ META_KEYS = frozenset(
     {"hubId", "deviceId", "deviceName", "ledgerInstanceId", "fedRevision", "enabled", "relayGeneration",
      "inboxCursor", "receiptCursor", "directoryRevision", "directoryDigest", "ingressCatchup", "hubStateLost",
      "relayState", "relayLastSeen", "directoryLocalDigest", "budgetDeferredAt", "retentionCursor",
-     "incomingWriteFailedAt"}
+     "incomingWriteFailedAt", "relayAnchorWatch", "relayDistributionVersion", "relayPublishedAt"}
 )
+# relay 运行诊断三键（DESIGN §90.6）：只由 Windows relay 主线程整组发布；任一平台的 relay 启动时先清掉旧值
+RELAY_DIAGNOSTIC_KEYS = ("relayAnchorWatch", "relayDistributionVersion", "relayPublishedAt")
 
 
 def now_ms() -> int:
@@ -362,6 +364,43 @@ class FederatedStore:
             raise StoreError("federation_store_corrupt") from error
         return store
 
+    @classmethod
+    def open_readonly(cls, directory: Path) -> FederatedStore:
+        """状态投影用的只读连接（DESIGN §90.6）：mode=ro、query_only、50 ms busy；不设 WAL、不修 ACL、不建库、不迁移。
+
+        按普通只读读者参与 WAL 协调，读到的总是一致快照。SQLite 需要时会以调用方本人令牌补建标准 -wal/-shm
+        （owner 2026-10-27 决定放宽「不补建」：用 SQLite 做不到严格不补建，immutable 绕法会读到前后不一致的数据，
+        见 §90.13）；同用户普通令牌下与任何 ab 命令开库相同，Windows 提权令牌建出的属主由 §86 自愈。
+        只读连接关库时不做 checkpoint，补建的空辅助文件会留到下一个写连接关库时才删除（Opus P3-r2-1）。
+        不用 immutable，也不回退到可写打开；打不开时报 federation_store_unavailable，调用方把投影判为未知。
+        """
+        path = directory / FED_DB_NAME
+        if not path.exists():
+            raise StoreError("federation_store_missing")
+        try:
+            connection = sqlite3.connect(get_platform().files.sqlite_uri(path.absolute(), escaped=True), uri=True,
+                                         timeout=0.05, isolation_level=None)
+        except sqlite3.Error as error:
+            raise StoreError("federation_store_unavailable") from error
+        store = cls(connection, path)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > FED_SCHEMA_VERSION:
+                raise StoreError("federation_schema_too_new")
+            if version != FED_SCHEMA_VERSION:
+                raise StoreError("federation_store_corrupt")
+        except StoreError:
+            store.close()
+            raise
+        except sqlite3.OperationalError as error:
+            store.close()
+            raise StoreError("federation_store_unavailable") from error  # 忙、锁定、打不开
+        except sqlite3.DatabaseError as error:
+            store.close()
+            raise StoreError("federation_store_corrupt") from error  # 与可写 open() 同口径（Opus 实现审计 P3-5）
+        return store
+
     def _validate_files(self) -> None:
         if get_platform().name == "windows":
             get_platform().files.validate_database(self.path)  # pyright: ignore[reportAttributeAccessIssue]
@@ -492,6 +531,26 @@ class FederatedStore:
                 "INSERT INTO fed_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value),
             )
+
+    def clear_relay_diagnostics(self) -> None:
+        """relay 启动初始化：一笔短事务删掉上一代留下的三键（§90.6）。"""
+        with self._transaction() as conn:
+            conn.execute("DELETE FROM fed_meta WHERE key IN (?,?,?)", RELAY_DIAGNOSTIC_KEYS)
+
+    def publish_relay_diagnostics(self, *, anchor_watch: str, version: str | None, published_at: int) -> None:
+        """整组替换（§90.6）：同一事务先删三键再写本次有值的键，不依赖初始化清除成功；没有版本时旧版本随之删除。"""
+        values = [("relayAnchorWatch", anchor_watch), ("relayPublishedAt", str(published_at))]
+        if version is not None:
+            values.append(("relayDistributionVersion", version))
+        with self._transaction() as conn:
+            conn.execute("DELETE FROM fed_meta WHERE key IN (?,?,?)", RELAY_DIAGNOSTIC_KEYS)
+            conn.executemany("INSERT INTO fed_meta(key,value) VALUES (?,?)", values)
+
+    def relay_diagnostics(self) -> dict[str, str]:
+        """单条 SELECT 取齐三键并物化：三键来自同一 SQLite 读快照，不会拼出旧版本配新时间（§90.6）。"""
+        rows = self._conn.execute("SELECT key, value FROM fed_meta WHERE key IN (?,?,?)",
+                                  RELAY_DIAGNOSTIC_KEYS).fetchall()
+        return {str(row[0]): str(row[1]) for row in rows}
 
     def ledger_instance_id(self) -> str:
         value = self.meta("ledgerInstanceId")

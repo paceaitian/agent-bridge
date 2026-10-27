@@ -1,9 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  ab 跨设备 relay 的 Windows 计划任务模板（DESIGN §88.10、§89）：当前用户登录后、InteractiveToken、Limited（LeastPrivilege）、
+  ab 跨设备 relay 的 Windows 计划任务模板（DESIGN §88.10、§89、§90）：当前用户登录后、InteractiveToken、Limited（LeastPrivilege）、
   IgnoreNew、无执行时限。不用 S4U/SYSTEM/最高权限，不塞进 RMUX/CloudCLI。
   启动链 conhost.exe headless → cmd.exe /d /c → 已安装的 ab.cmd：交互令牌任务直接拉控制台程序会在桌面留一个常驻窗口、
-  关窗即停 relay；headless conhost 不显示窗口（P5.2 实机测试，AS-20261026-008）。ab.cmd 路径跨升级不变，升级后只需重启任务。
+  关窗即停 relay；headless conhost 不显示窗口（P5.2 实机测试，AS-20261026-008）。ab.cmd 路径跨升级不变。
+  Stop-ScheduledTask 只结束这个 action conhost，cmd、Python、relay 与 ssh 会留下（AS-20261026-023）；
+  参数 watch-launch-anchor（XML 注释里不能写双连字符）让 relay 持有该 conhost 的等待句柄，任务结束即走同一关闭路径（停 ssh、释放锁、保留 worker，§90）。
+  该参数只给支持它的版本用（旧版不认识会报参数错误）；维护先 Disable、Stop，再以 ab federation status 的 JSON 输出中
+  relayRunning 连续两次 false 确认停净后再换入口（DESIGN §90.7，由安装器执行）。
   conhost 会把自己的命令行切分后逐项重新转义，所以 ab.cmd 路径单独成一个参数（含空格时由 conhost 加引号，cmd 按规则 1 保留）；
   路径不得含 " & ( ) @ ^ | < > % ! 这些 cmd 特殊字符，注册前校验。
   登录触发器只负责登录即启动；看门狗是起点在过去、每 5 分钟无期限重复的时间触发器（登录触发器的重复要等触发器真正触发，
@@ -60,7 +64,7 @@
   <Actions Context="Author">
     <Exec>
       <Command>@SYSTEMROOT@\System32\conhost.exe</Command>
-      <Arguments>--headless "@SYSTEMROOT@\System32\cmd.exe" /d /c "@AB_CMD@" federation relay</Arguments>
+      <Arguments>--headless "@SYSTEMROOT@\System32\cmd.exe" /d /c "@AB_CMD@" federation relay --watch-launch-anchor</Arguments>
     </Exec>
   </Actions>
 </Task>

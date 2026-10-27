@@ -11,7 +11,9 @@ import base64
 import json
 import os
 import random
+import sqlite3
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -94,10 +96,11 @@ class HubConnection:
     """协议客户端（单线程）：写请求，按 requestId 收集响应帧，跟踪认证回复里的 commitCounter。"""
 
     def __init__(self, transport: FederationTransport, *, on_counter: Callable[[int], None],
-                 timeout: float = REQUEST_TIMEOUT_S) -> None:
+                 timeout: float = REQUEST_TIMEOUT_S, should_stop: Callable[[], bool] = lambda: False) -> None:
         self.transport = transport
         self._on_counter = on_counter
         self._timeout = timeout
+        self._should_stop = should_stop
 
     def _read(self) -> dict[str, Any]:
         try:
@@ -115,6 +118,8 @@ class HubConnection:
 
     def request(self, kind: str, **fields: Any) -> list[dict[str, Any]]:
         """发一个请求，返回属于它的全部帧（item/directory_snapshot 收齐后连同终结帧）；错误帧抛 CodecError。"""
+        if self._should_stop():
+            raise RelayStop("stopped")  # 停止已请求：不再发新请求（含附件 chunk），由 connect_and_run 收尾（§90.5）
         request_id = new_id()
         try:
             self.transport.write_frame({"type": kind, "requestId": request_id, **fields})
@@ -150,22 +155,40 @@ class SubprocessTransport(StreamTransport):
         assert process.stdout is not None and process.stdin is not None
         super().__init__(process.stdout, process.stdin)
         self.process = process
+        self._reap_lock = threading.Lock()  # 同一 Popen 的 terminate/kill/wait 串行：abort 与 close 不争 waitpid/信号
+
+    def abort(self) -> None:
+        """停止控制线程调用（DESIGN §90.5），幂等：唤醒读方，再结束并回收本连接的 ssh；不关 Python 流、不碰 worker。
+
+        ssh 退出后管道断开，阻塞在写 flush 上的主线程得到 BrokenPipe/OSError 返回。
+        """
+        self.wake()
+        with self._reap_lock:
+            self._reap()
 
     def close(self) -> None:
         # 先终止并回收子进程，再关流：后台读线程可能正阻塞在 readline 上、持有读端的锁，先关读端会一直等下去，
         # terminate 永远轮不到；写端 flush 也可能因对端不读而阻塞（Codex AS89-C-P2-04）。子进程退出后管道断开，
-        # 读线程读到 EOF 释放锁；远端按异常断开处理（hub 的 CAS 与重推本就覆盖断连）
-        if self.process.poll() is None:
+        # 读线程读到 EOF 释放锁；远端按异常断开处理（hub 的 CAS 与重推本就覆盖断连）。
+        # 控制线程正在 abort 时，这里在同一把锁上等它回收完，再关流（§90.5）
+        with self._reap_lock:
+            self._reap()
+        super().close()
+
+    def _reap(self) -> None:
+        if self.process.poll() is not None:
+            return
+        try:
             self.process.terminate()
+            self.process.wait(timeout=self.TERMINATE_GRACE_S)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
             try:
                 self.process.wait(timeout=self.TERMINATE_GRACE_S)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                try:
-                    self.process.wait(timeout=self.TERMINATE_GRACE_S)
-                except subprocess.TimeoutExpired:
-                    pass  # kill 之后仍未回收只可能是系统异常；不在关闭路径上无限等
-        super().close()
+                pass  # kill 之后仍未回收只可能是系统异常；不在关闭路径上无限等
+        except OSError:
+            pass  # 进程已在别处退出（ESRCH/拒绝访问）：交给 poll/wait 的结果，不在停止路径上抛
 
 
 def ssh_connector(config: FederationConfig, state_root: Path, *,
@@ -250,6 +273,7 @@ class Relay:
                  connect: Callable[[], FederationTransport],
                  directory: Callable[[], dict[str, Any]] | None = None,
                  on_work: Callable[[], bool | None] | None = None,
+                 on_tick: Callable[[], None] | None = None,
                  clock: Callable[[], int] = now_ms) -> None:
         self.store = store
         self.ident = ident
@@ -258,6 +282,8 @@ class Relay:
         self._connect = connect
         self._directory = directory
         self._on_work = on_work or (lambda: None)
+        self._on_tick = on_tick or (lambda: None)  # 主线程的诊断发布点（§90.6）：每轮循环与每段退避各调一次
+        self._should_stop: Callable[[], bool] = lambda: False
         self._clock = clock
         self._timers = _Timers()
         self._max_counter = 0
@@ -309,9 +335,12 @@ class Relay:
             self.store.set_meta("hubStateLost", "1")  # 新连接计数低于见过的最大值：hub 回退
             raise RelayStop("hub_state_lost")
         self._max_counter = persisted
-        transport.write_frame({"type": "hello_ack", "protocol": {"major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR},
-                               "capabilities": sorted(capabilities & REQUIRED_CAPABILITIES),
-                               "ledgerInstanceId": self.store.ledger_instance_id()})
+        try:
+            transport.write_frame({"type": "hello_ack", "protocol": {"major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR},
+                                   "capabilities": sorted(capabilities & REQUIRED_CAPABILITIES),
+                                   "ledgerInstanceId": self.store.ledger_instance_id()})
+        except OSError as error:
+            raise RelayStop("hub_unavailable") from error  # 管道已断（ssh 退出或被停止中止）：不当认证失败
         try:
             ready = transport.read_frame(timeout=REQUEST_TIMEOUT_S)
         except (TimeoutError, CodecError) as error:
@@ -327,7 +356,7 @@ class Relay:
         self.store.set_meta("ingressCatchup", "1")
         self._set_state("connected")
         self.store.set_meta("relayLastSeen", str(self._clock()))  # 本机最后认证活动（doctor lastSeen）
-        self.conn = HubConnection(transport, on_counter=self._observe_counter)
+        self.conn = HubConnection(transport, on_counter=self._observe_counter, should_stop=self._should_stop)
         return self.conn
 
     # ---- 一轮 ----
@@ -344,32 +373,47 @@ class Relay:
         self._periodic()
 
     def connect_and_run(self, *, cycles: int | None = None, wait: Callable[[float], None] = time.sleep,
-                        should_stop: Callable[[], bool] = lambda: False) -> str:
-        """建立一条连接并循环；cycles=None 时一直跑到断开或 should_stop（停用）。返回结束状态。"""
+                        should_stop: Callable[[], bool] = lambda: False, stopper: Any = None) -> str:
+        """建立一条连接并循环；cycles=None 时一直跑到断开或 should_stop。返回结束状态。
+
+        stopper（StopController）登记本条连接，停止时由它的控制线程中止 ssh（§90.5）。停止优先：
+        已请求停止时，读断、写断、协议错误与库忙都归 stopped，不重连、不当认证失败。
+        """
+        self._should_stop = should_stop
+        if should_stop():
+            return self._stopped()  # 停止后不再新建连接
         transport = self._connect()
+        if stopper is not None:
+            stopper.bind(transport)  # 停止先于绑定时，bind 立即中止这条新连接
         try:
             self.handshake(transport)
             done = 0
             while cycles is None or done < cycles:
+                self._on_tick()
                 if should_stop():
-                    self._set_state("offline")
-                    return "stopped"
+                    return self._stopped()
                 self.cycle()
                 done += 1
                 if cycles is None or done < cycles:
                     wait(1.0)
             return "connected"
         except RelayStop as stop:
+            if should_stop():
+                return self._stopped()
             self._set_state(stop.state if stop.state in STOP_STATES or stop.state == "auth_failed"
                             else "reconnecting")
             return stop.state
         except CodecError:
+            if should_stop():
+                return self._stopped()
             # 某个请求收到 hub 的错误帧而调用处没有专门处理：结束这条连接、按退避重连，不让 relay 进程崩出
             self._set_state("reconnecting")
             return "hub_unavailable"
         except StoreError as error:
             if not _storage_failure(error):
                 raise
+            if should_stop():
+                return self._stopped()
             # 收件分类之外的本机写遇到库忙/暂不可用：同样结束这条连接、按退避重连，不靠进程崩溃后的服务重启
             # （状态都已持久、hub 会重推；重连也不清空唤醒记录，Opus r2-P3-3）
             try:
@@ -379,15 +423,27 @@ class Relay:
             return "reconnecting"
         finally:
             self.conn = None
-            transport.close()
+            if stopper is not None:
+                stopper.unbind()
+            transport.close()  # SubprocessTransport：控制线程正在 abort 时在同一把锁上等它回收完 ssh
+
+    def _stopped(self) -> str:
+        """停止收尾：尽力写 offline 诊断，最多 1 秒、库忙就跳过；失败不挡连接关闭与释放单例锁（§90.5）。"""
+        try:
+            self.store.connection.execute("PRAGMA busy_timeout=1000")
+            self._set_state("offline")
+        except (StoreError, sqlite3.Error):
+            pass
+        return "stopped"
 
     def run_forever(self, *, wait: Callable[[float], None] = time.sleep,
-                    should_stop: Callable[[], bool] = lambda: False) -> str:
+                    should_stop: Callable[[], bool] = lambda: False, stopper: Any = None) -> str:
         """重连循环：退避 30s 起、健康 120 秒清零；停止类状态直接返回等运维处理。"""
+        self._should_stop = should_stop
         attempt = 0
         while not should_stop():
             started = time.monotonic()
-            state = self.connect_and_run(wait=wait, should_stop=should_stop)
+            state = self.connect_and_run(wait=wait, should_stop=should_stop, stopper=stopper)
             if state in STOP_STATES or state == "stopped":
                 return state
             if time.monotonic() - started >= HEALTHY_RESET_S:
@@ -395,13 +451,14 @@ class Relay:
             delay = AUTH_RETRY_S if state == "auth_failed" else reconnect_delay(
                 attempt, low=self.config.reconnect_min, high=self.config.reconnect_max)
             attempt += 1
-            self._retention_tick(self._clock())  # 长时间连不上 hub 也照常清过期内容
-            # 退避分段等待：停用后最多一秒内退出，不必等满重连间隔
+            self._retention_tick(self._clock())  # 长时间连不上 hub 也照常清过期内容（停止后不开始，见 _retention_tick）
+            # 退避分段等待：停止后最多一秒内结束等待，不必等满重连间隔
             while delay > 0 and not should_stop():
+                self._on_tick()
                 step = min(1.0, delay)
                 wait(step)
                 delay -= step
-        return "stopped"
+        return self._stopped()
 
     # ---- outbox ----
 
@@ -817,8 +874,11 @@ class Relay:
         self._retention_tick(now)
 
     def _retention_tick(self, now: int) -> None:
-        """每小时一轮留存回收；连着 hub 时在周期任务里跑，断线退避期间也跑（回收只碰本机库与自有目录）。"""
-        if now - self._timers.retention < RETENTION_INTERVAL_MS:
+        """每小时一轮留存回收；连着 hub 时在周期任务里跑，断线退避期间也跑（回收只碰本机库与自有目录）。
+
+        停止已请求时不开始新一轮（§90.5）。
+        """
+        if now - self._timers.retention < RETENTION_INTERVAL_MS or self._should_stop():
             return
         self._timers.retention = now
         try:
@@ -841,8 +901,8 @@ class Relay:
         self._woken = {msg_id: due for msg_id, due in self._woken.items() if msg_id in candidates}
         due = {msg_id for msg_id in candidates
                if msg_id in intents or msg_id not in self._woken or self._woken[msg_id][0] <= now}
-        if not due or self._on_work() is not True:
-            return  # 拉起失败/退避中，或 worker 已在跑（可能正要空闲退出）：都不记下，下个周期再看
+        if not due or self._should_stop() or self._on_work() is not True:
+            return  # 拉起失败/退避中/停止已请求，或 worker 已在跑（可能正要空闲退出）：都不记下，下个周期再看
         for msg_id in due - intents:
             previous = self._woken.get(msg_id)
             interval = REWAKE_MIN_MS if previous is None else min(previous[1] * 2, REWAKE_MAX_MS)

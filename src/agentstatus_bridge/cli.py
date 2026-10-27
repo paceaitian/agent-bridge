@@ -74,7 +74,7 @@ from .reports import ReportError, ReportInput, apply_report, file_reference
 from .store import ATTEMPT_WARNING_THRESHOLD, DB_NAME, MAX_BODY_BYTES, Store, StoreError
 from .closure import ACCEPTED, CLOSED, ClosureOutcome, queue_closures
 from .dispatch import needs_worker, select_generation
-from .doctor import collect_checks, federation_text, print_checks
+from .doctor import collect_checks, federation_text, print_checks, relay_diagnostics_text
 from .views import (
     _no_pane_warning,
     _NO_HINT,
@@ -1680,17 +1680,20 @@ def cmd_federation(args: argparse.Namespace) -> int:
         return EXIT_OK
     if action == "disable":
         fed.disable(root)
-        print("跨设备协作已停用：relay 会在一秒内退出，worker 不再领取跨设备作业；数据与附件保留，本机协作照常")
+        print("跨设备协作已停用：relay 约一秒内察觉，随后中止连接、释放锁后退出（是否已停以 federation status 为准）；"
+              "worker 不再领取跨设备作业；数据与附件保留，本机协作照常")
         return EXIT_OK
     if action == "status":
-        projection = fed.doctor_projection(root)
+        # 顶层 relayRunning 先于联邦投影取得，所有分支都有（DESIGN §90.6）；维护只解析 JSON，null 绝非 false
+        status = fed.federation_status(root)
         if args.json:
-            _print_json({"federation": projection})
+            _print_json(status)
             return EXIT_OK
-        if projection is None:
-            print(reason_text("federation_not_configured"))
-            return EXIT_OK
-        print(federation_text(projection))
+        projection, running = status["federation"], status["relayRunning"]
+        print(reason_text("federation_not_configured") if projection is None else federation_text(projection))
+        print("relay 进程：" + ("运行中" if running is True else "未运行" if running is False else "未知"))
+        for line in relay_diagnostics_text(projection):
+            print(line)
         return EXIT_OK
     if action == "rebuild":
         outcome = fed.rebuild(root, hub_id=args.hub_id, device_id=args.device_id)
@@ -1701,7 +1704,7 @@ def cmd_federation(args: argparse.Namespace) -> int:
                   "旧任务可在发起设备本机 close，确认对方没收到后再 send 新任务")
         return EXIT_OK
     if action == "relay":
-        state = fed.run_relay(root, once=args.once)
+        state = fed.run_relay(root, once=args.once, watch_anchor=args.watch_launch_anchor)
         if state in ("connected", "stopped", "already_running"):
             return EXIT_OK
         _report_error(args, state)
@@ -1867,6 +1870,8 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     fed_status.add_argument("--json", action="store_true")
     relay = federation_actions.add_parser("relay", help="运行 relay（通常由用户服务/计划任务拉起）")
     relay.add_argument("--once", action="store_true", help="只连一次、跑一轮")
+    relay.add_argument("--watch-launch-anchor", action="store_true",
+                       help="Windows 计划任务用：启动它的 conhost 结束时随之停止（DESIGN §90）；其他平台忽略")
     rebuild = federation_actions.add_parser("rebuild", help="灾难换 hub：hub 换新 hubId 并重新登记本机后使用")
     rebuild.add_argument("--hub-id", required=True, help="新 hub 的 hubId")
     rebuild.add_argument("--device-id", help="本机联邦库丢失时 hub 新登记的 deviceId（库完整时保留原 ID，不用给）")
@@ -1982,8 +1987,11 @@ def _run_command(args: argparse.Namespace) -> int:
                           + '  [root] 状态未知' + ('  ' + issues if issues else ''))
             _revive_for_federation()  # 这个入口不开本机账本、不走通用补查：只按联邦待办补拉（Codex r3-P2-02）
             return EXIT_OK
-    # 任一调用前后补查摘要：提交后未发布（进程被杀、锁超时）的窗口由下一次调用收敛；worker 与 summary 自行处理
-    refresh = args.command not in {"worker", "summary"} and not (get_platform().name == 'windows' and args.command == 'wait')
+    # 任一调用前后补查摘要：提交后未发布（进程被杀、锁超时）的窗口由下一次调用收敛；worker 与 summary 自行处理。
+    # federation status/relay 前后都不补（DESIGN §90.6）：status 是维护判停的只读查询，不连主账本、不写摘要、不拉 worker；
+    # relay 启动取锁与退出清理不被主账本争用拖住
+    refresh = (args.command not in {"worker", "summary"} and not (get_platform().name == 'windows' and args.command == 'wait')
+               and not (args.command == "federation" and args.federation_action in {"status", "relay"}))
     if refresh:
         _refresh_summary()
     try:

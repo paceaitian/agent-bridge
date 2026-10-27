@@ -10,22 +10,35 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import unittest
 from typing import Any
 
 from agentstatus_bridge.federation.relay import SubprocessTransport
 
 
-class SubprocessTransportCloseTests(unittest.TestCase):
-    def spawn(self, code: str) -> subprocess.Popen[bytes]:
+class ChildMixin(unittest.TestCase):
+    def spawn(self, code: str, *args: str) -> subprocess.Popen[bytes]:
         """拉起只做 sleep 的本地子进程；先等它在 stdout 写出 READY，确认已就绪（含信号处理器已装好）。"""
-        process = subprocess.Popen([sys.executable, "-I", "-c", code], stdin=subprocess.PIPE,
+        process = subprocess.Popen([sys.executable, "-I", "-c", code, *args], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.addCleanup(self._reap, process)
         assert process.stdout is not None
         self.assertEqual(process.stdout.readline().strip(), b"READY")
         return process
+
+    @staticmethod
+    def _kill_pid(pid: int) -> None:
+        """结束测试自己拉起的孙进程（按精确 PID，不按名字）；已退出则忽略。"""
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
+            else:
+                os.kill(pid, 9)
+        except OSError:
+            pass
 
     @staticmethod
     def _reap(process: subprocess.Popen[bytes]) -> None:
@@ -57,6 +70,9 @@ class SubprocessTransportCloseTests(unittest.TestCase):
         self.assertTrue(reader.closed and writer.closed)
         self.assertTrue(transport._closed)  # pyright: ignore[reportPrivateUsage]
 
+
+
+class SubprocessTransportCloseTests(ChildMixin):
     def test_close_terminates_a_silent_child_while_the_reader_is_blocked(self) -> None:
         process = self.spawn("import sys, time; print('READY', flush=True); time.sleep(60)")
         transport = SubprocessTransport(process)
@@ -83,6 +99,84 @@ class SubprocessTransportCloseTests(unittest.TestCase):
         self.close_within(transport, 5.0)
         self.assert_closed(transport, process)
         self.assertEqual(process.returncode, 0)
+
+
+
+class SubprocessTransportAbortTests(ChildMixin):
+    """§90.5：停止控制线程的 abort 唤醒阻塞的读与写、回收子进程、幂等，且不关 Python 流（流由主线程 close 关）。"""
+
+    def in_thread(self, target: Any) -> tuple[threading.Thread, list[Any]]:
+        results: list[Any] = []
+
+        def run() -> None:
+            try:
+                results.append(target())
+            except BaseException as error:  # noqa: BLE001  带回主线程判定
+                results.append(error)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        return worker, results
+
+    def test_abort_wakes_a_reader_blocked_in_the_queue(self) -> None:
+        # 孙进程继承 stdout 并一直开着：结束子进程也等不到 EOF，只有停止哨兵能唤醒读方（不能等 60 秒读超时）
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "grandchild.pid")
+            process = self.spawn(
+                "import subprocess, sys, time\n"
+                "g = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(60)'])\n"
+                "open(sys.argv[1], 'w').write(str(g.pid))\n"
+                "print('READY', flush=True); time.sleep(60)", marker)
+            grandchild = int(open(marker).read())
+        self.addCleanup(self._kill_pid, grandchild)
+        transport = SubprocessTransport(process)
+        reader, results = self.in_thread(lambda: transport.read_frame(timeout=60.0))
+        reader.join(0.3)
+        self.assertTrue(reader.is_alive(), "读方应阻塞在队列上")
+        started = time.monotonic()
+        transport.abort()
+        reader.join(5.0)
+        self.assertFalse(reader.is_alive(), "abort 没有唤醒读方")
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertEqual(results, [None])  # 停止按 EOF 返回，之后的读也一样
+        self.assertIsNone(transport.read_frame(timeout=0.01))
+        self.assertIsNotNone(process.returncode)  # abort 自己回收了子进程
+        writer: Any = transport._writer  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(writer.closed)  # 控制线程不关 Python 流
+        transport.abort()  # 幂等
+        self._kill_pid(grandchild)  # 释放管道，读线程才会退出 readline、close 才能关读端
+        self.close_within(transport, 5.0)
+        self.assert_closed(transport, process)
+
+    def test_abort_unblocks_a_writer_stuck_on_a_full_pipe(self) -> None:
+        process = self.spawn("import sys, time; print('READY', flush=True); time.sleep(60)")  # 从不读 stdin
+        transport = SubprocessTransport(process)
+        frame = {"type": "heartbeat", "requestId": "0" * 32, "pad": "x" * (512 * 1024)}  # 单帧不超 1 MiB 上限
+
+        def flood() -> None:
+            for _ in range(64):  # 32 MiB 远超管道缓冲：对端不读时必然阻塞在 flush 上
+                transport.write_frame(frame)
+
+        writer, results = self.in_thread(flood)
+        writer.join(0.5)
+        self.assertTrue(writer.is_alive(), "写方应阻塞在满管道上")
+        transport.abort()
+        writer.join(10.0)
+        self.assertFalse(writer.is_alive(), "abort 没有让阻塞的写返回")
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], OSError)
+        self.close_within(transport, 5.0)
+        self.assertIsNotNone(process.returncode)
+
+    def test_abort_and_close_race_without_errors(self) -> None:
+        process = self.spawn("import sys, time; print('READY', flush=True); time.sleep(60)")
+        transport = SubprocessTransport(process)
+        aborter, results = self.in_thread(transport.abort)
+        self.close_within(transport, 15.0)
+        aborter.join(15.0)
+        self.assertFalse(aborter.is_alive())
+        self.assertEqual(results, [None])
+        self.assert_closed(transport, process)
 
 
 if __name__ == "__main__":

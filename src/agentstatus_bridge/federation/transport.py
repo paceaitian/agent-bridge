@@ -30,6 +30,7 @@ class FederationTransport(Protocol):
 
 
 _EOF = object()
+_STOP = object()  # 停止唤醒哨兵（DESIGN §90.5）：不是线上帧，只让阻塞在 queue.get 的主线程立即返回
 
 
 class StreamTransport:
@@ -43,6 +44,7 @@ class StreamTransport:
         self._writer = writer
         self._queue: queue.Queue[object] = queue.Queue(maxsize=READ_QUEUE_FRAMES)
         self._closed = False
+        self._stopping = False
         self._thread = threading.Thread(target=self._pump, name="federation-reader", daemon=True)
         self._thread.start()
 
@@ -64,11 +66,23 @@ class StreamTransport:
                 return
             self._queue.put(frame)
 
+    def wake(self) -> None:
+        """停止已请求：之后的读一律按 EOF 返回，并投一个哨兵唤醒正阻塞在读上的线程（队列满说明读方没在等）。"""
+        self._stopping = True
+        try:
+            self._queue.put_nowait(_STOP)
+        except queue.Full:
+            pass
+
     def read_frame(self, timeout: float | None = None) -> dict[str, Any] | None:
+        if self._stopping:
+            return None
         try:
             item = self._queue.get(timeout=timeout)
         except queue.Empty as error:
             raise TimeoutError from error
+        if item is _STOP or self._stopping:
+            return None
         if item is _EOF:
             self._queue.put(_EOF)  # 之后的读也立即得到 EOF
             return None

@@ -99,9 +99,11 @@ class WindowsTaskTests(unittest.TestCase):
 
     def test_runs_ab_cmd_under_headless_conhost(self) -> None:
         # §89：交互令牌任务直接拉控制台程序会留常驻窗口；headless conhost 无窗口，ab.cmd 路径跨升级不变
+        # §90：relay 监视启动它的 action conhost，Stop-ScheduledTask 结束 conhost 时随之停止
         self.assertEqual(self.text("t:Actions/t:Exec/t:Command"), "@SYSTEMROOT@\\System32\\conhost.exe")
         self.assertEqual(self.text("t:Actions/t:Exec/t:Arguments"),
-                         '--headless "@SYSTEMROOT@\\System32\\cmd.exe" /d /c "@AB_CMD@" federation relay')
+                         '--headless "@SYSTEMROOT@\\System32\\cmd.exe" /d /c "@AB_CMD@" federation relay'
+                         ' --watch-launch-anchor')
 
     def test_only_documented_placeholders(self) -> None:
         self.assertEqual(set(re.findall(r"@[A-Z_]+@", TASK.read_text(encoding="utf-8"))),
@@ -119,7 +121,8 @@ class WindowsTaskTests(unittest.TestCase):
         root = ET.fromstring(text)
         self.assertEqual(root.findtext("t:Actions/t:Exec/t:Command", namespaces=NS), r"C:\Windows\System32\conhost.exe")
         self.assertEqual(root.findtext("t:Actions/t:Exec/t:Arguments", namespaces=NS),
-                         r'--headless "C:\Windows\System32\cmd.exe" /d /c "C:\Users\A B\.local\bin\ab.cmd" federation relay')
+                         r'--headless "C:\Windows\System32\cmd.exe" /d /c "C:\Users\A B\.local\bin\ab.cmd" federation relay'
+                         ' --watch-launch-anchor')
         self.assertEqual(root.findtext("t:Principals/t:Principal/t:UserId", namespaces=NS), r"PC\A & B")
 
     def test_command_line_reaches_ab_cmd_through_conhost_and_cmd(self) -> None:
@@ -130,7 +133,7 @@ class WindowsTaskTests(unittest.TestCase):
             for reescape in (True, False):
                 with self.subTest(path=path, reescape=reescape):
                     self.assertEqual(_run_chain(arguments.replace("@AB_CMD@", path), reescape),
-                                     (path, "federation relay"))
+                                     (path, "federation relay --watch-launch-anchor"))
 
     def test_cmd_special_characters_in_the_path_are_not_supported(self) -> None:
         # 模板注释写明 ab.cmd 路径不得含 cmd 特殊字符（注册前校验）：模型里 & 会把命令拆开

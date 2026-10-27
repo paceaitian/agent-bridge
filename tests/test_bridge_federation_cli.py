@@ -853,6 +853,8 @@ class RelayRuntimeTests(unittest.TestCase):
         relay.connect_and_run = connect_and_run  # type: ignore[method-assign]
         relay._clock = lambda: 0  # pyright: ignore[reportPrivateUsage]  半构造对象：退避期间的留存回收不在本例范围
         relay._retention_tick = lambda _now: None  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
+        relay._on_tick = lambda: None  # pyright: ignore[reportPrivateUsage]  诊断发布点（§90.6）不在本例范围
+        relay.store = Mock()  # 停止时尽力写 offline（§90.5）
 
         def wait(seconds: float) -> None:
             waits.append(seconds)
@@ -943,7 +945,7 @@ class RelayRuntimeTests(unittest.TestCase):
                 def connect_and_run(self, **kwargs: Any) -> str:
                     return "ok"
 
-            rt = SimpleNamespace(store=None, ident=None, config=None, close=lambda: None,
+            rt = SimpleNamespace(store=Mock(), ident=None, config=None, close=lambda: None,
                                  paths=RelayPaths(Path("/nonexistent"), windows=windows))
             with self.subTest(windows=windows), tempfile.TemporaryDirectory() as tmp, \
                     patch.object(fed_commands, "_require_unelevated"), \

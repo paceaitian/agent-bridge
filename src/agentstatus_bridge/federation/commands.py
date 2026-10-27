@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -44,6 +45,8 @@ from .errors import FedCliError
 from .fedstore import FED_DB_NAME, FederatedStore, FedAttempt, FedTask, load_dict, now_ms
 from .refs import TargetRef, WireActor
 from .relay import STOP_STATES, Relay, RelayPaths, ssh_connector
+from .relay_control import RelayDiagnostics, StopController, config_disabled, install_sigterm
+from .relay_control import valid_distribution_version
 from .views import model_attempt, model_attempts, model_task
 
 RELAY_LOCK = "federation-relay.lock"
@@ -120,19 +123,17 @@ def try_runtime(root: Path) -> Runtime | None:
         return None
 
 
-def relay_running(root: Path) -> bool:
-    """瞬时共享锁探测 relay 是否在运行（与 worker 同一口径）。"""
-    lifecycle = get_platform().lifecycle
-    fd = lifecycle.open_lock(root / RELAY_LOCK)
+def relay_running(root: Path) -> bool | None:
+    """只读瞬时探测 relay 单例锁（DESIGN §90.6）：忙=True，可取=False，根或锁不存在=False，权限/IO 异常=None。
+
+    不新建根或锁、不修 ACL、不打开任何 SQLite；只回答探测当时是否有人持有锁，不证明 hub 已连接。
+    """
     try:
-        lifecycle.try_lock(fd, shared=True)
-    except BlockingIOError:
-        return True
-    else:
-        lifecycle.unlock(fd)
+        return get_platform().lifecycle.probe_lock(root / RELAY_LOCK)
+    except FileNotFoundError:
         return False
-    finally:
-        lifecycle.close_lock(fd)
+    except OSError:
+        return None
 
 
 # ---- 目标 ----
@@ -677,8 +678,13 @@ def _rebuild_locked(root: Path, *, hub_id: str, device_id: str | None) -> dict[s
 # ---- relay 入口 ----
 
 
-def run_relay(root: Path, *, once: bool = False, connector: Callable[[], Any] | None = None) -> str:
-    """`federation relay`：单例锁、开库前核非提权令牌与 stateRoot，跑重连循环；停用即退出。"""
+def run_relay(root: Path, *, once: bool = False, connector: Callable[[], Any] | None = None,
+              watch_anchor: bool = False) -> str:
+    """`federation relay`：单例锁、开库前核非提权令牌与 stateRoot，跑重连循环；停用、SIGTERM 或任务结束即退出。
+
+    启动顺序（DESIGN §90.5）：取单例锁 → 开 runtime → Windows 按需绑定 launch anchor → 初始化诊断 →
+    主线程接管 SIGTERM、启动停止控制线程 → 连接。重复启动先因锁退出，不扫描祖先、不改诊断。
+    """
     lifecycle = get_platform().lifecycle
     fd = lifecycle.open_lock(root / RELAY_LOCK)
     try:
@@ -690,12 +696,27 @@ def run_relay(root: Path, *, once: bool = False, connector: Callable[[], Any] | 
         _require_unelevated()
         rt = open_runtime(root)
         try:
-            relay = Relay(rt.store, rt.ident, rt.config, rt.paths,
-                          connect=connector or ssh_connector(rt.config, root, windows=rt.paths.windows),
-                          directory=directory_source(rt), on_work=worker_starter(root))
-            if once:
-                return relay.connect_and_run(cycles=1, wait=lambda _s: None)
-            return relay.run_forever(should_stop=lambda: _disabled(root))
+            controller = StopController(read_disabled=lambda: config_disabled(root),
+                                        anchor=_launch_anchor() if watch_anchor and rt.paths.windows else None)
+            try:
+                diagnostics = RelayDiagnostics(rt.store, controller, windows=rt.paths.windows)
+                diagnostics.initialize()  # 先清上一代三键；Windows 随即整组发布本次值
+                restore = install_sigterm(controller)
+                try:
+                    controller.start()  # 线程创建失败也要恢复原 SIGTERM 处理函数
+                    relay = Relay(rt.store, rt.ident, rt.config, rt.paths,
+                                  connect=connector or ssh_connector(rt.config, root, windows=rt.paths.windows),
+                                  directory=directory_source(rt), on_work=worker_starter(root), on_tick=diagnostics.tick)
+                    if once:
+                        state = relay.connect_and_run(cycles=1, wait=lambda _s: None, should_stop=controller.is_set,
+                                                      stopper=controller)
+                    else:
+                        state = relay.run_forever(should_stop=controller.is_set, stopper=controller)
+                finally:
+                    restore()
+            finally:
+                controller.close()
+            return "stop_controller_failed" if controller.reason == "stop_controller_failed" else state
         finally:
             rt.close()
     finally:
@@ -703,12 +724,16 @@ def run_relay(root: Path, *, once: bool = False, connector: Callable[[], Any] | 
         lifecycle.close_lock(fd)
 
 
-def _disabled(root: Path) -> bool:
+def _launch_anchor() -> Any:
+    """Windows 任务模板带 --watch-launch-anchor 时绑定 action conhost；定位不到或出错都按 unavailable 继续服务。"""
+    from ..platforms.windows import anchor  # layout: allow Windows launch anchor，只在 Windows relay 启动时加载
+    api: Any = getattr(get_platform().transport, "api", None)
+    if api is None:
+        return None
     try:
-        current = fed_config.load(root)
-    except fed_config.ConfigError:
-        return True
-    return current is None or not current.enabled
+        return anchor.bind(api, pid=os.getpid(), system_root=os.environ.get("SystemRoot"))
+    except Exception:  # 定位失败不是 relay 失败（§90.6）
+        return None
 
 
 def worker_starter(root: Path, *, start: Callable[[Path], bool] = ensure_worker,
@@ -782,8 +807,36 @@ def directory_source(rt: Runtime) -> Callable[[], dict[str, Any]]:
 # ---- doctor 投影 ----
 
 
-def doctor_projection(root: Path, *, now: int | None = None) -> dict[str, Any] | None:
-    """doctor 的 optional federation 投影（§88.12）：不读 key、不连 hub；失败只写进本投影，不覆盖本机账本结论。"""
+_PROBE = object()  # doctor_projection 未给 running 时现场探锁
+ANCHOR_WATCH_STATES = frozenset({"active", "unavailable"})
+
+
+def relay_diagnostics_projection(raw: dict[str, str]) -> dict[str, Any]:
+    """Windows 三键 → 投影（§90.6）：必需键 relayAnchorWatch 与 relayPublishedAt 缺一或不合法时整组未知（null）；
+
+    版本可选（Opus r3 P3-3），缺失或不合法只让 relayVersion 为 null。
+    """
+    anchor, published = raw.get("relayAnchorWatch"), raw.get("relayPublishedAt")
+    if (anchor not in ANCHOR_WATCH_STATES or published is None or not published.isascii()
+            or not published.isdecimal() or len(published) > 19):
+        return {"anchorWatch": None, "relayVersion": None, "relayPublishedAt": None}
+    version = raw.get("relayDistributionVersion")
+    return {"anchorWatch": anchor, "relayVersion": version if valid_distribution_version(version) else None,
+            "relayPublishedAt": int(published)}
+
+
+def federation_status(root: Path, *, now: int | None = None) -> dict[str, Any]:
+    """`federation status --json` 的整体（§90.6）：先取顶层 relayRunning，再做可选联邦投影；投影失败不丢运行事实。"""
+    running = relay_running(root)
+    return {"relayRunning": running, "federation": doctor_projection(root, now=now, running=running)}
+
+
+def doctor_projection(root: Path, *, now: int | None = None, running: object = _PROBE) -> dict[str, Any] | None:
+    """doctor 的 optional federation 投影（§88.12/§90.6）：不读 key、不连 hub；失败只写进本投影，不覆盖本机账本结论。
+
+    联邦库走只读 SQL（不设 WAL、不修 ACL、不迁移）；running 是本次已探得的锁事实（status 先探再投影），未给则现场探。
+    Windows 上 relay 在跑时附带同快照读取的三键诊断；Linux 不发布这组字段，投影里也不出现。
+    """
     try:
         config = fed_config.load(root)
     except fed_config.ConfigError:
@@ -803,46 +856,66 @@ def doctor_projection(root: Path, *, now: int | None = None) -> dict[str, Any] |
                       storageSubreason="federation_store_missing")
         return result
     try:
-        store = FederatedStore.open(root)
+        store = FederatedStore.open_readonly(root)
     except StoreError as error:
         result.update(reason="unknown", storageReason="federation_store_unavailable", storageSubreason=error.code)
         return result
     with store:
         try:
-            mismatch = store.device_id() != config.device_id
-        except StoreError:
-            mismatch = True
-        result["ledgerReadable"] = True
-        if mismatch:
-            result["reason"] = "ledger_instance_mismatch"
-            return result
-        current = now if now is not None else now_ms()
-        conn = store.connection
-        pending, deferred = conn.execute(
-            "SELECT COALESCE(SUM(next_try_at<=?),0), COALESCE(SUM(next_try_at>?),0) FROM fed_outbox"
-            " WHERE state IN ('ready','submitting')", (current, current)).fetchone()
-        decisions = conn.execute(
-            "SELECT COUNT(*) FROM fed_reports r LEFT JOIN fed_report_decisions d ON d.reporter_device=r.reporter_device"
-            " AND d.report_operation_id=r.operation_id WHERE d.decision IS NULL").fetchone()[0]
-        result.update(outboxPending=int(pending), outboxDeferred=int(deferred),
-                      authorityDecisionsPending=int(decisions),
-                      attachments=attachment_usage(store, _paths(root), config.storage_budget))
-        relay_state = store.meta("relayState") or "starting"
-        seen = store.meta("relayLastSeen")
-        result["lastSeen"] = int(seen) if seen and seen.isdigit() else None
-        if not config.enabled:
-            result.update(state="disabled", reason="unknown")
-        elif store.meta("hubStateLost"):
-            result.update(state="incompatible", reason="hub_state_lost")
-        elif not relay_running(root):
-            result.update(state="offline", reason="relay_not_running")
-        elif relay_state in STOP_STATES:
-            result.update(state="incompatible", reason=relay_state)
-        else:
-            result["state"] = relay_state if relay_state in RELAY_STATES else "reconnecting"
-            result["reason"] = "unknown" if relay_state == "connected" else "hub_unavailable"
-            result["hubAccepted"] = relay_state == "connected"
+            _project_store(result, store, root, config, now=now,
+                           running=relay_running(root) if running is _PROBE else running)
+        except (StoreError, sqlite3.Error, OSError) as error:
+            # 只读查询中途失败（库忙、只读读者补建辅助文件失败等）：投影未知，不回退到可写打开
+            code = error.code if isinstance(error, StoreError) else "federation_store_unavailable"
+            for key in ("outboxPending", "outboxDeferred", "authorityDecisionsPending", "attachments", "anchorWatch",
+                        "relayVersion", "relayPublishedAt"):
+                result.pop(key, None)
+            result.update(ledgerReadable=False, state="storage_failed", hubAccepted=False, lastSeen=None,
+                          reason="unknown", storageReason="federation_store_unavailable", storageSubreason=code)
     return result
+
+
+def _project_store(result: dict[str, Any], store: FederatedStore, root: Path, config: fed_config.FederationConfig, *,
+                   now: int | None, running: object) -> None:
+    try:
+        mismatch = store.device_id() != config.device_id
+    except StoreError:
+        mismatch = True
+    result["ledgerReadable"] = True
+    if mismatch:
+        result["reason"] = "ledger_instance_mismatch"
+        return
+    current = now if now is not None else now_ms()
+    conn = store.connection
+    pending, deferred = conn.execute(
+        "SELECT COALESCE(SUM(next_try_at<=?),0), COALESCE(SUM(next_try_at>?),0) FROM fed_outbox"
+        " WHERE state IN ('ready','submitting')", (current, current)).fetchone()
+    decisions = conn.execute(
+        "SELECT COUNT(*) FROM fed_reports r LEFT JOIN fed_report_decisions d ON d.reporter_device=r.reporter_device"
+        " AND d.report_operation_id=r.operation_id WHERE d.decision IS NULL").fetchone()[0]
+    result.update(outboxPending=int(pending), outboxDeferred=int(deferred),
+                  authorityDecisionsPending=int(decisions),
+                  attachments=attachment_usage(store, _paths(root), config.storage_budget))
+    relay_state = store.meta("relayState") or "starting"
+    seen = store.meta("relayLastSeen")
+    result["lastSeen"] = int(seen) if seen and seen.isdigit() else None
+    if not config.enabled:
+        result.update(state="disabled", reason="unknown")
+    elif store.meta("hubStateLost"):
+        result.update(state="incompatible", reason="hub_state_lost")
+    elif running is None:
+        result.update(state="storage_failed", reason="relay_running_unknown")  # 锁文件读不了：不冒称离线或在线
+    elif not running:
+        result.update(state="offline", reason="relay_not_running")
+    elif relay_state in STOP_STATES:
+        result.update(state="incompatible", reason=relay_state)
+    else:
+        result["state"] = relay_state if relay_state in RELAY_STATES else "reconnecting"
+        result["reason"] = "unknown" if relay_state == "connected" else "hub_unavailable"
+        result["hubAccepted"] = relay_state == "connected"
+    if running is True and get_platform().name == "windows":
+        # 未运行/运行未知时隐藏磁盘残留；锁忙但字段缺失/不合法时为 null（未知），不假定 active
+        result.update(relay_diagnostics_projection(store.relay_diagnostics()))
 
 
 def attachment_usage(store: FederatedStore, paths: RelayPaths, storage_budget: int) -> dict[str, int | None]:

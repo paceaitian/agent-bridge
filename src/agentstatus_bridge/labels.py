@@ -235,6 +235,8 @@ REASON_TEXTS: dict[str, str] = {
     "federation_archive_authority": "发起设备上的任务用 close 结束；archive 只归档本机镜像",
     "federation_withdraw_unsupported": "跨设备任务不支持 withdraw（不触碰对方设备的原生队列）",
     "relay_not_running": "联邦 relay 未运行",
+    "relay_running_unknown": "无法确认联邦 relay 是否在运行（relay 锁文件无法读取）",
+    "stop_controller_failed": "relay 的停止控制线程意外退出，relay 已停止；服务管理器会重新拉起",
     "relay_elevated": "relay 不能在管理员（提权）令牌下运行",
     "remote_endpoint_unresolved": "对方设备的目录里没有这个会话；先用 peers --device 查看，再用 provider@id:<完整ID> 指定",
     "device_unknown": "未知设备：本机目录里没有这个设备名或设备 ID",

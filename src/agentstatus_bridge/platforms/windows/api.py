@@ -124,6 +124,19 @@ class WinApi:
                 raise OSError('windows_identity_unknown')
             return ProcessFact(pid, times[0].number(), self.token(handle))
 
+    def open_wait_handle(self, pid: int, birth: int) -> int:
+        """QUERY_LIMITED|SYNCHRONIZE 进程句柄，核同一代出生时刻后交调用方持有（DESIGN §90.6 launch anchor）。"""
+        handle = self.handle(self.k.OpenProcess(0x1000 | 0x100000, False, pid))
+        try:
+            times = [A.FILETIME() for _ in range(4)]
+            self.check(self.k.GetProcessTimes(handle, *(C.byref(t) for t in times)))
+            if times[0].number() != birth:
+                raise WinFailure(1168, 'windows_process_reused')
+        except BaseException:
+            self.close(handle)
+            raise
+        return handle
+
     def process_image(self, pid: int, birth: str) -> str:
         """Documented image query, not PEB/argv inspection; bracket by generation."""
         before = self.process(pid, expected_birth=birth)
