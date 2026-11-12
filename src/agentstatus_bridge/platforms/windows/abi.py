@@ -62,6 +62,11 @@ class PROCESSENTRY32W(C.Structure):
                 ('flags', DWORD), ('exe', WCHAR * 260)]
 
 
+class UNICODE_STRING(C.Structure):
+    # Win64：Length/MaximumLength 后有 4 字节对齐，Buffer 在偏移 8（§92.3 class 60 返回的头）
+    _fields_ = [('length', WORD), ('maximum', WORD), ('buffer', PTR)]
+
+
 class FILE_INFORMATION(C.Structure):
     _fields_ = [('attributes', DWORD), ('creation', FILETIME), ('access', FILETIME),
                 ('write', FILETIME), ('volume', DWORD), ('size_high', DWORD), ('size_low', DWORD),
@@ -116,7 +121,7 @@ SIGNATURES = {
         'GetExitCodeProcess': (BOOL, [HANDLE, PTR]),
         'CreateToolhelp32Snapshot': (HANDLE, [DWORD, DWORD]),
         'Process32FirstW': (BOOL, [HANDLE, PTR]), 'Process32NextW': (BOOL, [HANDLE, PTR]),
-        'LocalFree': (PTR, [PTR]),
+        'LocalFree': (PTR, [PTR]), 'LocalSize': (C.c_size_t, [PTR]),
         'CreateFileW': (HANDLE, [PTR, DWORD, DWORD, PTR, DWORD, DWORD, HANDLE]),
         'CreateDirectoryW': (BOOL, [PTR, PTR]),
         'GetFileInformationByHandle': (BOOL, [HANDLE, PTR]),
@@ -156,7 +161,8 @@ SIGNATURES = {
         'SetSecurityInfo': (DWORD, [HANDLE, DWORD, DWORD, PTR, PTR, PTR, PTR]),
         'GetAce': (BOOL, [PTR, DWORD, PTR]),
     },
-    'shell32': {'SHGetKnownFolderPath': (C.c_int32, [PTR, DWORD, HANDLE, PTR])},
+    'shell32': {'SHGetKnownFolderPath': (C.c_int32, [PTR, DWORD, HANDLE, PTR]),
+                'CommandLineToArgvW': (PTR, [PTR, PTR])},
     'ole32': {'CoTaskMemFree': (None, [PTR])},
     'secur32': {'LsaGetLogonSessionData': (C.c_int32, [PTR, PTR]),
                'LsaFreeReturnBuffer': (C.c_int32, [PTR])},

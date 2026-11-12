@@ -56,6 +56,58 @@ def text(pointer):
     raise AssertionError('unterminated wide input')
 
 
+def split_command_line(line):
+    """Fixture model of CommandLineToArgvW, transcribed from Wine shell32 (argv[0] ends at the next quote/space;
+    2n/2n+1 backslashes before a quote; consecutive quotes counted, the third is a literal). The documented rules
+    do not cover quote runs, so test_bridge_windows_native compares this model with the real API on one corpus."""
+    args, s, n = [], 0, len(line)
+    if not line:
+        return args
+    if line[0] == '"':
+        end = line.find('"', 1)
+        end = n if end < 0 else end
+        args.append(line[1:end]); s = end + 1
+    else:
+        while s < n and line[s] not in ' \t':
+            s += 1
+        args.append(line[:s])
+    while s < n and line[s] in ' \t':
+        s += 1
+    if s >= n:
+        return args
+    current, quotes, slashes = [], 0, 0
+    while s < n:
+        c = line[s]
+        if c in ' \t' and quotes == 0:
+            args.append(''.join(current)); current, slashes = [], 0
+            while s < n and line[s] in ' \t':
+                s += 1
+            if s >= n:
+                return args
+            continue
+        if c == '\\':
+            current.append(c); slashes += 1; s += 1
+            continue
+        if c == '"':
+            if slashes % 2 == 0:
+                del current[len(current) - slashes // 2:]
+                quotes += 1
+            else:
+                del current[len(current) - slashes // 2 - 1:]
+                current.append('"')
+            s += 1; slashes = 0
+            while s < n and line[s] == '"':
+                quotes += 1
+                if quotes == 3:
+                    current.append('"'); quotes = 0
+                s += 1
+            if quotes == 2:
+                quotes = 0
+            continue
+        current.append(c); slashes = 0; s += 1
+    args.append(''.join(current))
+    return args
+
 class Fn:
     def __init__(self, kernel, name, prototype):
         self.kernel, self.name = kernel, name
@@ -127,6 +179,12 @@ class Kernel:
         self.environments = {}  # synthetic UTF-16 blocks, never host process memory
         self.environment_addresses = {}  # pid -> optional non-page-aligned base
         self.environment_limits = {}  # pid -> readable bytes from base; default ends at the last mapped page
+        self.command_lines = {}  # pid -> synthetic command line for class 60 (§92), never host argv
+        self.argv_blocks = {}  # CommandLineToArgvW allocations still owned by the caller
+        self.argv_freed = []
+        self.command_line_hooks = {}  # pid -> hook(out, size) -> (status, ReturnLength) | None; writes any header shape
+        self.argv_argc = None  # reported argc override (argc anomaly tests)
+        self.argv_null = frozenset()  # argv indexes whose pointer slot is NULL
         self.lsa_allocations = set()
         self.acls, self.descriptors = {}, {}
         self.descriptor_acls = {}
@@ -173,7 +231,12 @@ class Kernel:
         me, other = self.processes[self.current], self.processes[pid]
         return other[2] != me[2] or other[3] and not me[3]
     def OpenProcess(self, access, inherit, pid):
-        assert access in (0x101000, 0x101010) and not inherit
+        assert not inherit
+        if not access & 0x1000:
+            return self.fail(5)  # §92 Opus P2-2: missing QUERY is a permission failure, not an oracle
+        # Only QUERY_LIMITED / SYNCHRONIZE / VM_READ are ever modelled; each primitive checks its own bit
+        # (class 60 needs QUERY, waits need SYNCHRONIZE) instead of pinning whole masks (§92 Codex P3-03).
+        assert not access & ~0x101010, 'unmodelled process access bits'
         if pid not in self.processes:
             self.error = 87
             return 0
@@ -184,6 +247,8 @@ class Kernel:
         put(out, S.I32, 0)
         return 1
     def NtQueryInformationProcess(self, handle, kind, out, size, returned):
+        if kind == 60:
+            return self.command_line_information(handle, out, size, returned)
         assert kind == 0 and size == 48
         if self.record(handle)['pid'] not in self.environments:
             return -1073741790
@@ -342,7 +407,52 @@ class Kernel:
                         if alias != name and Path(alias).is_file() and os.path.samefile(path, alias):
                             other['aces'] = list(child['aces'])
         return 0
-    def LocalFree(self, pointer): return 0
+    def LocalFree(self, pointer):
+        if pointer in self.argv_blocks:
+            self.argv_blocks.pop(pointer)
+            self.argv_freed.append(pointer)
+        return 0
+    def LocalSize(self, pointer):
+        block = self.argv_blocks.get(pointer)
+        return len(block) if block is not None else self.fail(6)
+    def command_line_information(self, handle, out, size, returned):
+        # ProcessCommandLineInformation: UNICODE_STRING header + inline buffer at an absolute address
+        # inside the CALLER's allocation; only QUERY_LIMITED is required (Opus §92 P2-2).
+        record = self.record(handle)
+        if not record['access'] & 0x1000:
+            return -1073741790  # STATUS_ACCESS_DENIED
+        hook = self.command_line_hooks.get(record['pid'])
+        result = None if hook is None else hook(out, size)  # None: side effects only, then default reply
+        if result is not None:
+            status, length = result
+            if returned:
+                put(returned, S.U32, length)
+            return status
+        line = self.command_lines.get(record['pid'])
+        if line is None:
+            return -1073741790
+        raw = line.encode('utf-16-le', 'surrogatepass')
+        need = 16 + len(raw) + 2
+        if returned:
+            put(returned, S.U32, need)
+        if size < need:
+            return -1073741820  # STATUS_INFO_LENGTH_MISMATCH
+        C.memmove(out, struct.pack('<HHIQ', len(raw), len(raw) + 2, 0, out + 16), 16)
+        C.memmove(out + 16, raw + b'\0\0', len(raw) + 2)
+        return 0
+    def CommandLineToArgvW(self, line, argc):
+        args = split_command_line(text(line)) or ['C:\\fixture\\python.exe']  # empty → own path
+        encoded = [a.encode('utf-16-le', 'surrogatepass') + b'\0\0' for a in args]
+        table = 8 * len(args)
+        block = C.create_string_buffer(table + sum(len(e) for e in encoded))
+        base, offset = C.addressof(block), table
+        for index, value in enumerate(encoded):
+            C.memmove(base + 8 * index, struct.pack('<Q', 0 if index in self.argv_null else base + offset), 8)
+            C.memmove(base + offset, value, len(value))
+            offset += len(value)
+        self.argv_blocks[base] = block
+        put(argc, S.I32, len(args) if self.argv_argc is None else self.argv_argc)
+        return base
     def CoTaskMemFree(self, pointer): pass
     def SHGetKnownFolderPath(self, folder, flags, token, out):
         put(out, S.P, self.buffer(S.wide(str(self.root))))
@@ -633,6 +743,9 @@ class Kernel:
     def WaitForSingleObject(self, event, timeout):
         if self.record(event)['kind']=='process':
             assert timeout==0
+            if not self.record(event)['access'] & 0x100000:
+                self.error = 5
+                return 0xFFFFFFFF  # WAIT_FAILED: process waits need SYNCHRONIZE
             return 0 if self.record(event)['pid'] in self.exited else 258
         return 258 if self.pending else 0
     def CancelIoEx(self, handle, overlap):

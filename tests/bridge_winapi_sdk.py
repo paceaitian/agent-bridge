@@ -122,6 +122,7 @@ SDK = {
         'Process32FirstW': (I32, [H, P]),
         'Process32NextW': (I32, [H, P]),
         'LocalFree': (P, [P]),
+        'LocalSize': (S, [P]),
         'CreateFileW': (H, [P, U32, U32, P, U32, U32, H]),
         'CreateDirectoryW': (I32, [P, P]),
         'GetFileInformationByHandle': (I32, [H, P]),
@@ -164,7 +165,8 @@ SDK = {
         'SetSecurityInfo': (U32, [H, U32, U32, P, P, P, P]),
         'GetAce': (I32, [P, U32, P]),
     },
-    'shell32': {'SHGetKnownFolderPath': (I32, [P, U32, H, P])},
+    'shell32': {'SHGetKnownFolderPath': (I32, [P, U32, H, P]),
+                'CommandLineToArgvW': (P, [P, P])},
     'ole32': {'CoTaskMemFree': (None, [P])},
     'secur32': {'LsaGetLogonSessionData': (I32, [P, P]), 'LsaFreeReturnBuffer': (I32, [P])},
     'ws2_32': {

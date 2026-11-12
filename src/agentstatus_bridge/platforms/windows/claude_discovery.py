@@ -14,6 +14,7 @@ from .claude_auth import PeerFiles, PIPE, generation
 from .local_transport import WindowsPlatform
 from .api import ProcessFact
 from .io import WinIO
+from .process_role import Roles
 
 MAX_RECORDS, SECONDS = 4096, 5.0
 RECORD = re.compile(r'[1-9][0-9]{0,9}\.json')
@@ -113,6 +114,8 @@ class Discovery:
     duplicates: tuple[Endpoint, ...] = ()
     registries: tuple[dict[str, Any], ...] = ()
     root_diagnostics: tuple[tuple[Path, str], ...] = ()
+    # §92：本轮当前代际的非交互登记 PID（进程内事实，不进协议/doctor）；与 found 一起构成角色裁决的保护集
+    noninteractive: frozenset[int] = frozenset()
 
     def select(self, reference: str) -> Endpoint:
         key = reference.removeprefix('claude@')
@@ -155,6 +158,8 @@ def discover(backend: WindowsPlatform, *, connect: bool = True) -> Discovery:
     unlocated = set(scan.unlocated)
     located_roots = dict(scan.live)
     known_noninteractive: set[int] = set()
+    # 逐 PID 的待判缺口：(pid, birth)；birth 为 None 表示拿不到当前事实，不能做角色裁决（§92.5）
+    gaps: list[tuple[int, str | None]] = []
     for root in roots:
         files = PeerFiles(backend.files, root)
         diagnostic = {'path': str(root), 'readable': False, 'reason': 'unreadable'}
@@ -193,12 +198,11 @@ def discover(backend: WindowsPlatform, *, connect: bool = True) -> Discovery:
                         if pid in located_roots and located_roots[pid] != root:
                             continue  # 已定位到别处的 PID，不由旧根的损坏残留决定完整性。
                         try:
-                            peer_process(backend, pid)
+                            gaps.append((pid, str(peer_process(backend, pid).birth)))
                         except Ineligible:
                             continue
                         except OSError:
-                            pass
-                        complete = False
+                            gaps.append((pid, None))
         except OSError:
             # Speculative accounts are not authority for unrelated live peers.
             # Only an as-yet unlocated owner of this root can affect completeness.
@@ -210,14 +214,21 @@ def discover(backend: WindowsPlatform, *, connect: bool = True) -> Discovery:
             fact = peer_process(backend, pid)
             if PureWindowsPath(backend.api.process_image(pid, str(fact.birth))).name.lower() != 'claude.exe':
                 continue
+            gaps.append((pid, str(fact.birth)))
         except Ineligible:
             continue
         except OSError:
-            pass
-        complete = False
+            gaps.append((pid, None))
+    # 全部登记处理完后才裁决角色：有效登记者既不被免除、也不作 P 的见证；只免除同代且已正证的缺口，
+    # 全局失败（扫描、预算、显式覆盖）不受影响，已不完整时不必再读命令行。显式覆盖只做 T，不做父子扫描（§92.5）
+    if gaps and complete:
+        protected = frozenset({endpoint.ref.pid for endpoint in found} | known_noninteractive)
+        roles = Roles(backend.api, started + SECONDS, allow_parent=not scan.exclusive)
+        if any(birth is None or not roles.exempt(pid, birth, protected) for pid, birth in gaps):
+            complete = False
     counts = Counter(e.ref.native_id for e in found)
     duplicates = tuple(replace(e, issues=(*e.issues, 'ambiguous_thread'))
                        for e in found if counts[e.ref.native_id] > 1)
     eligible = tuple(e for e in found if counts[e.ref.native_id] == 1)
     return Discovery(eligible, complete, 'complete' if complete else 'claude_discovery_incomplete', duplicates,
-                     tuple(registries), scan.diagnostics)
+                     tuple(registries), scan.diagnostics, frozenset(known_noninteractive))

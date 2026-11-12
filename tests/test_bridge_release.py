@@ -137,6 +137,8 @@ class ReleaseTests(unittest.TestCase):
             'test_bridge_registration','test_bridge_labels','test_bridge_hints','test_bridge_windows_native','test_bridge_windows_callers',
             'test_bridge_windows_delivery','test_bridge_windows_boundaries','test_bridge_windows_roots',
             'test_bridge_windows_roots_rework','test_bridge_windows_storage','test_bridge_local_display',
+            # §92：Desktop 进程角色正证（Fake 读取原语/父证/discover）；真实 Win32 部分在 native 里
+            'test_bridge_windows_process_role',
             # P5 联邦（DESIGN §88.18）：可移植附件、Windows 交付模型、编解码与部署模板；联邦库用例因提权 CI 不进选择集
             'test_bridge_federation_codec','test_bridge_federation_attachments','test_bridge_federation_windows',
             'test_bridge_federation_packaging',
