@@ -50,7 +50,8 @@ from .store import Store, StoreError
 from .transports import DeliveryContext, DeliveryOutcome, Transport
 from .platforms.transport_codec import Receipt, parse_receipt, parse_reply
 from .platforms.transport_codec import encode_address, same_address
-from .notification_policy import can_notify, wire_ref
+from .native_names import NameBook
+from .notification_policy import can_notify
 from .transports.codex_queue import queue_item_state
 
 # 原生调度提示按消息种类选（DESIGN §45.42）。取消忙时扣留之后，「对方什么时候读它」不再由
@@ -388,7 +389,8 @@ class Dispatcher:
                 task_id,
                 role=Role.NOTICE,
                 target=task.origin,
-                body=reminder_body(task, attempts, reminder.view, command=self.command),
+                body=reminder_body(task, attempts, reminder.view, command=self.command,
+                                   names=NameBook.of(self._endpoints)),
                 refs=[],
                 now=now,
                 # 提醒由桥自己生成，不冒充接收方；消息头照常显示 from=user
@@ -581,15 +583,18 @@ class Dispatcher:
             provider_ref=native_message if provider is Provider.CLAUDE else None,
         ):
             return "skipped"
-        sender = wire_ref(attempt.sender) if attempt.sender is not None else None
+        sender = attempt.sender
+        # 消息头 from 与 Claude 帧 from-name 同走 NameView（§91.4.2）：本轮同绑定已核实的原生主名，否则完整 ID；
+        # 本地 worker 只投给本机端点，发送方也是本机会话，所以设备上下文是 LOCAL/LOCAL
+        sender_token = NameBook.of(endpoints).local_wire(sender) if sender is not None else None
         try:
             text = envelope.render(
-                task, attempt, sender=sender.token() if sender else "user", device=self.device, command=self.command
+                task, attempt, sender=sender_token or "user", device=self.device, command=self.command
             )
             context = DeliveryContext(
                 message_uuid=native_message,
-                sender_name=sender.display()
-                if sender
+                sender_name=sender_token
+                if sender_token
                 else "AgentStatus 协作桥（提醒）"
                 if REMINDER_OPTION in attempt.options
                 else "AgentStatus 协作桥（结束回执）"

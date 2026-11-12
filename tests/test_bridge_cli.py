@@ -24,12 +24,15 @@ from unittest.mock import patch
 from agentstatus_bridge.platforms.linux import files as linux_files
 from agentstatus_bridge import cli, doctor, naming, observer_dbus, paths, summary, views
 from agentstatus_bridge.naming import DEFAULT_COMMAND as CMD
-from agentstatus_bridge.endpoints import Caller, DiscoverySources
+from agentstatus_bridge.endpoints import Caller, DiscoverySources, resolve_target
 from agentstatus_bridge.observer_dbus import ObserverView
-from agentstatus_bridge.model import Consumption, Delivery, Endpoint, EndpointRef, Flow, Provider, Role, Runtime, Verdict, Work
+from agentstatus_bridge.model import (Consumption, Delivery, Endpoint, EndpointRef, Flow, NameSource, Provider, Role, Runtime,
+                                      Verdict, Work)
 from agentstatus_bridge.platforms.linux.process import ProcessInfo
+from agentstatus_bridge.native_names import UNKNOWN_NAME
 from agentstatus_bridge.store import Store, StoreError
-from bridge_support import discovering, endpoint, ref
+from bridge_support import discovering, endpoint, ref, with_name_views
+from agentstatus_bridge.ids import short
 
 IMPL = endpoint(ref(Provider.CODEX, "impl-thread", pid=1000, pane="%1", label="impl", server=100))
 REVIEW = endpoint(ref(Provider.CLAUDE, "review-session", pid=2000, pane="%2", label="review"))
@@ -56,6 +59,8 @@ class CliTests(unittest.TestCase):
         impl = 'codex@impl〔impl-thr〕'
         lead = 'codex@lead〔lead-thr〕'
         review = 'claude@review〔review-s〕'
+        # §91.4.2：本机名字只来自本轮发现随端点携带的 NameView；真实 discover 会附上，这里的假 discover 要显式附
+        self.endpoints = with_name_views([IMPL, REVIEW, LEAD])
         self.caller = as_agent(LEAD)
         code, out, err = self.run_cli('send', '--to', 'codex@impl', '-m', 'fixture', '--no-wait')
         self.assertEqual(code, 0, err)
@@ -75,16 +80,26 @@ class CliTests(unittest.TestCase):
         self.mark_sent(task_id)
         self.caller = as_agent(IMPL)
         self.assertEqual(self.run_cli('report', task_id, '--result')[0], 0)
-        self.caller = as_agent(LEAD)
-        code, out, err = self.run_cli('accept', task_id)
-        self.assertEqual(code, 0, err)
-        self.assertIn('已排队结束回执 → '+impl, out)
+        # 进行中的任务：status 文本是「名字〔ID〕」，JSON 的 name 仍是不带 ID 的可复制主名（已核实且整体无空白）
         text = self.run_cli('status', task_id)[1]
         self.assertIn('发起：'+lead, text)
         self.assertIn('→ '+impl, text)
         document = json.loads(self.run_cli('status', task_id, '--json')[1])
         self.assertEqual(document['origin']['name'], 'codex@lead')
         self.assertEqual(document['attempts'][0]['target']['name'], 'codex@impl')
+        self.caller = as_agent(LEAD)
+        code, out, err = self.run_cli('accept', task_id)
+        self.assertEqual(code, 0, err)
+        self.assertIn('已排队结束回执 → '+impl, out)
+        # 已结束的任务 status 不另做发现（§91.4.2）：没有同绑定名字证据，文本与 JSON 都写完整 ID，不回退 tmux 标签
+        text = self.run_cli('status', task_id)[1]
+        self.assertIn('发起：codex@id:lead-thread', text)
+        self.assertIn('→ codex@id:impl-thread', text)
+        self.assertNotIn(impl, text)
+        self.assertNotIn('codex@impl', text)
+        document = json.loads(self.run_cli('status', task_id, '--json')[1])
+        self.assertEqual(document['origin']['name'], 'codex@id:lead-thread')
+        self.assertEqual(document['attempts'][0]['target']['name'], 'codex@id:impl-thread')
         # Review report, status reviewer and close all go through the local formatter.
         task_id = self.send('--review-by', 'claude@review')
         self.mark_sent(task_id)
@@ -99,11 +114,82 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn(impl, out)
         self.assertIn(review, out)
-        # Linux peers already has an ID column and copyable selector; no bracketed selector.
+        # §91.4.2/91.7：Linux peers 与 Windows 同形，人读「名字〔全集消歧ID〕」加同行完整 ID target，不再有 pane 列；
+        # JSON 另给 name/displayName/nameVerified（取 NameView），session/pane/nativeId 结构不动
         peers = self.run_cli('peers')[1]
-        self.assertIn('codex@impl', peers)
-        self.assertIn('impl-thr', peers)
-        self.assertNotIn('〔', peers)
+        [line] = [line for line in peers.splitlines() if line.startswith(impl)]
+        self.assertIn('  target=codex@id:impl-thread  ', line)
+        self.assertNotIn('%1', peers)
+        rows = {row['nativeId']: row for row in json.loads(self.run_cli('peers', '--json')[1])['peers']}
+        self.assertEqual({key: rows['impl-thread'][key] for key in ('target', 'name', 'nameVerified', 'pane', 'session')},
+                         {'target': 'codex@id:impl-thread', 'name': 'impl', 'nameVerified': True, 'pane': '%1',
+                          'session': 'impl'})
+
+    def test_peers_name_comes_from_the_name_view_not_the_tmux_label(self) -> None:
+        # §91.4.2：peers 的名字只取本轮 NameView，tmux 会话名只留在 JSON 的 session 诊断字段；〔ID〕按全集消歧，
+        # 身份全集不完整时写完整 ID、名字只作展示；认不出 ID 的端点没有可复制 target（JSON 为 null）
+        native = "019a1111-aaaa-7aaa-8aaa-aaaaaaaaaaaa"
+        named = endpoint(ref(Provider.CODEX, native, pid=4000, pane="%4", label="tmuxname", server=100),
+                         native_name=NameSource("named", "alpha"))
+        self.endpoints = with_name_views([named, REVIEW, LEAD])
+        text = self.run_cli("peers")[1]
+        self.assertIn(f"codex@alpha〔019a1111〕  target=codex@id:{native}  ", text)
+        self.assertNotIn("tmuxname", text)
+        rows = {row["nativeId"]: row for row in json.loads(self.run_cli("peers", "--json")[1])["peers"]}
+        self.assertEqual((rows[native]["name"], rows[native]["nameVerified"], rows[native]["session"]),
+                         ("alpha", True, "tmuxname"))
+        blind = endpoint(ref(Provider.CODEX, "-", pid=4001, pane="%5", label="other", server=100),
+                         issues=("title_thread_missing",), native_name=UNKNOWN_NAME)
+        self.endpoints = with_name_views([named, blind, REVIEW, LEAD])
+        text = self.run_cli("peers")[1]
+        self.assertIn(f"codex@id:{native} 名称=alpha（仅展示）  target=codex@id:{native}  ", text)
+        [line] = [line for line in text.splitlines() if line.startswith("codex（ID未解析）")]
+        self.assertNotIn("target=", line)
+        rows = {row["pane"]: row for row in json.loads(self.run_cli("peers", "--json")[1])["peers"]}
+        self.assertEqual((rows["%4"]["nameVerified"], rows["%5"]["target"], rows["%5"]["name"]), (False, None, None))
+
+    def test_local_outputs_use_full_id_without_same_binding_name_evidence(self) -> None:
+        """§91.4.2 反例：名字只来自同绑定 (provider, nativeId, PID, 出生时刻) 的 NameView；没有就写完整 ID，
+        不回退 ref.label（tmux 会话名）或 pane。"""
+        # 一：发现到的端点不带 NameView（无名字证据）。按名字寻址照常可用（解析器自己算），输出一律完整 ID
+        self.caller = as_agent(LEAD)
+        code, out, err = self.run_cli('send', '--to', 'codex@impl', '-m', 'fixture', '--no-wait')
+        self.assertEqual(code, 0, err)
+        self.assertIn('已交给 codex@id:impl-thread：', out)
+        self.assertNotIn('codex@impl', out)
+        with self.store() as store:
+            task_id = store.list_tasks()[0].id
+        listing = self.run_cli('tasks')[1]
+        self.assertIn('codex@id:impl-thread', listing)
+        self.assertNotIn('codex@impl', listing)
+        document = json.loads(self.run_cli('status', task_id, '--json')[1])
+        self.assertEqual((document['origin']['name'], document['attempts'][0]['target']['name']),
+                         ('codex@id:lead-thread', 'codex@id:impl-thread'))
+        # 二：同一 thread 在另一个进程（PID 不同）恢复，本轮带名字；账本里的旧代际绑定对不上，仍写完整 ID，
+        # 同一张 NameBook 里绑定一致的发起方照常用名字
+        resumed = endpoint(ref(Provider.CODEX, "impl-thread", pid=1007, pane="%7", label="impl", server=100))
+        self.endpoints = with_name_views([resumed, REVIEW, LEAD])
+        text = self.run_cli('status', task_id)[1]
+        self.assertIn('→ codex@id:impl-thread：', text)
+        self.assertNotIn('codex@impl', text)
+        self.assertIn('发起：codex@lead〔lead-thr〕', text)
+        document = json.loads(self.run_cli('status', task_id, '--json')[1])
+        self.assertEqual((document['origin']['name'], document['attempts'][0]['target']['name']),
+                         ('codex@lead', 'codex@id:impl-thread'))
+
+    def test_finished_rows_in_task_list_use_full_id_like_status(self) -> None:
+        """tasks --all 里已结束的行与 status 一致用完整 ID，不因别的未结束任务触发了发现就借本轮名字（迁移报告 a）。"""
+        self.endpoints = with_name_views(self.endpoints)
+        self.caller = as_agent(LEAD)
+        finished = json.loads(self.run_cli('send', '--to', 'codex@impl', '-m', 'one', '--no-wait', '--json')[1])['id']
+        self.assertEqual(self.run_cli('close', finished)[0], 0)
+        live = json.loads(self.run_cli('send', '--to', 'codex@impl', '-m', 'two', '--no-wait', '--json')[1])['id']
+        rows = {row['id']: row for row in json.loads(self.run_cli('tasks', '--all', '--json')[1])['tasks']}
+        self.assertEqual(rows[live]['attempts'][0]['target']['name'], 'codex@impl')
+        self.assertEqual(rows[finished]['attempts'][0]['target']['name'], 'codex@id:impl-thread')
+        lines = {line.split()[0]: line for line in self.run_cli('tasks', '--all')[1].splitlines() if line.strip()}
+        self.assertIn('codex@impl〔', lines[short(live)])
+        self.assertIn('codex@id:impl-thread', lines[short(finished)])
 
     def test_linux_empty_reviewer_and_local_controls_keep_legacy_behavior(self) -> None:
         code,out,err=self.run_cli('send','--to','codex@impl','--review-by','',
@@ -495,11 +581,13 @@ class CliTests(unittest.TestCase):
         self.endpoints = [IMPL, REVIEW, LEAD, endpoint(GROK.ref, issues=("no_inbox",))]
         task_id = self.send()
         self.mark_sent(task_id, Delivery.FAILED)
+        # §91：Grok 只用 ID 寻址（裸完整 UUID 或 grok@id:<完整ID>）
+        grok = f"grok@id:{GROK.ref.native_id}"
         cases = [
             ("send", "--to", GROK.ref.native_id, "-m", "x", "--no-wait"),
-            ("send", "--to", "grok@grok", "-m", "x", "--no-wait"),
-            ("send", "--to", "codex@impl", "--review-by", "grok@grok", "-m", "x", "--no-wait"),
-            ("retry", task_id[:8], "--to", "grok@grok", "-m", "x"),
+            ("send", "--to", grok, "-m", "x", "--no-wait"),
+            ("send", "--to", "codex@impl", "--review-by", grok, "-m", "x", "--no-wait"),
+            ("retry", task_id[:8], "--to", grok, "-m", "x"),
         ]
         for argv in cases:
             with self.subTest(command=argv[0] + ("+review" if "--review-by" in argv else "")):
@@ -507,31 +595,35 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(code, cli.EXIT_REJECTED, err)
                 self.assertIn("target_no_inbox", err)
                 self.assertIn("没有收件通道", err)
+        # 旧写法 grok@grok 不再是名字：Grok 没有原生主名，找不到
+        code, _out, err = self.run_cli("send", "--to", "grok@grok", "-m", "x", "--no-wait")
+        self.assertEqual((code, "target_not_found" in err), (cli.EXIT_TARGET, True))
         # 只读端点照常出现在 peers 里，并标明原因
         code, out, _err = self.run_cli("peers")
         self.assertEqual(code, cli.EXIT_OK)
         self.assertIn("只读", out)
 
     def test_ambiguous_read_only_candidates_report_the_real_reason(self) -> None:
-        # 同一进程 resume 出两个会话：pane 与 provider@会话名都命中两行，但换哪个候选都投不进去
+        # 同一进程 resume 出两个会话：两个 Grok ID 共用前缀 019a0000，provider@id:<前缀> 与不带 provider 的
+        # id:<前缀> 都命中两行（§91 起 pane 与 grok@会话名不再是输入），但换哪个候选都投不进去
         second = endpoint(
             ref(Provider.GROK, "019a0000-dddd-7ddd-8ddd-dddddddddddd", pid=4000, pane="%9", label="grok"),
             issues=("no_inbox", "shared_process"),
         )
         self.endpoints = [IMPL, REVIEW, LEAD, endpoint(GROK.ref, issues=("no_inbox", "shared_process")), second]
-        for selector in ("grok@grok", "%9"):
+        for selector in ("grok@id:019a0000", "id:019a0000"):
             with self.subTest(selector=selector):
                 code, _out, err = self.run_cli("send", "--to", selector, "-m", "x", "--no-wait")
                 self.assertEqual(code, cli.EXIT_REJECTED, err)
                 self.assertIn("target_no_inbox", err)
                 self.assertNotIn("可选目标", err)
-        # 候选里混有能收件的会话时（同一 pane 里既有 Grok 又有 Codex），仍然是「目标不唯一」，让用户去选
+        # 候选里混有能收件的会话时（同一 pane 里既有 Grok 又有 Codex，ID 同前缀），仍然是「目标不唯一」，让用户去选
         self.endpoints = [
             IMPL,
             endpoint(GROK.ref, issues=("no_inbox",)),
-            endpoint(ref(Provider.CODEX, "other-thread", pid=1001, pane="%9", label="other")),
+            endpoint(ref(Provider.CODEX, "019a0000-eeee-7eee-8eee-eeeeeeeeeeee", pid=1001, pane="%9", label="other")),
         ]
-        code, _out, err = self.run_cli("send", "--to", "%9", "-m", "x", "--no-wait")
+        code, _out, err = self.run_cli("send", "--to", "id:019a0000", "-m", "x", "--no-wait")
         self.assertEqual(code, cli.EXIT_TARGET, err)
         self.assertIn("target_ambiguous", err)
 
@@ -556,7 +648,7 @@ class CliTests(unittest.TestCase):
         for issue in ("title_thread_missing", "title_thread_unmatched", "title_shows_subagent", "pane_process_ambiguous"):
             with self.subTest(issue=issue):
                 self.endpoints = [endpoint(IMPL.ref, issues=(issue,))]
-                code, _, err = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+                code, _, err = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--no-wait")
                 self.assertEqual((code, f"target_{issue}" in err), (cli.EXIT_REJECTED, True))
                 self.assertNotIn("{command}", err)
 
@@ -564,10 +656,11 @@ class CliTests(unittest.TestCase):
         # daemon 调用者端点（pid 是 daemon、没有 pane）与显示同一 thread 的窗口是同一会话（DESIGN §53.4.3）
         daemon_ref = EndpointRef(Provider.CODEX, IMPL.ref.native_id, pid=900, start_ticks="100", pane=None)
         self.caller = Caller(Endpoint(ref=daemon_ref), ProcessInfo(900, 1000, "codex", "100"), "daemon")
-        code, _, err = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+        # §91 起 pane 不再是输入：按原生主名指向显示该 thread 的窗口（%1）与别的窗口（%2）
+        code, _, err = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--no-wait")
         self.assertEqual((code, "target_is_self" in err), (cli.EXIT_REJECTED, True))
         # 发给别的窗口可以：发起方就是这个没有 pane 的端点
-        code, _, err = self.run_cli("send", "--to", "%2", "-m", "x", "--no-wait")
+        code, _, err = self.run_cli("send", "--to", "claude@review", "-m", "x", "--no-wait")
         self.assertEqual(code, cli.EXIT_OK, err)
         with Store.open(self.state) as store:
             [task] = store.list_tasks()
@@ -579,19 +672,32 @@ class CliTests(unittest.TestCase):
         code, _, err = self.run_cli("send", "--to", "nope", "-m", "x", "--no-wait")
         self.assertEqual((code, "target_not_found" in err), (cli.EXIT_TARGET, True))
         self.caller = as_agent(IMPL)
-        code, _, err = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+        code, _, err = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--no-wait")
         self.assertEqual((code, "target_is_self" in err), (cli.EXIT_REJECTED, True))
         self.caller = USER
         self.endpoints = [endpoint(IMPL.ref, issues=("no_thread_yet",))]
-        code, _, err = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+        code, _, err = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--no-wait")
         self.assertEqual((code, "target_no_thread_yet" in err), (cli.EXIT_REJECTED, True))
         # 对方忙不再影响投递（§45.42）：排队与否只取决于 worker 在不在
         self.endpoints = [endpoint(IMPL.ref, runtime=Runtime.BUSY)]
         self.worker_up = False
-        code, out, _ = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+        code, out, _ = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--no-wait")
         self.assertEqual(code, cli.EXIT_UNAVAILABLE)
         self.assertIn("后台 worker 未运行", out)
         self.assertNotIn("对方忙", out)
+
+    def test_ambiguous_name_candidates_are_full_ids(self) -> None:
+        # §91.4.2：本机报错的候选恒为完整 ID；按候选子集算出的前缀（这里是 019a0000-1）在全集上未必唯一
+        first, second = "019a0000-1111-7222-8333-44445555bbbb", "019a0000-2222-7222-8333-44445555cccc"
+        self.endpoints = [endpoint(ref(Provider.CODEX, first, pid=4000, pane="%4", label="a", server=100),
+                                   native_name=NameSource("named", "same")),
+                          endpoint(ref(Provider.CODEX, second, pid=4001, pane="%5", label="b", server=100),
+                                   native_name=NameSource("named", "same")), REVIEW, LEAD]
+        code, _out, err = self.run_cli("send", "--to", "codex@same", "-m", "x", "--no-wait")
+        self.assertEqual(code, cli.EXIT_TARGET, err)
+        self.assertIn("target_names_unverified", err)
+        self.assertIn(f"codex@id:{first}", err)
+        self.assertIn(f"codex@id:{second}", err)
 
     def test_agent_origin_is_recorded(self) -> None:
         self.caller = as_agent(LEAD)
@@ -615,6 +721,18 @@ class CliTests(unittest.TestCase):
         with self.store() as store:
             attempts = store.attempts(task_id)
         self.assertEqual([(item.seq, item.delivery) for item in attempts], [(1, Delivery.UNKNOWN), (2, Delivery.PENDING)])
+
+    def test_retry_without_to_keeps_the_bound_target_when_names_drift(self) -> None:
+        # §91 T6：名字漂移不改在途目标。原目标改名 impl2、另一会话现在叫 impl，不带 --to 的 retry 仍发给原 thread
+        task_id = self.send()
+        self.mark_sent(task_id, Delivery.UNKNOWN)
+        other = endpoint(ref(Provider.CODEX, "other-thread", pid=4000, pane="%4", label="o", server=100),
+                         native_name=NameSource("named", "impl"))
+        self.endpoints = [endpoint(IMPL.ref, native_name=NameSource("named", "impl2")), other, REVIEW, LEAD]
+        code, _out, err = self.run_cli("retry", task_id, "--force")
+        self.assertEqual(code, 0, err)
+        with self.store() as store:
+            self.assertEqual(store.attempts(task_id)[-1].target.native_id, "impl-thread")
 
     def test_retry_cancels_a_result_notice_that_has_not_been_sent(self) -> None:
         """返工意味着这个结果不作数：还没发出的结果回执随之作废（DESIGN §45.42）。
@@ -941,7 +1059,7 @@ class CliTests(unittest.TestCase):
 
     def test_shared_thread_opt_in_is_required_and_kept_for_retry(self) -> None:
         self.endpoints = [endpoint(IMPL.ref, issues=("shared_thread",)), REVIEW, LEAD]
-        code, _, err = self.run_cli("send", "--to", "%1", "-m", "x", "--no-wait")
+        code, _, err = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--no-wait")
         self.assertEqual((code, "target_shared_thread" in err), (cli.EXIT_REJECTED, True))
         task_id = self.send("--allow-shared")
         self.mark_sent(task_id, Delivery.FAILED)
@@ -1442,10 +1560,12 @@ class CliTests(unittest.TestCase):
         task_id = self.send()
         self.mark_sent(task_id)
         # 发现里还有别的会话，却没有 impl 的任何一代：可能已退出，也可能暂时无法识别（DESIGN §45.32）
-        self.endpoints = [REVIEW, LEAD]
+        # 其余会话带着本轮名字（NameBook 非空），但 impl 本轮未发现：没有同绑定的名字证据，写完整 ID，不回退 tmux 标签（§91.4.2）
+        self.endpoints = with_name_views([REVIEW, LEAD])
         code, out, _ = self.run_cli("status", task_id)
         self.assertEqual(code, 0)
-        self.assertIn("当前未发现 codex@impl〔impl-thr〕 的会话（可能已退出", out)
+        self.assertIn("当前未发现 codex@id:impl-thread 的会话（可能已退出", out)
+        self.assertNotIn("codex@impl", out)
         self.assertNotIn("已不在", out)
         self.assertIn(f"{CMD} retry {task_id[:8]} --force", out)
         document = json.loads(self.run_cli("status", task_id, "--json")[1])
@@ -1671,25 +1791,30 @@ class StateRootTests(unittest.TestCase):
 
 
 class PeerSelectorTests(unittest.TestCase):
-    """ab peers 给出的目标必须能解析回这一行（DESIGN §45.33.6）。"""
+    """ab peers 给出的目标必须能解析回这一行（DESIGN §45.33.6）；§91 起一律 provider@id:<完整ID>。"""
+
+    def assert_full_ids_resolve_back(self, endpoints: list[Endpoint]) -> None:
+        selectors = cli._selectors(endpoints)
+        for item in endpoints:
+            self.assertEqual(selectors[id(item)], f"codex@id:{item.ref.native_id}")
+            self.assertIs(resolve_target(selectors[id(item)], endpoints), item)
 
     def test_short_id_is_used_only_when_it_resolves_back(self) -> None:
         plain = endpoint(ref(Provider.CODEX, "019a0000-1111-7111-8111-111111111111", pid=5001, pane=None, label=None))
+        # 夹具把 label 注入为原生主名 tmuxed
         named = endpoint(ref(Provider.CODEX, "019a9999-3333-7333-8333-333333333333", pid=5003, pane="%3", label="tmuxed"))
-        # 唯一时用展示名
-        selectors = cli._selectors([plain, named])
-        self.assertEqual(selectors[id(plain)], "codex@019a0000")
-        self.assertEqual(selectors[id(named)], "codex@tmuxed")
-        # 同前缀的第二条无 pane 会话出现后，两条都退回完整原生 ID
+        # 唯一时也不用短 ID 或名字：原生主名可用，但不进 peers target
+        self.assertIs(resolve_target("codex@tmuxed", [plain, named]), named)
+        self.assert_full_ids_resolve_back([plain, named])
+        # 同前缀的第二条无 pane 会话出现后，两条仍是完整原生 ID 并各自解析回来
         twin = endpoint(ref(Provider.CODEX, "019a0000-2222-7222-8222-222222222222", pid=5002, pane=None, label=None))
-        selectors = cli._selectors([plain, twin])
-        self.assertEqual(selectors[id(plain)], plain.ref.native_id)
-        self.assertEqual(selectors[id(twin)], twin.ref.native_id)
-        # 前缀撞上别人的 tmux 会话名时也退回完整原生 ID
+        self.assert_full_ids_resolve_back([plain, twin])
+        # 别人的原生主名恰好等于自己的 8 位 ID 前缀时，target 仍各自解析回来
         clash = endpoint(ref(Provider.CODEX, "019a8888-4444-7444-8444-444444444444", pid=5004, pane="%4", label="019a0000"))
-        selectors = cli._selectors([plain, clash])
-        self.assertEqual(selectors[id(plain)], plain.ref.native_id)
-        self.assertEqual(selectors[id(clash)], "codex@019a0000")
+        self.assert_full_ids_resolve_back([plain, clash])
+        # 裸值只按名字：codex@019a0000 选中 clash，不落到 plain 的 ID 前缀；显式 id: 才按前缀选中 plain
+        self.assertIs(resolve_target("codex@019a0000", [plain, clash]), clash)
+        self.assertIs(resolve_target("codex@id:019a0000", [plain, clash]), plain)
 
 
 class WorkerStartupTests(unittest.TestCase):
@@ -1733,7 +1858,7 @@ class WorkerStartupTests(unittest.TestCase):
     def _send(self) -> tuple[int, str, str]:
         out, err = StringIO(), StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            code = cli.main(["send", "--to", "%1", "-m", "x", "--no-wait"])
+            code = cli.main(["send", "--to", "codex@impl", "-m", "x", "--no-wait"])
         return code, out.getvalue(), err.getvalue()
 
     def test_starting_worker_is_not_reported_missing(self) -> None:

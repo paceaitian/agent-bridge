@@ -28,6 +28,7 @@ from agentstatus_bridge.model import (
     Endpoint,
     EndpointRef,
     Flow,
+    NameSource,
     NOTICE_KIND_OPTION,
     Phase,
     Provider,
@@ -38,25 +39,52 @@ from agentstatus_bridge.model import (
 from agentstatus_bridge.store import Store, StoreError
 from agentstatus_bridge.transports import DeliveryContext, DeliveryOutcome
 from agentstatus_bridge.platforms.transport_codec import encode_address
-from bridge_support import RecordingTransport, endpoint, ref
+from bridge_support import RecordingTransport, endpoint, ref, with_name_views
 
 
 class DispatchTests(unittest.TestCase):
     def test_local_names_do_not_change_protocol_sender_name_or_header(self) -> None:
-        origin = ref(Provider.CLAUDE, '2aa904d4-0000-4000-8000-000000000002', label='vm claude')
-        target = ref(Provider.CODEX, '01a15e9f-0000-4000-8000-000000000001', label='实现 窗口')
-        self.endpoints = [endpoint(target)]
-        task, attempt = self._task(target, origin=origin)
-        self._run()
-        self.assertEqual(len(self.codex.calls), 1)
-        _target, text, context = self.codex.calls[0]
-        self.assertEqual(context.sender_name, 'claude@vm claude')
-        self.assertEqual(text.splitlines()[0], f'[AgentStatus 协作] task={task.id} attempt=1 '
-                         f'msg={attempt.message_id} role=handoff from=claude@vm-claude device=testbox')
+        """§91.4.2：头 from= 与 Claude 帧 from-name 同走本轮 NameView 的本机可复制标识；字段顺序与 \\S{1,64} 语法不变。
+
+        已核实且整个 provider@名字 无空白才用原生主名；名字含空格不转连字符、不用短 ID，改写完整 ID；
+        发送方本轮未发现（无同绑定名字证据）也写完整 ID。tmux 标签与本机「名字〔ID〕」文字都不进协议。
+        """
+        from agentstatus_bridge.native_names import NameSource
         from agentstatus_bridge.transports.claude_peer import build_frame
-        frame = json.loads(build_frame(text, context))
-        self.assertIn('from-name="claude@vm claude"', frame['message']['content'])
-        self.assertNotIn('〔', frame['message']['content'])
+        # 原生主名 review-vm 与 tmux 标签不同：头里出现的名字只能来自 NameView
+        plain = ref(Provider.CLAUDE, '3bb904d4-0000-4000-8000-000000000003', pid=1100, label='tmux 标签')
+        spaced = ref(Provider.CLAUDE, '2aa904d4-0000-4000-8000-000000000002', pid=1200, label='vm claude')
+        missing = ref(Provider.CLAUDE, '4cc904d4-0000-4000-8000-000000000004', pid=1300, label='lead')
+        # 两个绑定原生主名相同：互相否证、未核实，主名不能当可复制标识
+        twin, other_twin = (ref(Provider.CLAUDE, f'5dd904d{index}-0000-4000-8000-000000000005', pid=1400 + index,
+                                label='dup-name') for index in range(2))
+        targets = [ref(Provider.CODEX, f'01a15e9{index}-0000-4000-8000-000000000001', pid=2000 + index,
+                       label='实现 窗口') for index in range(4)]
+        self.endpoints = with_name_views([*(endpoint(item) for item in targets), endpoint(spaced),
+                                          endpoint(plain, native_name=NameSource('named', 'review-vm')),
+                                          endpoint(twin), endpoint(other_twin)])
+        cases = ((plain, 'claude@review-vm'), (spaced, 'claude@id:' + spaced.native_id),
+                 (missing, 'claude@id:' + missing.native_id), (twin, 'claude@id:' + twin.native_id))
+        for (origin, expected), target in zip(cases, targets):
+            with self.subTest(expected=expected):
+                task, attempt = self._task(target, origin=origin)
+                self._run()
+                _target, text, context = self.codex.calls[-1]
+                self.assertTrue(_target.ref.same_session(target))
+                self.assertEqual(context.sender_name, expected)
+                self.assertEqual(text.splitlines()[0], f'[AgentStatus 协作] task={task.id} attempt=1 '
+                                 f'msg={attempt.message_id} role=handoff from={expected} device=testbox')
+                self.assertRegex(expected, r'^\S{1,64}$')
+                header = parse_header(text)
+                assert header is not None
+                self.assertEqual((header.role, header.sender), (Role.HANDOFF, expected))
+                frame = json.loads(build_frame(text, context))
+                content = frame['message']['content']
+                self.assertIn(f'from-name="{expected}"', content)
+                self.assertNotIn('〔', content)
+                for leaked in (origin.label, 'vm-claude', 'claude@lead', origin.native_id[:8] + ' '):
+                    self.assertNotIn(leaked, content)
+        self.assertEqual(len(self.codex.calls), 4)
 
     def test_linux_pending_uses_discovery_cache(self) -> None:
         from unittest.mock import Mock
@@ -206,6 +234,20 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(failed.delivery, Delivery.FAILED)
         self.assertEqual(failed.delivery_reason, "target_gone")
 
+    def test_renamed_target_still_present_keeps_the_task_when_its_old_name_moves(self) -> None:
+        # §91 T6：在途目标按绑定身份投递。原目标仍在、只是改名 work2，另一会话现在叫 work（原目标存下的 label），
+        # 仍投给原目标，不按旧名字重新解析（「原目标已退出」形态见 test_bridge_closure）
+        target = ref()
+        assert target.label == "work"
+        other = ref(native="thread-other", pid=2000, pane="%2", label="other")
+        self.endpoints = with_name_views([endpoint(target, native_name=NameSource("named", "work2")),
+                                          endpoint(other, native_name=NameSource("named", "work"))])
+        _task, attempt = self._task(target)
+        self._run()
+        self.assertEqual(len(self.codex.calls), 1)
+        self.assertTrue(self.codex.calls[0][0].ref.same_session(target))
+        self.assertEqual(self._attempt(attempt.id).delivery, Delivery.QUEUED)
+
     def test_empty_discovery_never_declares_target_gone(self) -> None:
         _task, attempt = self._task(ref())
         self.endpoints = []
@@ -328,7 +370,9 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(context.sender_class, "bypass")
         self.assertEqual(context.reply_to, "uds:/run/test/inbox.sock")
         self.assertEqual(context.message_uuid, message_uuid(attempt.message_id))
-        self.assertIn("from=codex@lead device=testbox", text.splitlines()[0])
+        # 发起方本轮未发现：没有同绑定名字证据，from 写完整 ID，不回退 tmux 标签（§91.4.2）
+        self.assertIn("from=codex@id:origin-thread device=testbox", text.splitlines()[0])
+        self.assertNotIn("codex@lead", text)
         self.assertEqual(self._attempt(attempt.id).delivery, Delivery.WRITTEN)
 
     def _claude_written(self, socket_path: str = "/run/test/peer.sock"):

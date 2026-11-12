@@ -3,6 +3,9 @@
 endpointId 由所属设备按 (provider, nativeId, 本机根绑定) 持久分配：同根恢复更新 revision 不换 ID，换根换新 ID。
 根摘要只留本机，不发网络。目录只公开 provider/完整 ID/绑定标识/名字/收件能力/eligible/namesVerified 与 provider
 完整性，不发 cwd、PID、进程路径、pipe/key、transcript；超预算标 complete=false，不截断后谎称完整。
+
+名字（§91.4.1）：每行最多一个原生主名，只取端点携带的本轮 NameView（name 是可复制主名、displayName 是转义展示名、
+namesVerified 是主名已核实）；不回退 Endpoint.name、tmux 会话名、pane 或 Windows alias。快照带 namePolicy。
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from typing import Any
 
 from ..endpoints import ADAPTERS, Endpoint
 from ..model import EndpointRef, Provider
+from ..native_names import TARGET_ID_UNVERIFIED, TARGET_PROVIDER_REQUIRED, SelectorError, id_prefixes, parse_selector
 from ..paths import claude_sessions_dirs, codex_home, grok_home
 from ..platforms.factory import get_platform
 from .codec import canonical_bytes
@@ -27,6 +31,9 @@ MAX_ENDPOINT_BYTES = 2048
 MAX_SNAPSHOT_BYTES = 768 * 1024
 MAX_LABEL_CHARS = 120
 FRESH_MS = 90_000
+# last_seen 是 hub 的时刻、now 是本机时刻：hub 钟略快会算出小的负年龄。owner 2026-11-12 定容忍 5 秒（§91.9 D-B）
+CLOCK_SKEW_MS = 5_000
+NAME_POLICY = "agent-native-v1"
 
 
 class DirectoryError(Exception):
@@ -73,50 +80,69 @@ def root_binding(ref: EndpointRef) -> str | None:
     return _digest_path(grok_home())
 
 
-def bind_local(store: FederatedStore, ident_device: str, ref: EndpointRef, *, label: str | None = None) -> TargetRef:
-    """本机端点 → TargetRef（本机字段 + 对外远端投影）；分配或复用持久 endpointId。根核实不了报 target_root_unverified。"""
+def published_name(endpoint: Endpoint | None, *, publish_names: bool) -> str | None:
+    """可作远端人读旁注的名字：本轮已核实、可复制的原生主名，且发布开关打开；否则 None（§91.4.2/91.4.3）。"""
+    view = endpoint.name_view if endpoint is not None and publish_names else None
+    return view.name if view is not None and view.verified and view.name is not None else None
+
+
+def bind_local(store: FederatedStore, ident_device: str, ref: EndpointRef, *, verified_name: str | None) -> TargetRef:
+    """本机端点 → TargetRef（本机字段 + 对外远端投影）；分配或复用持久 endpointId。根核实不了报 target_root_unverified。
+
+    displayLabel 只取调用方给的已核实原生主名（published_name），不回退 ref.label——它在 Windows 上可能是本机 alias。
+    """
     binding = root_binding(ref)
     if binding is None:
         raise DirectoryError("target_root_unverified")
     endpoint_id, revision = store.bind_endpoint(provider=ref.provider.value, native_id=ref.native_id,
                                                 root_binding=binding, local_ref=ref.to_dict())
-    text = label or ref.label
+    label = verified_name if verified_name is not None and len(verified_name) <= MAX_LABEL_CHARS else None
     remote = RemoteEndpointRef(device_id=ident_device, provider=ref.provider, native_id=ref.native_id,
-                               endpoint_id=endpoint_id, endpoint_revision=revision,
-                               display_label=text[:MAX_LABEL_CHARS] if text else None)
+                               endpoint_id=endpoint_id, endpoint_revision=revision, display_label=label)
     return TargetRef(remote=remote, local=ref)
 
 
 def snapshot(store: FederatedStore, device_id: str, endpoints: Iterable[Endpoint], *,
              publish_names: bool = True, provider_complete: Mapping[str, bool] | None = None) -> dict[str, Any]:
-    """整帧目录：每个本机端点一行（绑定标识、名字、收件能力、eligible）；超预算标 incomplete。"""
+    """整帧目录：每个本机端点一行（绑定标识、名字、收件能力、eligible）；超预算标 incomplete。
+
+    名字的证明与否证已在发现时对全集算好（NameView），这里只投影：先对全集定名，再按预算降级，不先裁冲突证据。
+    单行超限时先丢名字（降为纯 ID、namesVerified=false）保住身份，并标快照不完整；名字本身超过 120 字符也只丢名字。
+    """
     rows: list[dict[str, Any]] = []
     reason = None
     for endpoint in endpoints:
         ref = endpoint.ref
+        view = endpoint.name_view if publish_names else None
         try:
-            target = bind_local(store, device_id, ref, label=endpoint.name)
+            target = bind_local(store, device_id, ref, verified_name=published_name(endpoint, publish_names=publish_names))
         except DirectoryError:
             reason = "root_unverified"  # 这一行不发布；目录因此不完整，名字不能据此唯一选中
             continue
-        name = (endpoint.name or ref.label) if publish_names else None
         row: dict[str, Any] = {
             "provider": ref.provider.value, "nativeId": ref.native_id, "endpointId": target.remote.endpoint_id,
             "endpointRevision": target.remote.endpoint_revision, "inbox": ADAPTERS[ref.provider].inbox,
-            "eligible": not endpoint.blocking_issues, "namesVerified": endpoint.name is not None and publish_names,
+            "eligible": not endpoint.blocking_issues, "namesVerified": False,
         }
-        if name:
-            row["name"] = name[:MAX_LABEL_CHARS]
+        if view is not None and view.name is not None and len(view.name) <= MAX_LABEL_CHARS:
+            row.update(name=view.name, namesVerified=view.verified)
+        if view is not None and view.display_name:
+            row["displayName"] = view.display_name  # display_text 已转义并限 120 字符
         if len(canonical_bytes(row)) > MAX_ENDPOINT_BYTES:
+            for key in ("name", "displayName"):
+                row.pop(key, None)
+            row["namesVerified"] = False
             reason = "endpoint_too_large"
-            continue
+            if len(canonical_bytes(row)) > MAX_ENDPOINT_BYTES:
+                continue  # 连纯 ID 都放不下：不发布这一行
         if len(rows) >= MAX_ENDPOINTS:
             reason = "too_many_endpoints"
             break
         rows.append(row)
     providers = {key: bool(value) for key, value in (provider_complete or {}).items()}
     complete = reason is None and all(providers.values())
-    document: dict[str, Any] = {"endpoints": rows, "complete": complete, "providers": providers}
+    document: dict[str, Any] = {"endpoints": rows, "complete": complete, "providers": providers,
+                                "namePolicy": NAME_POLICY}
     if reason is not None:
         document["reason"] = reason
     while len(canonical_bytes(document)) > MAX_SNAPSHOT_BYTES and rows:
@@ -137,53 +163,84 @@ def device_row(store: FederatedStore, reference: str) -> dict[str, Any]:
     return rows[0]
 
 
-def _parse_selector(selector: str) -> tuple[Provider | None, str, bool]:
-    provider: Provider | None = None
-    rest = selector.strip()
-    if "@" in rest:
-        prefix, rest = rest.split("@", 1)
-        try:
-            provider = Provider(prefix)
-        except ValueError as error:
-            raise DirectoryError("remote_endpoint_unresolved") from error
-    exact = rest.startswith("id:")
-    return provider, rest[3:] if exact else rest, exact
+def fresh(device: Mapping[str, Any], *, now: int) -> bool:
+    """目录可用于名字/前缀：hub 报在线，且缓存年龄在 [−5 秒, 90 秒]（§91.2.2；负侧容忍两端时钟的小偏差）；
+    更大的负年龄与缺字段都不猜。"""
+    seen = device.get("last_seen")
+    return (device.get("state") == "online" and isinstance(seen, int) and not isinstance(seen, bool)
+            and -CLOCK_SKEW_MS <= now - seen <= FRESH_MS)
 
 
-def resolve_remote(store: FederatedStore, device_reference: str, selector: str) -> TargetRef:
-    """在 B 的缓存目录里解析 `--to`：`provider@id:<完整ID>` 精确；名字只在 namesVerified 且唯一时可用。
+def _relevant_complete(snapshot_data: Mapping[str, Any], entries: list[dict[str, Any]], provider: Provider | None) -> bool:
+    """名字/前缀要求相关 provider 明确完整：快照 complete 为 true，相关 provider 的完整性必须是布尔 true（缺键不算）。
 
-    stale/offline 的已验证绑定也可排队（输出等 B 复核）；从未见过的 UUID 报 remote_endpoint_unresolved，不按名字猜。
+    相关集合取自快照本身（providers 的键并上行里出现的 provider），不取本机枚举：Windows 只发 codex/claude。
+    """
+    if snapshot_data.get("complete") is not True:
+        return False
+    raw = snapshot_data.get("providers")
+    providers: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}  # pyright: ignore[reportUnknownArgumentType]
+    if provider is not None:
+        relevant = {provider.value}
+    else:
+        relevant = {key for key in providers if isinstance(key, str)} | {str(item.get("provider")) for item in entries}
+    return all(providers.get(key) is True for key in relevant)
+
+
+def _full_id(item: Mapping[str, Any]) -> str:
+    return f"{item.get('provider')}@id:{item.get('nativeId')}"
+
+
+def resolve_remote(store: FederatedStore, device_reference: str, selector: str, *, now: int) -> TargetRef:
+    """在 B 的缓存目录里解析 `--to`（§91.2.2）。错误顺序：设备 → 语法/名字须带 provider → 目录完整性 → fresh/online
+    → 匹配与名字核实 → 收件资格。
+
+    - 完整 ID（`id:<完整>` 或裸完整 UUID）精确匹配已观察绑定，跳过完整性与时效门；stale/offline 的已验证绑定照样排队，
+      由 B 复核；从未见过的 ID 报 remote_endpoint_unresolved，不按名字猜。
+    - `id:` 前缀要求相关 provider 明确完整且目录新鲜，否则 remote_directory_incomplete / target_id_unverified。
+    - 名字必须带 provider（target_provider_required），只匹配原生主名：规范值命中的每一行都须逐字相等且 namesVerified
+      明确为 true，不能先丢掉未核实行再算唯一。
+    - 历史帧（无或未知 namePolicy）按旧字段理解，不追认来源，但补上同样的门；带 provider、≥32 字符的值沿旧启发式按
+      nativeId 精确匹配。
     """
     device = device_row(store, device_reference)
-    provider, value, exact = _parse_selector(selector)
-    entries = [item for item in device["snapshot"].get("endpoints") or [] if isinstance(item, dict)]
-    if provider is not None:
-        entries = [item for item in entries if item.get("provider") == provider.value]
-    if exact or len(value) >= 32:
-        matches = [item for item in entries if str(item.get("nativeId", "")).lower() == value.lower()]
+    try:
+        wanted = parse_selector(selector)
+    except SelectorError as error:
+        raise DirectoryError(error.args[0]) from None
+    snapshot_data = device["snapshot"] if isinstance(device.get("snapshot"), dict) else {}
+    legacy = snapshot_data.get("namePolicy") != NAME_POLICY
+    entries = [item for item in snapshot_data.get("endpoints") or [] if isinstance(item, dict)]
+    pool = [item for item in entries if wanted.provider is None or item.get("provider") == wanted.provider.value]
+    if wanted.kind == "name" and wanted.provider is None:
+        raise DirectoryError(TARGET_PROVIDER_REQUIRED)
+    if wanted.kind == "id" or (legacy and wanted.kind == "name" and len(wanted.value) >= 32):
+        matches = [item for item in pool if str(item.get("nativeId", "")).lower() == wanted.value.lower()]
     else:
-        # 名字只在目录完整（相关 provider 都报完整）时才能当唯一：没收齐的同名端点无法参与消歧
-        snapshot_data = device["snapshot"]
-        providers = snapshot_data.get("providers") or {}
-        relevant = [provider.value] if provider is not None else list(providers)
-        if snapshot_data.get("complete") is not True or any(providers.get(key) is False for key in relevant):
+        if not _relevant_complete(snapshot_data, entries, wanted.provider):
             raise DirectoryError("remote_directory_incomplete")
-        named = [item for item in entries if item.get("name") == value]
-        if named and not all(item.get("namesVerified") for item in named):
-            raise DirectoryError("target_names_unverified")
-        matches = named
+        if not fresh(device, now=now):
+            raise DirectoryError(TARGET_ID_UNVERIFIED if wanted.kind == "prefix" else "target_names_unverified")
+        if wanted.kind == "prefix":
+            matches = [item for item in pool if str(item.get("nativeId", "")).lower().startswith(wanted.value)]
+        else:
+            named = [item for item in pool if isinstance(item.get("name"), str) and item["name"].strip() == wanted.value]
+            if any(item["name"] != wanted.value or item.get("namesVerified") is not True for item in named):
+                raise DirectoryError("target_names_unverified", tuple(_full_id(item) for item in named))
+            matches = named
     if not matches:
         raise DirectoryError("remote_endpoint_unresolved")
     if len(matches) > 1:
-        raise DirectoryError("target_ambiguous", tuple(f"{item['provider']}@id:{item['nativeId']}" for item in matches))
+        raise DirectoryError("target_ambiguous", tuple(_full_id(item) for item in matches))
     item = matches[0]
     if item.get("inbox") is False:
         raise DirectoryError("target_no_inbox")
+    name = item.get("name")
+    label = name if (isinstance(name, str) and item.get("namesVerified") is True
+                     and len(name) <= MAX_LABEL_CHARS) else None
     remote = RemoteEndpointRef(device_id=str(device["device_id"]), provider=Provider(item["provider"]),
                                native_id=str(item["nativeId"]), endpoint_id=str(item["endpointId"]),
-                               endpoint_revision=int(item.get("endpointRevision") or 1),
-                               display_label=str(item["name"])[:MAX_LABEL_CHARS] if item.get("name") else None)
+                               endpoint_revision=int(item.get("endpointRevision") or 1), display_label=label)
     return TargetRef(remote=remote)
 
 
@@ -196,8 +253,10 @@ def peer_devices(store: FederatedStore, device_reference: str | None, *, now: in
     devices: list[dict[str, Any]] = []
     for row in rows:
         seen = row.get("last_seen")
-        fresh = isinstance(seen, int) and now - seen <= FRESH_MS and row["state"] == "online"
-        snapshot_data = row["snapshot"]
+        online = fresh(row, now=now)
+        snapshot_data = row["snapshot"] if isinstance(row.get("snapshot"), dict) else {}
+        # 可复制的 --device 值：登记 slug，没有就用完整 deviceId（device_row 两者都认；8 位前缀解析不了）
+        reference = str(row["name"] or row["device_id"])
         peers: list[dict[str, Any]] = []
         for item in snapshot_data.get("endpoints") or []:
             if not isinstance(item, dict):
@@ -207,31 +266,59 @@ def peer_devices(store: FederatedStore, device_reference: str | None, *, now: in
                 "scope": "remote", "device": row["name"],
                 "remoteRef": {"deviceId": row["device_id"], "provider": provider, "nativeId": native,
                               "endpointId": item.get("endpointId"), "endpointRevision": item.get("endpointRevision")},
-                "name": item.get("name"), "inbox": item.get("inbox", True) is not False,
+                "name": item.get("name"), "displayName": item.get("displayName"),
+                "inbox": item.get("inbox", True) is not False,
                 "eligible": item.get("eligible", True) is not False, "namesVerified": item.get("namesVerified") is True,
-                "target": f"--device {row['name']} --to {provider}@id:{native}",
+                "target": f"--device {reference} --to {provider}@id:{native}",
             })
-        devices.append({"device": row["name"], "deviceId": row["device_id"], "online": fresh,
-                        "state": "revoked" if row["state"] == "revoked" else ("online" if fresh else "unknown"),
+        devices.append({"device": row["name"], "deviceId": row["device_id"], "online": online,
+                        "state": "revoked" if row["state"] == "revoked" else ("online" if online else "unknown"),
                         "lastSeen": seen if isinstance(seen, int) else None,
-                        "complete": snapshot_data.get("complete") is True, "peers": peers})
+                        "complete": snapshot_data.get("complete") is True,
+                        "namePolicy": snapshot_data.get("namePolicy"), "peers": peers})
     return devices
+
+
+def _shown_ids(row: Mapping[str, Any], *, now: int) -> dict[tuple[str, str], str]:
+    """peers 文字里的消歧 ID（§91.4.2）：该 provider 目录明确完整且新鲜时取缓存全集上的最短唯一前缀，否则完整 ID。"""
+    snapshot_data = row["snapshot"] if isinstance(row.get("snapshot"), dict) else {}
+    entries = [item for item in snapshot_data.get("endpoints") or [] if isinstance(item, dict)]
+    live = fresh(row, now=now)
+    shown: dict[tuple[str, str], str] = {}
+    for name in {str(item.get("provider")) for item in entries}:
+        try:
+            complete = live and _relevant_complete(snapshot_data, entries, Provider(name))
+        except ValueError:
+            complete = False
+        ids = [str(item.get("nativeId", "")) for item in entries if str(item.get("provider")) == name]
+        shown.update(((name, native), prefix) for native, prefix in id_prefixes(ids, complete=complete).items())
+    return shown
 
 
 def peer_lines(store: FederatedStore, device_reference: str | None, *, now: int) -> list[str]:
     """文字版：按设备展示缓存目录，附可直接复制的完整目标。"""
     lines: list[str] = []
+    rows = {str(row["device_id"]): row for row in (store.device_states() if device_reference is None
+                                                   else [device_row(store, device_reference)])}
     for device in peer_devices(store, device_reference, now=now):
+        shown_ids = _shown_ids(rows.get(str(device["deviceId"])) or {}, now=now)
         state = {"online": "在线", "revoked": "已撤销"}.get(device["state"], "离线或未知")
         complete = "完整" if device["complete"] else "不完整"
         lines.append(f"设备 {device['device']}〔{str(device['deviceId'])[:8]}〕：{state}，目录{complete}")
+        where = device["device"] or device["deviceId"]
         for peer in device["peers"]:
             ref = peer["remoteRef"]
-            name = peer["name"] or ref["nativeId"][:8]
+            # 名字只作带设备的人读旁注：已核实写「provider@名字〔ID〕」，否则「provider@id:<ID> 名称=…（仅展示）」；
+            # 可复制的永远是 target 里的完整 ID 与 --device（§91.4.2）
+            short_id = shown_ids.get((str(ref["provider"]), str(ref["nativeId"])), str(ref["nativeId"]))
+            if peer["namesVerified"] and isinstance(peer["name"], str):
+                shown = f"{ref['provider']}@{peer['name']}〔{short_id}〕"
+            else:
+                display = peer["displayName"] or peer["name"]
+                shown = f"{ref['provider']}@id:{short_id}" + (f" 名称={display}（仅展示）" if display else "")
             flags = [] if peer["inbox"] else ["只读"]
             if not peer["eligible"]:
                 flags.append("暂不可投")
             suffix = f"  （{'、'.join(flags)}）" if flags else ""
-            lines.append(f"  {ref['provider']}@{name}〔{ref['nativeId'][:8]}〕 device={device['device']}"
-                         f" target={peer['target']}{suffix}")
+            lines.append(f"  {shown} device={where} target={peer['target']}{suffix}")
     return lines

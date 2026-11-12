@@ -13,6 +13,7 @@ from typing import Any
 from ..closure import ACCEPTED, CLOSED, closure_body
 from ..ids import new_id, short
 from ..labels import next_step, review_capacity_hint
+from ..native_names import id_token
 from ..model import MAY_HAVE_ARRIVED, Attempt, Delivery, Provider, ReportKind, Role, Task, Verdict, Work
 from ..reports import REPORT_LABELS
 from ..store import CAPACITY_CODES, MAX_ACTIVE_TASKS, MAX_PENDING_ATTEMPTS, StoreError, attempt_limit
@@ -347,7 +348,7 @@ def _send_decision(store: FederatedStore, ident: Identity, task: FedTask, report
 
 
 def apply_report(store: FederatedStore, ident: Identity, report: dict[str, Any], *, reporter_device: str,
-                 now: int, reporter_token: str | None = None, command: str = "ab") -> Decision:
+                 now: int, command: str = "ab") -> Decision:
     """A 裁决一条报告（远端报告与 A 本机参与方报告共用）。
 
     report 字段：authorityDeviceId/taskId/attempt/reportNo/operationId/kind/note/refs/commit/reporter/reporterClass/source。
@@ -414,12 +415,12 @@ def apply_report(store: FederatedStore, ident: Identity, report: dict[str, Any],
             return _reject(store, ident, task, report, reporter_device=reporter_device,
                            reason="result_already_submitted", now=now)
         return _accept_report(store, ident, task, attempts, attempt, report, kind, reporter_device=reporter_device,
-                              now=now, reporter_token=reporter_token, command=command)
+                              now=now, command=command)
 
 
 def _accept_report(store: FederatedStore, ident: Identity, task: FedTask, attempts: list[FedAttempt],
                    attempt: FedAttempt, report: dict[str, Any], kind: ReportKind, *, reporter_device: str, now: int,
-                   reporter_token: str | None, command: str) -> Decision:
+                   command: str) -> Decision:
     result: dict[str, Any] = {"note": report.get("note") or "", "refs": list(report.get("refs") or []),
                               "source": report.get("source", "agent"), "reportedAt": now}
     if isinstance(report.get("commit"), dict):
@@ -485,7 +486,9 @@ def _accept_report(store: FederatedStore, ident: Identity, task: FedTask, attemp
             if "review" in decision.skipped:
                 next_text = review_capacity_hint(decision.skipped["review"])
             title = f"「{task.title}」" if task.title else ""
-            label = reporter_token or (reporter_actor.wire_token if reporter_actor else attempt.target.remote.native_id[:8])
+            # 执行方标识按结构化身份生成（完整 ID），不照抄对端信封里的 wireToken：W3.9 对端仍发友好名（附注 P3-4）
+            label = (id_token(reporter_actor.provider, reporter_actor.native_id) if reporter_actor
+                     else id_token(attempt.target.remote.provider, attempt.target.remote.native_id))
             lines = [f"你发起的任务{title}{REPORT_LABELS[kind]}（{label}）。", *_describe_result(result)]
             if next_text:
                 lines.append(f"下一步：{next_text}")
@@ -519,11 +522,10 @@ class _Rollback(Exception):
 
 
 def apply_report_safely(store: FederatedStore, ident: Identity, report: dict[str, Any], *, reporter_device: str,
-                        now: int, reporter_token: str | None = None, command: str = "ab") -> Decision:
+                        now: int, command: str = "ab") -> Decision:
     """apply_report 的外层：确定业务拒绝（如复核方无收件通道）回滚推进后，另开事务写报告事实与拒绝决定。"""
     try:
-        return apply_report(store, ident, report, reporter_device=reporter_device, now=now,
-                            reporter_token=reporter_token, command=command)
+        return apply_report(store, ident, report, reporter_device=reporter_device, now=now, command=command)
     except _Rollback as rollback:
         with store.transaction():
             existing = store.decision(reporter_device, report["operationId"])
@@ -540,7 +542,8 @@ def apply_report_safely(store: FederatedStore, ident: Identity, report: dict[str
 
 
 def _review_body(attempt: FedAttempt, result: dict[str, Any]) -> str:
-    lines = [f"请复核 {attempt.target.remote.provider.value}@{attempt.target.remote.native_id[:8]} 完成的这项工作。", "",
+    # 复核请求可能发往另一台设备：执行方写完整 ID，不写 8 位短 ID（附注 P3-1）
+    lines = [f"请复核 {id_token(attempt.target.remote.provider, attempt.target.remote.native_id)} 完成的这项工作。", "",
              "【结果】"]
     lines.extend(_describe_result(result) or ["（对方未附说明）"])
     lines.extend(["", "【原始任务要求】", attempt.body.rstrip()])

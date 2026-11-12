@@ -30,7 +30,8 @@ class MetadataCache:
         self.attempted: frozenset[str] = frozenset()  # 诊断：本轮交给读取器或仍有效缓存的 id，不是发帧计数
 
     def read(self, home: Path, holders: Mapping[str, tuple[tuple[int, str], ...]], *,
-             preferred: Collection[str] = (), absent: Collection[str] = ()) -> NativeBatch:
+             preferred: Collection[str] = (), absent: Collection[str] = (),
+             deferred: Collection[str] = ()) -> NativeBatch:
         self.attempted = frozenset()
         if not holders:
             self._entries.clear()
@@ -53,8 +54,10 @@ class MetadataCache:
             self._queried = True
             priority = set(preferred)
             no_row = set(absent)
+            later = set(deferred) - priority - no_row  # §91：只为取名的 thread 排在分类之后（分类优先）
             ordered: list[str] = []
-            for group in (missing & priority, (missing - priority) & no_row, missing - priority - no_row):
+            for group in (missing & priority, (missing - priority) & no_row, missing - priority - no_row - later,
+                          missing & later):
                 values = sorted(group, reverse=True)
                 offset = 0 if self.single_batch or not values else self._cursor % len(values)
                 ordered.extend(values[offset:] + values[:offset])

@@ -29,7 +29,7 @@ from agentstatus_bridge.envelope import parse_header
 from agentstatus_bridge.model import Attempt, Consumption, Delivery, EndpointRef, Flow, Provider, Role, Runtime, Task, Work
 from agentstatus_bridge.store import Store, StoreError
 from agentstatus_bridge.transports import DeliveryOutcome, codex_queue
-from bridge_support import FakeProc, RecordingTransport, discovering, endpoint, ref
+from bridge_support import FakeProc, RecordingTransport, discovering, endpoint, ref, with_name_views
 from test_bridge_cli import IMPL, LEAD, REVIEW, USER, as_agent
 
 DAY = 86400.0
@@ -47,7 +47,8 @@ class ClosureCliTests(unittest.TestCase):
             # AgentStatus 快照在最底层替换为空（DESIGN §55.4）：查询命令照真实代码读一次、什么也读不到
             patch.object(observer_dbus, "_observer_rows", return_value=[]),
             patch.dict(os.environ, {"AB_STATE_DIR": str(self.state)}),
-            patch.object(cli, "discover", side_effect=discovering(lambda: [IMPL, REVIEW, LEAD])),
+            # 真实 discover 会让端点带上本轮 NameView（§91.4.2）；回执文本与 JSON 里的名字只从它来
+            patch.object(cli, "discover", side_effect=discovering(lambda: with_name_views([IMPL, REVIEW, LEAD]))),
             patch.object(cli, "identify_caller", side_effect=lambda _endpoints: self.caller),
             patch.object(cli, "ensure_worker", return_value=False),
             patch.object(cli, "worker_running", side_effect=lambda _root: self.worker_up),
@@ -208,7 +209,9 @@ class ClosureCliTests(unittest.TestCase):
         self.assertEqual(self.run_cli("close", task_id)[0], cli.EXIT_OK)
         code, out, _ = self.run_cli("status", task_id)
         self.assertEqual(code, cli.EXIT_OK)
-        self.assertIn("#2 结束回执 → codex@impl〔impl-thr〕：桥内排队", out)
+        # 已结束的任务 status 不另做发现（§91.4.2）：没有同绑定名字证据，写完整 ID，不回退 tmux 标签
+        self.assertIn("#2 结束回执 → codex@id:impl-thread：桥内排队", out)
+        self.assertNotIn("codex@impl", out)
         self.assertIn("排队结束回执", out)
         self.assertNotIn("通知发起方", out)
         code, out, _ = self.run_cli("status", task_id, "--json")

@@ -24,6 +24,7 @@ from test_bridge_windows_discovery import uuid
 from agentstatus_bridge import cli, worker
 from agentstatus_bridge.dispatch import Dispatcher
 from agentstatus_bridge.model import Delivery, Consumption, Flow, Provider, EndpointRef
+from agentstatus_bridge.native_names import Selector
 from agentstatus_bridge.store import Store, StoreError
 from agentstatus_bridge.transports import DeliveryContext, DeliveryOutcome
 from agentstatus_bridge.transports.codex_native import NativeFailure
@@ -97,7 +98,9 @@ class NamingTests(unittest.TestCase):
         for row in repeated.rows:
             self.assertEqual(repeated.select(repeated.target_name(row)).thread,row.thread)
         with self.assertRaisesRegex(NativeFailure,'target_explicit_required'):result.select(None)
-        with self.assertRaisesRegex(NativeFailure,'target_ambiguous'):result.select('00000000')
+        # §91.2.1：裸值只按名字，'00000000' 不再并入 ID 前缀；显式 id: 前缀另行歧义，同样不自动选
+        with self.assertRaisesRegex(NativeFailure,'target_not_found'):result.select('00000000')
+        with self.assertRaisesRegex(NativeFailure,'target_ambiguous'):result.select('id:00000000')
         failure=None;chosen=None
         try:chosen=result.select('id:'+uuid(1))
         except NativeFailure as error:failure=error.reason
@@ -354,7 +357,10 @@ class DeliveryTests(unittest.TestCase):
             db.execute('UPDATE threads SET name=?,cwd=?',('原生任务',r'C:\private\project'))
         with self.scope():
             result=D.discover(self.p.transport)
-            self.assertEqual(result.document()['peers'][0]['target'],'codex@原生任务')
+            # §91.4.2：peers target 一律完整 ID；SQL 原生名进 name 并已核实，本机私有 label 仍是它
+            peer=result.document()['peers'][0]
+            self.assertEqual((peer['target'],peer['name'],peer['nameVerified']),('codex@id:'+uuid(1),'原生任务',True))
+            self.assertEqual(result.target_name(result.rows[0]),'codex@原生任务')
             self.assertEqual(result.select('原生任务').thread,uuid(1))
             self.assertEqual(result.select('project').thread,uuid(1))
             self.assertFalse(any(m['method']=='thread/read' for m in self.k.messages))
@@ -400,7 +406,10 @@ class DeliveryTests(unittest.TestCase):
             db=connect(database,**kw);db.set_trace_callback(trace.append);return db
         with self.scope(),patch.object(sqlite3,'connect',opened):
             result=D.discover(self.p.transport)
-            self.assertEqual(result.document()['peers'][0]['target'],'codex@Native legacy name')
+            # §91.4.2：peers target 一律完整 ID；原生名取 thread/read 的 name（不取 legacy SQL 的 stale）并已核实
+            peer=result.document()['peers'][0]
+            self.assertEqual((peer['target'],peer['name'],peer['nameVerified']),('codex@id:'+uuid(1),'Native legacy name',True))
+            self.assertEqual(result.target_name(result.rows[0]),'codex@Native legacy name')
             self.assertTrue(result.names_complete)
             self.assertEqual(sum(m['method']=='thread/read' for m in self.k.messages),1)
             self.assertFalse(any('title' in s.lower() or 'preview' in s.lower() for s in trace))
@@ -408,7 +417,9 @@ class DeliveryTests(unittest.TestCase):
         with closing(sqlite3.connect(path)) as db, db:db.execute("UPDATE threads SET history_mode='future'")
         with self.scope():
             result=D.discover(self.p.transport)
-            self.assertEqual(result.document()['peers'][0]['target'],'codex@Native legacy name')
+            peer=result.document()['peers'][0]
+            self.assertEqual((peer['target'],peer['name'],peer['nameVerified']),('codex@id:'+uuid(1),'Native legacy name',True))
+            self.assertEqual(result.target_name(result.rows[0]),'codex@Native legacy name')
 
     def test_incomplete_name_budget_does_not_invent_name_uniqueness(self):
         self.k.loaded=[uuid(1),uuid(2)]
@@ -941,8 +952,17 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(chosen.thread,b)
         single=replace(result,rows=(replace(rows[0],name='alpha',cwd_label='project'),))
         with self.assertRaisesRegex(NativeFailure,'target_not_found'):single.select('0')
-        for key in ('same',a[:8]):
-            with self.assertRaisesRegex(NativeFailure,'target_ambiguous'):result.select(key)
+        # §91.2.1：裸值只按名字，名字未命中不改找 ID 前缀；显式 id: 才按前缀
+        with self.assertRaisesRegex(NativeFailure,'target_not_found'):single.select(a[:8])
+        self.assertEqual(single.select('id:'+a[:8]).thread,a)
+        with self.assertRaisesRegex(NativeFailure,'target_ambiguous'):result.select('same')
+        # 名字与 ID 前缀不再合并：a[:8] 只命中 b 的次级 cwd；id: 前缀命中 a、b 两行，另行歧义
+        error=None;chosen=None
+        try:chosen=result.select(a[:8])
+        except NativeFailure as failure:error=failure.reason
+        self.assertIsNone(error)
+        self.assertEqual(chosen.thread,b)
+        with self.assertRaisesRegex(NativeFailure,'target_ambiguous'):result.select('id:'+a[:8])
         repeated=replace(result,rows=(replace(rows[0],name='same'),rows[1]))
         with self.assertRaisesRegex(NativeFailure,'target_ambiguous'):repeated.select('same')
         same=replace(result,rows=(replace(rows[0],name='one',cwd_label='one'),rows[1]))
@@ -976,10 +996,12 @@ class AuditTests(unittest.TestCase):
                   patch('agentstatus_bridge.platforms.windows.caller.identify',return_value=Caller(None,None,'windows-terminal',False)),
                   patch.object(cli,'_start_worker',return_value=False),patch.object(cli,'_worker_up',return_value=False)):
                 for reference in ('',' ','　','codex@','codex@id:','id:','codex@ ','codex@id:\t',' \t'):
+                    # §91.2.2：显式 id: 后为空报 target_id_invalid（不转名字）；其余空值仍是 target_explicit_required
+                    expected='target_id_invalid' if reference.strip().lower().endswith('id:') else 'target_explicit_required'
                     for selectors in (['--to',reference],['--to',uuid(1),'--review-by',reference]):
                         code,out,err=self.run_cli('send',*selectors,'-m','fixture','--no-wait','--json')
                         self.assertEqual(code,2,(kinds,reference,selectors,err))
-                        self.assertIn('target_explicit_required',err)
+                        self.assertIn(expected,err)
                         self.assertFalse((self.state/'bridge.sqlite3').exists())
                         self.assertEqual(self.adds(),[])
 
@@ -987,8 +1009,9 @@ class AuditTests(unittest.TestCase):
         rows=tuple(D.Candidate(uuid(i+1),'root',name=name,cwd_label='',names_verified=True)
                    for i,name in enumerate(('', 'named')))
         result=D.Discovery(rows,True,'complete','a'*64,(200,'1'))
-        self.assertEqual(result._named(''),[])
-        self.assertEqual(result._named('named'),[rows[1]])
+        # 名字分支自己拒空名（不依赖 parse_selector 的空值检查）：直接交给它一个空名字选择器
+        with self.assertRaisesRegex(NativeFailure,'target_not_found'):result.select(Selector(None,'name',''))
+        self.assertEqual(result.select(Selector(None,'name','named')).thread,rows[1].thread)
         for row in rows:
             selector=result.target_name(row)
             self.assertNotIn(selector,('codex@','codex@id:','codex@ '))
@@ -1000,7 +1023,12 @@ class AuditTests(unittest.TestCase):
             rows=(D.Candidate(a,'root',name='alpha',names_verified=True),
                   replace(D.Candidate(b,'root',name='beta',names_verified=True),**{field:a[:8]}))
             result=D.Discovery(rows,True,'complete','a'*64,(200,'1'))
-            with self.assertRaisesRegex(NativeFailure,'target_ambiguous'):result.select(a[:8])
+            # §91.2.1：裸 a[:8] 只按名字，命中 b 的名字/次级 cwd，不再与 a 的 ID 前缀合并成歧义
+            error=None;chosen=None
+            try:chosen=result.select(a[:8])
+            except NativeFailure as failure:error=failure.reason
+            self.assertIsNone(error)
+            self.assertEqual(chosen.thread,b)
             for incomplete in (False,True):
                 sample=replace(result,rows=tuple(replace(r,names_verified=not incomplete) for r in rows))
                 error=None;chosen=None

@@ -40,6 +40,19 @@ def display_ref(target: TargetRef, *, label: str | None = None) -> EndpointRef:
     )
 
 
+def remote_text(target: TargetRef, device: str) -> str:
+    """跨设备目标的人读文本（§91.4.2）：`<设备> 上的 provider@id:<完整ID>`；有对端已核实主名时写成
+    `<设备> 上的 provider@名字 target=--device <设备> --to provider@id:<完整ID>`——名字只作旁注，可复制的是全限定 target。
+
+    `device` 须是可复制的设备引用（登记 slug，没有就是完整 deviceId）。不用 8 位短 ID：这里没有对端完整候选全集。
+    """
+    remote = target.remote
+    full = f"{remote.provider.value}@id:{remote.native_id}"
+    if remote.display_label:
+        return f"{device} 上的 {remote.provider.value}@{remote.display_label} target=--device {device} --to {full}"
+    return f"{device} 上的 {full}"
+
+
 def is_display_only(ref: EndpointRef) -> bool:
     """是否是 display_ref 造出的远端显示引用。"""
     return ref.pid == DISPLAY_ONLY_PID and ref.start_ticks.startswith(DISPLAY_PREFIX)
@@ -107,7 +120,7 @@ def model_attempt(attempt: FedAttempt) -> Attempt:
     if attempt.sender is not None:
         sender = EndpointRef(provider=attempt.sender.provider, native_id=attempt.sender.native_id,
                              pid=DISPLAY_ONLY_PID, start_ticks=DISPLAY_PREFIX + (attempt.sender.endpoint_id or ""),
-                             label=attempt.sender.wire_token)
+                             label=None)  # 显示走 NameBook；不把存下的 wireToken 当名字
     created = _seconds(attempt.authority_state.get("createdAt")) or 0.0
     return Attempt(
         id=attempt.msg_id,

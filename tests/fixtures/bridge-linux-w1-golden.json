@@ -5,7 +5,7 @@
         "peers"
       ],
       0,
-      "codex@fixture-label          %1    空闲     019a0000  prompting\n",
+      "codex@id:019a0000  target=codex@id:019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa  空闲  prompting\n",
       ""
     ],
     [
@@ -14,21 +14,21 @@
         "--json"
       ],
       0,
-      "{\n  \"peers\": [\n    {\n      \"device\": \"fixture-device\",\n      \"issues\": [],\n      \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n      \"pane\": \"%1\",\n      \"permissionClass\": \"prompting\",\n      \"provider\": \"codex\",\n      \"runtime\": \"idle\",\n      \"self\": false,\n      \"session\": \"fixture\\tlabel\",\n      \"target\": \"codex@fixture-label\",\n      \"threads\": [\n        \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\"\n      ]\n    }\n  ]\n}\n",
+      "{\n  \"peers\": [\n    {\n      \"device\": \"fixture-device\",\n      \"displayName\": null,\n      \"issues\": [],\n      \"name\": null,\n      \"nameVerified\": false,\n      \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n      \"pane\": \"%1\",\n      \"permissionClass\": \"prompting\",\n      \"provider\": \"codex\",\n      \"runtime\": \"idle\",\n      \"self\": false,\n      \"session\": \"fixture\\tlabel\",\n      \"target\": \"codex@id:019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n      \"threads\": [\n        \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\"\n      ]\n    }\n  ]\n}\n",
       ""
     ],
     [
       [
         "send",
         "--to",
-        "%1",
+        "codex@id:019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa",
         "--no-wait",
         "--json",
         "-m",
         "synthetic"
       ],
       6,
-      "{\n  \"acceptedAt\": null,\n  \"attempts\": [\n    {\n      \"bodyBytes\": 9,\n      \"consumption\": \"not_observed\",\n      \"createdAt\": 1000.0,\n      \"delivery\": \"pending\",\n      \"deliveryAt\": null,\n      \"deliveryDetail\": {},\n      \"deliveryDetailRedacted\": false,\n      \"deliveryReason\": null,\n      \"messageId\": \"00000000000000000000000000000004\",\n      \"providerRef\": null,\n      \"refs\": [],\n      \"result\": null,\n      \"role\": \"handoff\",\n      \"sender\": null,\n      \"senderClass\": \"bypass\",\n      \"seq\": 1,\n      \"target\": {\n        \"name\": \"codex@fixture\\tlabel\",\n        \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n        \"pane\": \"%1\",\n        \"provider\": \"codex\"\n      },\n      \"work\": \"awaiting_ack\",\n      \"workAt\": null\n    }\n  ],\n  \"closedAt\": null,\n  \"control\": \"active\",\n  \"createdAt\": 1000.0,\n  \"flow\": \"handoff\",\n  \"hint\": null,\n  \"id\": \"00000000000000000000000000000002\",\n  \"nativeWithdrawals\": {\n    \"operations\": [],\n    \"readable\": true,\n    \"reason\": null,\n    \"version\": 1\n  },\n  \"origin\": null,\n  \"phase\": \"queued\",\n  \"phaseLabel\": \"排队\",\n  \"reason\": \"waiting_for_target\",\n  \"reasonText\": \"已排队，还没发出\",\n  \"reviewer\": null,\n  \"targetSessionMissing\": false,\n  \"targetStoppedWithoutReport\": false,\n  \"targetTurnEndedAt\": null,\n  \"title\": \"synthetic\",\n  \"updatedAt\": 1000.0,\n  \"verdict\": null\n}\n",
+      "{\n  \"acceptedAt\": null,\n  \"attempts\": [\n    {\n      \"bodyBytes\": 9,\n      \"consumption\": \"not_observed\",\n      \"createdAt\": 1000.0,\n      \"delivery\": \"pending\",\n      \"deliveryAt\": null,\n      \"deliveryDetail\": {},\n      \"deliveryDetailRedacted\": false,\n      \"deliveryReason\": null,\n      \"messageId\": \"00000000000000000000000000000004\",\n      \"providerRef\": null,\n      \"refs\": [],\n      \"result\": null,\n      \"role\": \"handoff\",\n      \"sender\": null,\n      \"senderClass\": \"bypass\",\n      \"seq\": 1,\n      \"target\": {\n        \"name\": \"codex@id:019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n        \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n        \"pane\": \"%1\",\n        \"provider\": \"codex\"\n      },\n      \"work\": \"awaiting_ack\",\n      \"workAt\": null\n    }\n  ],\n  \"closedAt\": null,\n  \"control\": \"active\",\n  \"createdAt\": 1000.0,\n  \"flow\": \"handoff\",\n  \"hint\": null,\n  \"id\": \"00000000000000000000000000000002\",\n  \"nativeWithdrawals\": {\n    \"operations\": [],\n    \"readable\": true,\n    \"reason\": null,\n    \"version\": 1\n  },\n  \"origin\": null,\n  \"phase\": \"queued\",\n  \"phaseLabel\": \"排队\",\n  \"reason\": \"waiting_for_target\",\n  \"reasonText\": \"已排队，还没发出\",\n  \"reviewer\": null,\n  \"targetSessionMissing\": false,\n  \"targetStoppedWithoutReport\": false,\n  \"targetTurnEndedAt\": null,\n  \"title\": \"synthetic\",\n  \"updatedAt\": 1000.0,\n  \"verdict\": null\n}\n",
       ""
     ],
     [
@@ -36,7 +36,7 @@
         "tasks"
       ],
       0,
-      "00000000  排队   codex@fixture\tlabel          synthetic  （已排队，还没发出，0 秒前）\n",
+      "00000000  排队   codex@id:019a0000            synthetic  （已排队，还没发出，0 秒前）\n",
       ""
     ],
     [
@@ -45,7 +45,7 @@
         "--json"
       ],
       0,
-      "{\n  \"tasks\": [\n    {\n      \"acceptedAt\": null,\n      \"attempts\": [\n        {\n          \"bodyBytes\": 9,\n          \"consumption\": \"not_observed\",\n          \"createdAt\": 1000.0,\n          \"delivery\": \"pending\",\n          \"deliveryAt\": null,\n          \"deliveryDetail\": {},\n          \"deliveryDetailRedacted\": false,\n          \"deliveryReason\": null,\n          \"messageId\": \"00000000000000000000000000000004\",\n          \"providerRef\": null,\n          \"refs\": [],\n          \"result\": null,\n          \"role\": \"handoff\",\n          \"sender\": null,\n          \"senderClass\": \"bypass\",\n          \"seq\": 1,\n          \"target\": {\n            \"name\": \"codex@fixture\\tlabel\",\n            \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n            \"pane\": \"%1\",\n            \"provider\": \"codex\"\n          },\n          \"work\": \"awaiting_ack\",\n          \"workAt\": null\n        }\n      ],\n      \"closedAt\": null,\n      \"control\": \"active\",\n      \"createdAt\": 1000.0,\n      \"flow\": \"handoff\",\n      \"id\": \"00000000000000000000000000000002\",\n      \"nativeWithdrawals\": {\n        \"operations\": [],\n        \"readable\": true,\n        \"reason\": null,\n        \"version\": 1\n      },\n      \"origin\": null,\n      \"phase\": \"queued\",\n      \"phaseLabel\": \"排队\",\n      \"reason\": \"waiting_for_target\",\n      \"reasonText\": \"已排队，还没发出\",\n      \"reviewer\": null,\n      \"targetSessionMissing\": false,\n      \"targetStoppedWithoutReport\": false,\n      \"targetTurnEndedAt\": null,\n      \"title\": \"synthetic\",\n      \"updatedAt\": 1000.0,\n      \"verdict\": null\n    }\n  ]\n}\n",
+      "{\n  \"tasks\": [\n    {\n      \"acceptedAt\": null,\n      \"attempts\": [\n        {\n          \"bodyBytes\": 9,\n          \"consumption\": \"not_observed\",\n          \"createdAt\": 1000.0,\n          \"delivery\": \"pending\",\n          \"deliveryAt\": null,\n          \"deliveryDetail\": {},\n          \"deliveryDetailRedacted\": false,\n          \"deliveryReason\": null,\n          \"messageId\": \"00000000000000000000000000000004\",\n          \"providerRef\": null,\n          \"refs\": [],\n          \"result\": null,\n          \"role\": \"handoff\",\n          \"sender\": null,\n          \"senderClass\": \"bypass\",\n          \"seq\": 1,\n          \"target\": {\n            \"name\": \"codex@id:019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n            \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n            \"pane\": \"%1\",\n            \"provider\": \"codex\"\n          },\n          \"work\": \"awaiting_ack\",\n          \"workAt\": null\n        }\n      ],\n      \"closedAt\": null,\n      \"control\": \"active\",\n      \"createdAt\": 1000.0,\n      \"flow\": \"handoff\",\n      \"id\": \"00000000000000000000000000000002\",\n      \"nativeWithdrawals\": {\n        \"operations\": [],\n        \"readable\": true,\n        \"reason\": null,\n        \"version\": 1\n      },\n      \"origin\": null,\n      \"phase\": \"queued\",\n      \"phaseLabel\": \"排队\",\n      \"reason\": \"waiting_for_target\",\n      \"reasonText\": \"已排队，还没发出\",\n      \"reviewer\": null,\n      \"targetSessionMissing\": false,\n      \"targetStoppedWithoutReport\": false,\n      \"targetTurnEndedAt\": null,\n      \"title\": \"synthetic\",\n      \"updatedAt\": 1000.0,\n      \"verdict\": null\n    }\n  ]\n}\n",
       ""
     ],
     [
@@ -54,7 +54,7 @@
         "00000000000000000000000000000002"
       ],
       0,
-      "任务 00000000 「synthetic」 排队：已排队，还没发出\n流程：交接；发起：用户；创建于 0 秒前\n  #1 交接 → codex@fixture\tlabel：桥内排队；工作：等待对方确认\n下一步：等后台 worker 发送；不需要了可 agent-bridge cancel 00000000\n时间线：\n  01-01 00:16:40 #1 创建任务\n",
+      "任务 00000000 「synthetic」 排队：已排队，还没发出\n流程：交接；发起：用户；创建于 0 秒前\n  #1 交接 → codex@id:019a0000：桥内排队；工作：等待对方确认\n下一步：等后台 worker 发送；不需要了可 agent-bridge cancel 00000000\n时间线：\n  01-01 00:16:40 #1 创建任务\n",
       ""
     ],
     [
@@ -64,7 +64,7 @@
         "--json"
       ],
       0,
-      "{\n  \"acceptedAt\": null,\n  \"attempts\": [\n    {\n      \"bodyBytes\": 9,\n      \"consumption\": \"not_observed\",\n      \"createdAt\": 1000.0,\n      \"delivery\": \"pending\",\n      \"deliveryAt\": null,\n      \"deliveryDetail\": {},\n      \"deliveryDetailRedacted\": false,\n      \"deliveryReason\": null,\n      \"messageId\": \"00000000000000000000000000000004\",\n      \"providerRef\": null,\n      \"refs\": [],\n      \"result\": null,\n      \"role\": \"handoff\",\n      \"sender\": null,\n      \"senderClass\": \"bypass\",\n      \"seq\": 1,\n      \"target\": {\n        \"name\": \"codex@fixture\\tlabel\",\n        \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n        \"pane\": \"%1\",\n        \"provider\": \"codex\"\n      },\n      \"work\": \"awaiting_ack\",\n      \"workAt\": null\n    }\n  ],\n  \"closedAt\": null,\n  \"control\": \"active\",\n  \"createdAt\": 1000.0,\n  \"events\": [\n    {\n      \"at\": 1000.0,\n      \"attemptSeq\": 1,\n      \"detail\": {\n        \"flow\": \"handoff\"\n      },\n      \"kind\": \"created\"\n    }\n  ],\n  \"flow\": \"handoff\",\n  \"id\": \"00000000000000000000000000000002\",\n  \"nativeWithdrawals\": {\n    \"operations\": [],\n    \"readable\": true,\n    \"reason\": null,\n    \"version\": 1\n  },\n  \"origin\": null,\n  \"phase\": \"queued\",\n  \"phaseLabel\": \"排队\",\n  \"reason\": \"waiting_for_target\",\n  \"reasonText\": \"已排队，还没发出\",\n  \"reviewer\": null,\n  \"targetSessionMissing\": false,\n  \"targetStoppedWithoutReport\": false,\n  \"targetTurnEndedAt\": null,\n  \"title\": \"synthetic\",\n  \"updatedAt\": 1000.0,\n  \"verdict\": null\n}\n",
+      "{\n  \"acceptedAt\": null,\n  \"attempts\": [\n    {\n      \"bodyBytes\": 9,\n      \"consumption\": \"not_observed\",\n      \"createdAt\": 1000.0,\n      \"delivery\": \"pending\",\n      \"deliveryAt\": null,\n      \"deliveryDetail\": {},\n      \"deliveryDetailRedacted\": false,\n      \"deliveryReason\": null,\n      \"messageId\": \"00000000000000000000000000000004\",\n      \"providerRef\": null,\n      \"refs\": [],\n      \"result\": null,\n      \"role\": \"handoff\",\n      \"sender\": null,\n      \"senderClass\": \"bypass\",\n      \"seq\": 1,\n      \"target\": {\n        \"name\": \"codex@id:019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n        \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n        \"pane\": \"%1\",\n        \"provider\": \"codex\"\n      },\n      \"work\": \"awaiting_ack\",\n      \"workAt\": null\n    }\n  ],\n  \"closedAt\": null,\n  \"control\": \"active\",\n  \"createdAt\": 1000.0,\n  \"events\": [\n    {\n      \"at\": 1000.0,\n      \"attemptSeq\": 1,\n      \"detail\": {\n        \"flow\": \"handoff\"\n      },\n      \"kind\": \"created\"\n    }\n  ],\n  \"flow\": \"handoff\",\n  \"id\": \"00000000000000000000000000000002\",\n  \"nativeWithdrawals\": {\n    \"operations\": [],\n    \"readable\": true,\n    \"reason\": null,\n    \"version\": 1\n  },\n  \"origin\": null,\n  \"phase\": \"queued\",\n  \"phaseLabel\": \"排队\",\n  \"reason\": \"waiting_for_target\",\n  \"reasonText\": \"已排队，还没发出\",\n  \"reviewer\": null,\n  \"targetSessionMissing\": false,\n  \"targetStoppedWithoutReport\": false,\n  \"targetTurnEndedAt\": null,\n  \"title\": \"synthetic\",\n  \"updatedAt\": 1000.0,\n  \"verdict\": null\n}\n",
       ""
     ],
     [
@@ -82,7 +82,7 @@
         "doctor"
       ],
       0,
-      "agent-bridge 版本：0.1.0.dev0\n包路径：<package>/agentstatus_bridge\n对外命令名：agent-bridge\n本机设备名：fixture-device\n任务账本目录：<fixture>/bridge\n状态根目录：<fixture>/bridge\n状态根来源：env\n后台 worker 运行中：否\nCodex CLI 版本：None\nCodex 窗口标题里的会话 id：1 个能认出\nCodex 原生元数据：no_candidates；确认 0，冲突 0，SQL 直答 1，SQL 回退 0；SQL：available（未查询不代表可用）\nCodex CLI 输出证据：当前 codex 版本不可用，无法关联样本\nCodex RPC 证据（最近最多 200 条 Codex 尝试）：在本次查询窗口内没有可分类的 RPC 响应样本（传输失败的尝试不计入此项）\nClaude 会话注册表可读：是\nClaude 回执目录存在：否\nAgentStatus 忙闲状态可读：是\nworker 最近日志：（无）\n任务账本正常：是\n已关闭但对方可能仍在执行的任务：0\n协作摘要：正常\n",
+      "agent-bridge 版本：0.1.0.dev0\n包路径：<package>/agentstatus_bridge\n对外命令名：agent-bridge\n本机设备名：fixture-device\n任务账本目录：<fixture>/bridge\n状态根目录：<fixture>/bridge\n状态根来源：env\n后台 worker 运行中：否\nCodex CLI 版本：None\nCodex 窗口标题里的会话 id：1 个能认出\nCodex 原生元数据：socket_missing；确认 0，冲突 0，SQL 直答 1，SQL 回退 0；SQL：available（未查询不代表可用）\nCodex CLI 输出证据：当前 codex 版本不可用，无法关联样本\nCodex RPC 证据（最近最多 200 条 Codex 尝试）：在本次查询窗口内没有可分类的 RPC 响应样本（传输失败的尝试不计入此项）\nClaude 会话注册表可读：是\nClaude 回执目录存在：否\nAgentStatus 忙闲状态可读：是\nworker 最近日志：（无）\n任务账本正常：是\n已关闭但对方可能仍在执行的任务：0\n协作摘要：正常\n",
       ""
     ],
     [
@@ -91,7 +91,7 @@
         "--json"
       ],
       0,
-      "{\n  \"abVersion\": \"0.1.0.dev0\",\n  \"agentstatusRuntimeAvailable\": true,\n  \"archivedWithNativeRisk\": 0,\n  \"claudeInboxDirectory\": false,\n  \"claudeRegistryReadable\": true,\n  \"codexQueueEvidence\": {\n    \"state\": \"version_unavailable\",\n    \"version\": null,\n    \"window\": 200\n  },\n  \"codexRpcEvidence\": {\n    \"fallbacks\": 0,\n    \"otherVersion\": 0,\n    \"recognized\": 0,\n    \"state\": \"no_samples\",\n    \"unknownVersion\": 0,\n    \"unrecognized\": 0,\n    \"version\": null,\n    \"window\": 200\n  },\n  \"codexThreadTitle\": {\n    \"daemonMode\": true,\n    \"nativeMetadata\": {\n      \"confirmed\": 0,\n      \"conflicts\": 0,\n      \"serverVersion\": \"unknown\",\n      \"sqlAnswered\": 1,\n      \"sqlFallback\": 0,\n      \"sqlState\": \"available\",\n      \"state\": \"no_candidates\"\n    },\n    \"shortThreadId\": 0,\n    \"stateDbUnavailable\": false,\n    \"uuidNotParsed\": 0,\n    \"withThreadId\": 1,\n    \"withoutThreadId\": 0\n  },\n  \"codexVersion\": null,\n  \"command\": \"agent-bridge\",\n  \"device\": \"fixture-device\",\n  \"ledger\": \"<fixture>/bridge\",\n  \"ledgerOk\": true,\n  \"packagePath\": \"<package>/agentstatus_bridge\",\n  \"stateRoot\": \"<fixture>/bridge\",\n  \"stateRootSource\": \"env\",\n  \"summaryState\": \"正常\",\n  \"workerLog\": [],\n  \"workerRunning\": false\n}\n",
+      "{\n  \"abVersion\": \"0.1.0.dev0\",\n  \"agentstatusRuntimeAvailable\": true,\n  \"archivedWithNativeRisk\": 0,\n  \"claudeInboxDirectory\": false,\n  \"claudeRegistryReadable\": true,\n  \"codexQueueEvidence\": {\n    \"state\": \"version_unavailable\",\n    \"version\": null,\n    \"window\": 200\n  },\n  \"codexRpcEvidence\": {\n    \"fallbacks\": 0,\n    \"otherVersion\": 0,\n    \"recognized\": 0,\n    \"state\": \"no_samples\",\n    \"unknownVersion\": 0,\n    \"unrecognized\": 0,\n    \"version\": null,\n    \"window\": 200\n  },\n  \"codexThreadTitle\": {\n    \"daemonMode\": true,\n    \"nativeMetadata\": {\n      \"confirmed\": 0,\n      \"conflicts\": 0,\n      \"serverVersion\": \"unknown\",\n      \"sqlAnswered\": 1,\n      \"sqlFallback\": 0,\n      \"sqlState\": \"available\",\n      \"state\": \"socket_missing\"\n    },\n    \"shortThreadId\": 0,\n    \"stateDbUnavailable\": false,\n    \"uuidNotParsed\": 0,\n    \"withThreadId\": 1,\n    \"withoutThreadId\": 0\n  },\n  \"codexVersion\": null,\n  \"command\": \"agent-bridge\",\n  \"device\": \"fixture-device\",\n  \"ledger\": \"<fixture>/bridge\",\n  \"ledgerOk\": true,\n  \"packagePath\": \"<package>/agentstatus_bridge\",\n  \"stateRoot\": \"<fixture>/bridge\",\n  \"stateRootSource\": \"env\",\n  \"summaryState\": \"正常\",\n  \"workerLog\": [],\n  \"workerRunning\": false\n}\n",
       ""
     ]
   ],

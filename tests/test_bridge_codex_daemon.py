@@ -36,6 +36,7 @@ from agentstatus_bridge.platforms.pane import title_thread_prefix
 from agentstatus_bridge.platforms.linux.mux import tmux_pane_titles
 from agentstatus_bridge.platforms.linux import mux
 from agentstatus_bridge.model import Endpoint, EndpointRef, Provider
+from agentstatus_bridge.native_names import NO_NAME
 from agentstatus_bridge.observer_dbus import ObserverView
 from agentstatus_bridge.reports import ReportError, _attribute  # pyright: ignore[reportPrivateUsage]
 from bridge_support import FakeProc
@@ -193,7 +194,9 @@ class DaemonDiscoveryTests(DaemonBase):
         self.assertEqual((found["%1"].ref.native_id, found["%1"].threads, found["%1"].ref.pid), (T1, (T1,), 1000))
         self.assertEqual((found["%4"].ref.native_id, found["%4"].threads), (T2, (T2,)))
         self.assertEqual((found["%1"].blocking_issues, found["%4"].blocking_issues), ((), ()))
-        self.assertEqual(resolve_target("%4", self.found()).ref.native_id, T2)
+        # §91 起 pane 不再是输入：按标题认出的 thread 用完整 ID 寻址，回到显示它的窗口
+        target = resolve_target(f"codex@id:{T2}", self.found())
+        self.assertEqual((target.ref.native_id, target.ref.pane), (T2, "%4"))
 
     def test_lock_only_and_rollout_only_are_candidates_and_a_deleted_lock_is_not(self) -> None:
         self.daemon(self.lock(T1), self.rollout(T2), self.lock(T3) + " (deleted)")
@@ -423,10 +426,20 @@ class DaemonDiscoveryTests(DaemonBase):
         self.tui(2000, "%4", shows=T1)
         found = self.found()
         self.assertEqual(sorted(item.ref.native_id for item in found), [T1, T1])
-        self.assertEqual(resolve_target("%4", found).ref.pid, 2000)
+        # §91.2.3 已知限制：pane 不再能挑出同一 thread 的某个窗口。夹具没有名字证据时报名字未核实；
+        # 名字齐全（都已确认无名）时 %4 只是一个不存在的名字
+        with self.assertRaises(ResolveError) as pane:
+            resolve_target("%4", found)
+        self.assertEqual(pane.exception.code, "target_names_unverified")
+        named = [dataclasses.replace(item, name_source=NO_NAME) for item in found]
+        with self.assertRaises(ResolveError) as pane:
+            resolve_target("%4", named)
+        self.assertEqual(pane.exception.code, "target_not_found")
         with self.assertRaises(ResolveError) as caught:
             resolve_target(T1, found)
         self.assertEqual(caught.exception.code, "target_ambiguous")
+        # 完整 ID 也不任选其一：两个窗口都列为候选
+        self.assertEqual(sorted(item.ref.pid for item in caught.exception.candidates), [1000, 2000])
 
     def test_a_residual_title_cannot_bind_another_windows_thread(self) -> None:
         # 只有 app-server 与别组交互进程同时持有一个 thread 时，排除才起作用：这里 daemon 加载了 T5，
@@ -445,7 +458,9 @@ class DaemonDiscoveryTests(DaemonBase):
         self.proc.add(950, comm="sh", ppid=900)
         self.proc.add(960, comm="codex", ppid=950, argv=("codex", "--no-daemon"), fds=(self.rollout(T6),), tty=34817)
         found = self.found()
-        self.assertEqual(resolve_target("%1", found).ref.native_id, T1)
+        # 嵌套进程不借 %1：%1 仍只属于 T1 一个端点（§91 起 pane 不再是输入，直接按 pane 归组核对），按完整 ID 也回到它
+        self.assertEqual([item.ref.native_id for item in found if item.ref.pane == "%1"], [T1])
+        self.assertEqual(resolve_target(f"codex@id:{T1}", found).ref.pane, "%1")
         nested = [item for item in found if item.ref.pid == 960]
         self.assertEqual([(item.ref.pane, item.ref.native_id) for item in nested], [(None, T6)])
         # 同样不借给 Claude：daemon 工具里的 Claude 找不到 pane

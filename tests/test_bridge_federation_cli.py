@@ -26,7 +26,8 @@ from unittest.mock import Mock, patch
 import bridge_support  # noqa: F401  导入即隔离宿主会话环境
 
 from agentstatus_bridge import cli, doctor
-from agentstatus_bridge.endpoints import Caller
+from agentstatus_bridge.endpoints import Caller, ResolveError, resolve_target
+from agentstatus_bridge.envelope import parse_header
 from agentstatus_bridge.federation import commands as fed_commands
 from agentstatus_bridge.federation import directory, mirror, retention
 from agentstatus_bridge.federation.authority import Identity
@@ -39,7 +40,7 @@ from agentstatus_bridge.model import Delivery, Endpoint, Provider, ReportKind
 from agentstatus_bridge.platforms.linux.process import ProcessInfo
 from agentstatus_bridge.store import DB_NAME, Store
 from agentstatus_bridge.transports import DeliveryOutcome
-from bridge_support import RecordingTransport, endpoint, ref, register_claude_session
+from bridge_support import RecordingTransport, endpoint, ref, register_claude_session, with_name_views
 
 HUB = "c" * 32
 DEV_A = "a" * 32
@@ -100,7 +101,8 @@ class FedCliCase(unittest.TestCase):
             self.assertEqual(code, 0, err)
         # relay 会从目录与 hub 盖章记下对方：这里直接写入 B 的整帧目录与 A 的登记名
         with self.store("win") as store:
-            snapshot = directory.snapshot(store, DEV_B, [WORKER], provider_complete={"codex": True})
+            # 目录只发布端点携带的已核实 NameView（§91.4.3），照真实发现的最后一步附上
+            snapshot = directory.snapshot(store, DEV_B, with_name_views([WORKER]), provider_complete={"codex": True})
             store.remember_device_name(DEV_A, "vm")
         with self.store("vm") as store:
             store.put_device_state(device_id=DEV_B, name="win", revision=1, snapshot=snapshot, last_seen=now_ms(),
@@ -169,6 +171,7 @@ class FedCliCase(unittest.TestCase):
                                  discover=lambda: [LOCAL_REVIEW], transports={Provider.CODEX: transport},
                                  reply_address=None, command="ab").run_once()
         self.assertEqual(len(transport.calls), 1)
+        self.review_calls = transport.calls
         return task_id
 
     def delivered_task(self) -> str:
@@ -210,6 +213,64 @@ class EndToEndTests(FedCliCase):
         code, out, err = self.run_on("win", "status", task_id, "--json", caller=as_agent(WORKER))
         self.assertEqual(json.loads(out)["phase"], "done", err)
 
+    def test_actor_tokens_and_closure_decider_use_full_id(self) -> None:
+        """§91.4.2/冻结附注 P3-3：联邦 wireToken（发起方 actor、汇报方 reporter）随事实保存并可转发到别的设备，
+        一律 provider@id:<完整ID>；参与方跨设备时结束回执的 decider 也写完整 ID。本机名字 lead/impl 不进这些标识。"""
+        origin_id, worker_id = f"claude@id:{CLAUDE_A}", f"codex@id:{THREAD_B}"
+        # 夹具同真实发现（_discover_selected）一样附本轮 NameView：lead/impl 都已核实，名字才有机会漏进跨设备标识
+        self.endpoints = {"vm": with_name_views([ORIGIN, LOCAL_REVIEW]), "win": with_name_views([WORKER])}
+        origin, worker = self.endpoints["vm"][0], self.endpoints["win"][0]
+        assert origin.name_view is not None and worker.name_view is not None
+        self.assertEqual((origin.name_view.verified, worker.name_view.verified), (True, True))
+        code, out, err = self.run_on("vm", "send", "--device", "win", "--to", worker_id, "-m", "请处理 X", "--json",
+                                     caller=as_agent(origin))
+        self.assertEqual(code, cli.EXIT_OK, err)
+        task_id = json.loads(out)["id"]
+        self.assertGreaterEqual(self.pump("vm", "win"), 1)
+        [(_endpoint, text, _context)] = self.deliver_on_b().calls
+        self.assertIn(f" from={origin_id} device=", text.splitlines()[0])
+        self.assertNotIn("claude@lead", text)
+        with self.store("win") as store:
+            [handoff] = [item for item in store.attempts(DEV_A, task_id) if item.role == "handoff"]
+        self.assertIsNotNone(handoff.sender)
+        assert handoff.sender is not None
+        self.assertEqual(handoff.sender.wire_token, origin_id)
+        code, _, err = self.run_on("win", "report", task_id, "--origin-device", "vm", "--result", "--note", "完成",
+                                   caller=as_agent(worker))
+        self.assertEqual(code, 0, err)
+        self.assertGreaterEqual(self.pump("win", "vm"), 1)
+        with self.store("vm") as store:
+            [notice] = [item for item in store.attempts(DEV_A, task_id) if item.role == "notice"]
+        assert notice.sender is not None
+        self.assertEqual(notice.sender.wire_token, worker_id)
+        self.assertIn(f"（{worker_id}）", notice.body)
+        self.assertNotIn("codex@impl", notice.body)
+        code, _, err = self.run_on("vm", "accept", task_id, caller=as_agent(origin))
+        self.assertEqual(code, 0, err)
+        with self.store("vm") as store:
+            closures = [item for item in store.attempts(DEV_A, task_id) if item.is_closure]
+        self.assertTrue(closures)
+        for item in closures:
+            self.assertIn(f"已由 {origin_id} 验收", item.body)
+            self.assertNotIn("claude@lead", item.body)
+            assert item.sender is not None
+            self.assertEqual(item.sender.wire_token, origin_id)
+
+    def test_reviewer_token_uses_full_id(self) -> None:
+        """§91.4.2：远端执行、本机复核时随任务保存的 reviewer_token 同样是完整 ID，不是本机名字 review。"""
+        self.endpoints["vm"] = with_name_views(self.endpoints["vm"])  # 复核方带已核实 NameView（displayLabel=review）
+        review = self.endpoints["vm"][1]
+        assert review.name_view is not None
+        self.assertEqual((review.name_view.name, review.name_view.verified), ("review", True))
+        task_id = self.local_review_requested()
+        with self.store("vm") as store:
+            task = store.get_task(DEV_A, task_id)
+        assert task is not None
+        self.assertEqual(task.state.get("reviewerToken"), f"codex@id:{LOCAL_REVIEW.ref.native_id}")
+        # 复核请求正文写执行方的完整 ID，不写对端主名或 8 位短 ID（§91.4.2，附注 P3-1）
+        (_, text, _) = self.review_calls[0]
+        self.assertIn(f"请复核 codex@id:{THREAD_B} 完成的这项工作。", text)
+
     def test_executor_cannot_accept_on_authority_and_user_shell_can(self) -> None:
         task_id = self.delivered_task()
         code, _, err = self.run_on("vm", "pause", task_id, caller=as_agent(LOCAL_REVIEW))
@@ -228,7 +289,8 @@ class EndToEndTests(FedCliCase):
         self.pump("win", "vm")
         code, out, err = self.run_on("vm", "retry", task_id, "-m", "已授权", caller=as_agent(ORIGIN))
         self.assertEqual(code, 0, err)
-        self.assertIn("已排队第 3 次交接 → win 上的 codex@impl", out)  # #2 是发给发起方的受阻通知
+        # #2 是发给发起方的受阻通知；对端主名只作旁注，后面跟可复制的全限定 target（§91.4.2）
+        self.assertIn(f"已排队第 3 次交接 → win 上的 codex@impl target=--device win --to codex@id:{THREAD_B}", out)
         with self.store("vm") as store:
             [task] = store.find_tasks(task_id)
             second = store.attempts(DEV_A, task_id)[-1]
@@ -494,6 +556,45 @@ class BoundaryTests(FedCliCase):
         with cli.Store.open(self.states["vm"]) as local, self.store("vm") as store:
             self.assertEqual((len(local.list_tasks()), len(store.tasks())), (1, 0))
 
+    def test_unverified_or_ambiguous_remote_names_print_copyable_candidates(self) -> None:
+        # §91.2.2「提示 peers --device 及全 ID」：候选给成可直接照抄的完整写法（带 --device），不只留在异常里
+        first, second = "019a0000-1111-7222-8333-44445555cccc", "019a0000-1111-7222-8333-44445555dddd"
+        rows = [{"provider": "codex", "nativeId": native, "endpointId": native[-8:].ljust(32, "0"), "endpointRevision": 1,
+                 "inbox": True, "eligible": True, "namesVerified": False, "name": "dup"} for native in (first, second)]
+        with self.store("vm") as store:
+            store.put_device_state(device_id=DEV_C, name="wsl", revision=1, snapshot={
+                "endpoints": rows, "complete": True, "providers": {"codex": True}, "namePolicy": "agent-native-v1"},
+                last_seen=now_ms(), state="online")
+        code, _, err = self.run_on("vm", "send", "--device", "wsl", "--to", "codex@dup", "-m", "X", caller=as_agent(ORIGIN))
+        self.assertEqual(code, cli.EXIT_TARGET, err)
+        self.assertIn("target_names_unverified", err)
+        self.assertIn(f"可选目标：--device wsl --to codex@id:{first}、--device wsl --to codex@id:{second}", err)
+        code, _, err = self.run_on("vm", "send", "--device", "wsl", "--to", "codex@id:019a0000", "-m", "X",
+                                   caller=as_agent(ORIGIN))
+        self.assertEqual(code, cli.EXIT_TARGET, err)
+        self.assertIn("target_ambiguous", err)
+        self.assertIn(f"--device wsl --to codex@id:{first}", err)
+        # 复核方路径按复核方的参数名给（不能把复核方抄成执行方）
+        code, _, err = self.run_on("vm", "send", "--to", "codex@review", "--review-device", "wsl", "--review-by", "codex@dup",
+                                   "-m", "X", caller=as_agent(ORIGIN))
+        self.assertEqual(code, cli.EXIT_TARGET, err)
+        self.assertIn(f"可选目标：--review-device wsl --review-by codex@id:{first}、--review-device wsl --review-by "
+                      f"codex@id:{second}", err)
+        self.assertNotIn("--device wsl --to", err)
+        # 设备引用不唯一时候选是完整 deviceId（两台设备登记成同一个名字）
+        with self.store("vm") as store:
+            store.put_device_state(device_id="e" * 32, name="wsl", revision=1, snapshot={
+                "endpoints": [], "complete": True, "providers": {"codex": True}, "namePolicy": "agent-native-v1"},
+                last_seen=now_ms(), state="online")
+        code, _, err = self.run_on("vm", "send", "--device", "wsl", "--to", "codex@dup", "-m", "X", caller=as_agent(ORIGIN))
+        self.assertEqual(code, cli.EXIT_TARGET, err)
+        self.assertIn(f"可选设备：--device {DEV_C}、--device {'e' * 32}", err)
+        # 复核方路径上设备引用不唯一：设备候选也按复核方的参数名给（两方 r3 P3）
+        code, _, err = self.run_on("vm", "send", "--to", "codex@review", "--review-device", "wsl", "--review-by", "codex@dup",
+                                   "-m", "X", caller=as_agent(ORIGIN))
+        self.assertEqual(code, cli.EXIT_TARGET, err)
+        self.assertIn(f"可选设备：--review-device {DEV_C}、--review-device {'e' * 32}", err)
+
     def test_reviewer_defaults_to_origin_device_and_third_device_is_refused_before_write(self) -> None:
         code, out, err = self.run_on("vm", "send", "--device", "win", "--to", "codex@impl", "--review-by",
                                      "codex@review", "-m", "X", "--json", caller=as_agent(ORIGIN))
@@ -506,7 +607,8 @@ class BoundaryTests(FedCliCase):
             store.put_device_state(device_id=DEV_C, name="wsl", revision=1, snapshot={
                 "endpoints": [{"provider": "codex", "nativeId": THREAD_B.replace("b", "c"), "endpointId": "e" * 32,
                                "endpointRevision": 1, "inbox": True, "eligible": True, "namesVerified": True,
-                               "name": "other"}], "complete": True, "providers": {}}, last_seen=None, state="unknown")
+                               "name": "other"}], "complete": True, "providers": {"codex": True}},
+                last_seen=now_ms(), state="online")  # 名字解析要求目录完整且新鲜（§91.6），这里只测三设备拒绝
             before = len(store.tasks())
         code, _, err = self.run_on("vm", "send", "--device", "win", "--to", "codex@impl", "--review-by",
                                    "codex@other", "--review-device", "wsl", "-m", "X", caller=as_agent(ORIGIN))
@@ -545,6 +647,77 @@ class BoundaryTests(FedCliCase):
         self.pump("win", "vm")
         code, out, err = self.run_on("vm", "status", task_id, "--json")
         self.assertEqual(json.loads(out)["phase"], "awaiting_acceptance", err)
+
+    def test_copied_cross_device_identifiers_never_hit_a_same_named_local_session(self) -> None:
+        """T7（§91.4.2）：B 本机也有叫 lead 的 Claude、A 本机也有叫 impl 的 Codex；照抄跨设备消息头、帧发送方名与
+        自动正文里的标识却漏了 --device，只会找不到，不会命中本机同名的另一个会话。"""
+        lead_b = endpoint(ref(Provider.CLAUDE, "0000000b-1111-4222-8333-444444444444", pid=32010, start="790",
+                              label="lead"), name="lead")
+        impl_a = endpoint(ref(Provider.CODEX, "019a0000-1111-7222-8333-44445555dddd", pid=31010, start="510",
+                              label="impl"), name="impl")
+        on_b, on_a = with_name_views([WORKER, lead_b]), with_name_views([ORIGIN, LOCAL_REVIEW, impl_a])
+        self.assertIs(resolve_target("claude@lead", on_b), on_b[1])  # 同名风险是真的：裸名会选中 B 本机的 lead
+        task_id = self.delivered_task()
+        with self.store("win") as store:
+            [attempt] = [item for item in store.attempts(DEV_A, task_id) if item.role == "handoff"]
+        # 帧与消息头里的发送方：按 B 的投递渲染取出（与真实投递同一个函数）
+        recorder = RecordingTransport(Provider.CODEX)
+        with self.store("win") as store:
+            dispatcher = FederationDispatcher(store, self.ident("win"), RelayPaths(self.states["win"]),
+                                              discover=lambda: [WORKER], transports={Provider.CODEX: recorder},
+                                              reply_address=None, command="ab")
+            text, context = dispatcher._render(  # pyright: ignore[reportPrivateUsage]
+                store.get_task(DEV_A, task_id), attempt, None, Provider.CODEX)  # type: ignore[arg-type]
+        parsed = parse_header(text)
+        assert parsed is not None and parsed.sender is not None
+        copied = [parsed.sender, context.sender_name.split("（", 1)[0]]
+        self.assertEqual(copied, [f"claude@id:{CLAUDE_A}"] * 2)
+        for token in copied:
+            with self.assertRaises(ResolveError) as caught:
+                resolve_target(token, on_b)
+            self.assertEqual(caught.exception.code, "target_not_found")
+        # A 上的结果通知：执行方标识照抄到 A 本机也不会命中 A 本机的 impl
+        self.assertEqual(self.run_on("win", "report", task_id, "--origin-device", "vm", "--result",
+                                     caller=as_agent(WORKER))[0], 0)
+        self.pump("win", "vm")
+        with self.store("vm") as store:
+            notice = store.attempts(DEV_A, task_id)[-1]
+        self.assertIn(f"（codex@id:{THREAD_B}）", notice.body)
+        with self.assertRaises(ResolveError):
+            resolve_target(f"codex@id:{THREAD_B}", on_a)
+        self.assertIs(resolve_target("codex@impl", on_a), on_a[2])
+
+    def test_unnamed_remote_target_and_unknown_device_print_full_ids(self) -> None:
+        unnamed = endpoint(ref(Provider.CODEX, THREAD_B.replace("b", "e"), pid=32003, start="778"), native_name=None)
+        with self.store("win") as store:
+            snapshot = directory.snapshot(store, DEV_B, with_name_views([WORKER, unnamed]),
+                                          provider_complete={"codex": True})
+        with self.store("vm") as store:
+            store.put_device_state(device_id=DEV_B, name="win", revision=2, snapshot=snapshot, last_seen=now_ms(),
+                                   state="online")
+            runtime = SimpleNamespace(ident=SimpleNamespace(device_id=DEV_A, device_name="vm"), store=store)
+            self.assertEqual(fed_commands.device_name(runtime, DEV_C), DEV_C)  # type: ignore[arg-type]  未登记用完整 ID
+        code, out, err = self.run_on("vm", "send", "--device", "win", "--to", f"codex@id:{unnamed.ref.native_id}",
+                                     "-m", "X", caller=as_agent(ORIGIN))
+        self.assertEqual(code, cli.EXIT_OK, err)
+        self.assertIn(f"交给 win 上的 codex@id:{unnamed.ref.native_id}：", out)  # 没有已核实主名：完整 ID，不截 8 位
+
+    def test_publish_names_off_keeps_the_local_target_label_off_the_network(self) -> None:
+        self.endpoints["vm"] = with_name_views([ORIGIN, LOCAL_REVIEW])
+        labels: list[str | None] = []
+        for publish in (True, False):
+            config = self.states["vm"] / "federation.json"
+            data = json.loads(config.read_text(encoding="utf-8"))
+            data["directory"]["publishNames"] = publish
+            config.write_text(json.dumps(data), encoding="utf-8")
+            code, out, err = self.run_on("vm", "send", "--to", "codex@review", "--review-device", "win",
+                                         "--review-by", f"codex@id:{THREAD_B}", "-m", "X", "--json",
+                                         caller=as_agent(ORIGIN))
+            self.assertEqual(code, 0, err)
+            with self.store("vm") as store:
+                [first, *_] = store.attempts(DEV_A, json.loads(out)["id"])
+                labels.append(first.target.remote.display_label)
+        self.assertEqual(labels, ["review", None])
 
     def test_attachments_are_frozen_at_send_and_listed_per_item(self) -> None:
         note = self.root / "spec.md"

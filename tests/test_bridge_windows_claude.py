@@ -122,7 +122,7 @@ class NativeTests(unittest.TestCase):
         self.k.images[200] = r'C:\fixture\claude.exe'
         endpoint, _ = D.inspect(self.p.transport, 200)
         result = D.Discovery((endpoint, replace(endpoint, ref=replace(endpoint.ref, pid=300))), True, 'complete')
-        with self.assertRaisesRegex(NativeFailure, 'target_ambiguous'): result.select(UUID)
+        with self.assertRaisesRegex(NativeFailure, '^target_ambiguous$'): result.select(UUID)
 
     def test_key_exact_peer_token_and_optional_generation(self):
         files = A.PeerFiles(self.p.files)

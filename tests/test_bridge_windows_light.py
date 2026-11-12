@@ -113,8 +113,10 @@ class LightTests(unittest.TestCase):
         self.assertEqual(result.select(uuid(1)).thread,uuid(1))
         for value in (uuid(2),uuid(3)):
             with self.assertRaisesRegex(NativeFailure,'target_changed'):result.select(value)
-        for value in ('collision','00000000'):
+        # 名字与显式 id: 前缀都按两次 loaded 的并集判歧义；裸 '00000000' 只按名字，找不到（§91.2.1）
+        for value in ('collision','id:00000000'):
             with self.assertRaisesRegex(NativeFailure,'target_ambiguous'):result.select(value)
+        with self.assertRaisesRegex(NativeFailure,'target_not_found'):result.select('00000000')
         self.assertEqual(result.native_reads,3)
         self.assertEqual(self.initialized(),1)
         sampler=D.WorkerDiscovery(self.p.transport);sampler.result=result

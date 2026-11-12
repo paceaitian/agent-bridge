@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 
 class Provider(StrEnum):
@@ -268,6 +268,33 @@ _IDENTITY_ISSUES = frozenset(
 
 
 @dataclass(frozen=True)
+class NameSource:
+    """一个绑定的原生主名采样（DESIGN §91.3）：named 带原文；unnamed 是已确认无名；unknown 是元数据没读到（不等于无名）。"""
+    state: Literal['named', 'unnamed', 'unknown']
+    raw: str | None = None
+    truncated: bool = False  # 原文超过显示上限被截断；恰好等于上限不算
+
+
+@dataclass(frozen=True)
+class NameView:
+    """本轮一个绑定的名字投影（DESIGN §91.3）：可复制原生主名（name）、转义后的展示名、verified 与消歧 ID 前缀。
+
+    由 native_names.project 计算；放在这里是为了让 Endpoint 能携带它而不形成导入环。
+    """
+    provider: Provider
+    native_id: str
+    name: str | None
+    display_name: str | None
+    verified: bool
+    id_prefix: str
+
+    @property
+    def target(self) -> str:
+        """规范可复制 target 一律完整 ID。"""
+        return f'{self.provider.value}@id:{self.native_id}'
+
+
+@dataclass(frozen=True)
 class Endpoint:
     """一次发现得到的活端点。"""
 
@@ -282,6 +309,13 @@ class Endpoint:
     # 仅 Codex、仅运行期：不进 EndpointRef、不落账本（DESIGN §45.48 R1）
     threads: tuple[str, ...] = ()
     thread_consumers: tuple[tuple[str, int], ...] = ()
+    # 原生主名采样（DESIGN §91.3）：截断前原文与截断事实；仅运行期，不进 EndpointRef、不落账本。None = 平台未提供
+    name_source: NameSource | None = None
+    # 本轮发现结束时算好的名字投影（§91.4.2：formatter 只查表、不做 I/O）；派生值，不参与相等比较、不落账本
+    name_view: NameView | None = field(default=None, compare=False)
+    # 本轮发现没看全的 provider（DiscoverySources.incomplete 的快照，§91.2.2）。随每个端点带出、解析时取并集：
+    # 某家一个端点都没露出时，别家的端点也能把它带到。派生值，不参与相等比较、不落账本
+    round_incomplete: frozenset[str] = field(default=frozenset(), compare=False)
 
     @property
     def blocking_issues(self) -> tuple[str, ...]:

@@ -35,10 +35,11 @@ from agentstatus_bridge.model import (
     describe,
     work_attempts,
 )
-from agentstatus_bridge.reminders import REMIND_AFTER_SECONDS, REMINDER_OPTION, pending_reminder, reminder_token
+from agentstatus_bridge.native_names import NO_NAMES, NameBook
+from agentstatus_bridge.reminders import REMIND_AFTER_SECONDS, REMINDER_OPTION, pending_reminder, reminder_body, reminder_token
 from agentstatus_bridge.store import MAX_ATTEMPTS_PER_TASK, Store, StoreError
 from agentstatus_bridge.transports import DeliveryOutcome
-from bridge_support import RecordingTransport, endpoint, ref
+from bridge_support import RecordingTransport, endpoint, ref, with_name_views
 
 LEAD = ref(Provider.CLAUDE, "lead-session", pid=3000, pane="%3", label="lead")
 IMPL = ref(Provider.CODEX, "impl-thread", pid=1000, pane="%1", label="impl")
@@ -90,7 +91,8 @@ class ReminderTests(unittest.TestCase):
             found.append(endpoint(LEAD, runtime=runtime, socket_path=LEAD_SOCKET))
         if self.grok_online:
             found.append(endpoint(GROK_LEAD, issues=("no_inbox",)))
-        return found
+        # 真实 discover 让端点带上本轮 NameView（§91.4.2）；提醒正文里的接收方名字只从它来
+        return with_name_views(found)
 
     def _task(
         self,
@@ -199,6 +201,26 @@ class ReminderTests(unittest.TestCase):
         before = len(self.store.attempts(task_id))
         self._run()
         self.assertEqual(len(self.store.attempts(task_id)), before)
+
+    def test_reminder_receiver_name_needs_same_binding_name_view(self) -> None:
+        """§91.4.2 反例：提醒正文的接收方只在本轮同绑定已核实时写原生主名；没有名字证据或代际对不上
+        （同 thread、PID 不同）写完整 ID，不回退 ref.label（tmux 标签）。"""
+        task_id = self._task()
+        task = self.store.get_task(task_id)
+        assert task is not None
+        attempts = self.store.attempts(task_id)
+        view = describe(task, attempts)
+        resumed = endpoint(replace(IMPL, pid=1001))
+        for case, names, receiver in (
+            ("same_binding", NameBook.of(with_name_views([endpoint(IMPL)])), "codex@impl"),
+            ("no_names", NO_NAMES, "codex@id:impl-thread"),
+            ("other_pid", NameBook.of(with_name_views([resumed])), "codex@id:impl-thread"),
+            # 端点没带 NameView：formatter 不就地重算、不读 label
+            ("view_missing", NameBook.of([endpoint(IMPL)]), "codex@id:impl-thread"),
+        ):
+            with self.subTest(case=case):
+                first = reminder_body(task, attempts, view, command=CMD, names=names).splitlines()[0]
+                self.assertTrue(first.endswith(f"（{receiver}）。"), first)
 
     def test_result_is_reminded_once_after_thirty_minutes(self) -> None:
         task_id = self._task()

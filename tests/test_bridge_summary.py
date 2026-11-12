@@ -37,7 +37,7 @@ from agentstatus_bridge.model import (
 )
 from agentstatus_bridge.store import DB_NAME, Store
 from agentstatus_bridge.worker import run_worker
-from bridge_support import LedgerCase, RecordingTransport, new_task, ref
+from bridge_support import LedgerCase, RecordingTransport, new_task, ref, with_name_views
 import test_bridge_cli as cli_tests
 import test_bridge_labels as label_tests
 import test_bridge_worker as worker_tests
@@ -563,6 +563,8 @@ class SummaryCliTests(unittest.TestCase):
         self.assertFalse((self.state / DB_NAME).exists())
 
     def test_accept_json_reports_success_and_failure(self) -> None:
+        # 回执 target 是本机可复制标识（§91.4.2）：本轮同绑定已核实的主名来自发现携带的 NameView，这里显式附上
+        self.endpoints = with_name_views([cli_tests.IMPL, cli_tests.REVIEW, cli_tests.LEAD])
         task_id = self.send()
         self.mark_sent(task_id)
         code, out, err = self.run_cli("accept", task_id, "--json")

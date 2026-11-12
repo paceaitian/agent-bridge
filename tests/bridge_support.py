@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Callable, Collection, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import functools
 import importlib
 import io
@@ -147,7 +147,22 @@ def endpoint(
     issues: Sequence[str] = (),
     socket_path: str | None = None,
     name: str | None = None,
+    native_name: object = "label",
 ) -> Endpoint:
+    """测试端点。§91 起 ab 只按原生主名寻址：旧夹具用 tmux label 表达「这个会话叫 impl」，这里默认把 label
+    注入为 Codex/Claude 的原生主名采样（Claude 有注册表 name 时用 name），保留按名字寻址的用例意图；
+    要测「label 不是名字」时显式传 native_name=None（无名）或一个 NameSource。
+    """
+    from agentstatus_bridge.native_names import NO_NAME, NameSource, name_source  # layout: allow 回滚门用当前 tests 导入历史 src
+
+    if native_name == "label":
+        raw = name if name is not None else reference.label
+        source = None if reference.provider is Provider.GROK else name_source(raw)
+    elif native_name is None:
+        source = NO_NAME
+    else:
+        assert isinstance(native_name, NameSource)
+        source = native_name
     return Endpoint(
         ref=reference,
         runtime=runtime,
@@ -155,7 +170,20 @@ def endpoint(
         socket_path=socket_path,
         name=name,
         issues=tuple(issues),
+        name_source=source,
     )
+
+
+def with_name_views(items: Iterable[Endpoint]) -> list[Endpoint]:
+    """模拟真实 Linux 发现的最后一步（§91.4.2，`endpoints._discover_selected` 末尾）：按本轮全部端点算 NameView
+    并随端点携带。假 discover 直接返回夹具端点时不带 name_view，输出侧只能给完整 ID；
+    要测「名字会出现在输出里」就先经它附上，不要改回 ref.label。
+    """
+    from agentstatus_bridge.endpoints import name_views  # layout: allow 回滚门用当前 tests 导入历史 src
+
+    found = list(items)
+    views = name_views(found)
+    return [replace(item, name_view=views[id(item)]) for item in found]
 
 
 def discovering(

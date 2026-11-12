@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 from . import __version__, summary
 from .platforms import process as procfs
 from .codex_metadata import command_scope
-from .display import endpoint_text
+from .native_names import NO_NAMES, NameBook, SelectorError, parse_selector
 from .endpoints import (
     Caller,
     DiscoverySources,
@@ -57,6 +57,7 @@ from .model import (
     EndpointRef,
     Flow,
     Phase,
+    Provider,
     ReportKind,
     Role,
     Task,
@@ -155,30 +156,10 @@ def _print_json(document: object) -> None:
 
 
 def _selectors(endpoints: list[Endpoint]) -> dict[int, str]:
-    """为每个端点给出最短且唯一的 `--to` 写法。"""
-    counts: dict[tuple[str, str], int] = {}
-    for item in endpoints:
-        if item.ref.label:
-            key = (item.ref.provider.value, item.ref.label)
-            counts[key] = counts.get(key, 0) + 1
-    selectors: dict[int, str] = {}
-    for item in endpoints:
-        label = item.ref.label
-        if label and counts[(item.ref.provider.value, label)] == 1:
-            # tmux 会话名可含空格；显示成可直接复制的连字符形式（解析时同样归一化）
-            candidate = item.ref.token()
-        elif item.ref.pane:
-            candidate = item.ref.pane
-        else:
-            # 没有会话名也没有 pane（不经 tmux）：用 provider@<原生 ID 前缀>，与展示名一致且可直接复制
-            candidate = item.ref.token()
-        # 一律验算一遍：短写法撞上别人的会话名、同前缀会话，或同一 pane 里有多个会话（Grok resume 之后）时，
-        # 退回完整原生 ID，保证复制过去解析到的就是这一行
-        try:
-            selectors[id(item)] = candidate if resolve_target(candidate, endpoints) is item else item.ref.native_id
-        except ResolveError:
-            selectors[id(item)] = item.ref.native_id
-    return selectors
+    """每个端点的规范可复制 `--to`（§91.1）：一律 `provider@id:<完整ID>`；认不出 ID 的端点没有可用写法。"""
+    return {id(item): (f"{item.ref.provider.value}@id:{item.ref.native_id}"
+                       if item.ref.native_id != UNRESOLVED_NATIVE_ID else f"{item.ref.provider.value}（ID未解析）")
+            for item in endpoints}
 
 
 def _receiver_class(endpoint: Endpoint) -> str | None:
@@ -300,14 +281,19 @@ def cmd_peers(args: argparse.Namespace) -> int:
         return _fed_peers(args)
     endpoints = discover()
     caller = identify_caller(endpoints)
-    selectors = _selectors(endpoints)
+    # §91.4.2：名字只取本轮同绑定的 NameView（不回退 tmux 会话名）；可复制 target 一律完整 ID，认不出 ID 的为 null
+    book = NameBook.of(endpoints)
     # 设备只是路由属性：今天发现到的端点全在本机，所以每行都是同一个值（DESIGN §45.35）
     device = device_name()
     rows: list[dict[str, object]] = []
     for item in endpoints:
+        view = book.view(item.ref)
         rows.append(
             {
-                "target": selectors[id(item)],
+                "target": view.target if item.ref.native_id != UNRESOLVED_NATIVE_ID else None,
+                "name": view.name,
+                "displayName": view.display_name,
+                "nameVerified": view.verified,
                 "device": device,
                 "provider": item.ref.provider.value,
                 "session": item.ref.label,
@@ -335,17 +321,14 @@ def cmd_peers(args: argparse.Namespace) -> int:
         if args.all_devices:
             _fed_all_devices_text()
         return EXIT_OK
-    # 列宽按最长的目标写法算：同一 pane 里有多个会话时目标会退回 36 字符的完整会话 ID，固定列宽会把后面挤歪
-    width = max(28, *(len(str(row["target"])) for row in rows))
+    # 与 Windows 同形（§91.4.2、91.7）：人读名字〔全集消歧前缀〕加同行可复制 target；pane 不是输入，不再占一列
     for row, item in zip(rows, endpoints):
         mark = "  ← 当前会话" if row["self"] else ""
         issues = "，".join(ISSUE_LABELS.get(issue, issue) for issue in item.issues)
         extra = f"  [{issues}]" if issues else ""
         mode = f"  {row['permissionClass']}" if row["permissionClass"] else ""
-        print(
-            f"{str(row['target']):<{width}} {item.ref.pane or '-':<5} {RUNTIME_LABELS[item.runtime]:<6}"
-            f" {item.ref.native_id[:8]}{mode}{extra}{mark}"
-        )
+        target = f"  target={row['target']}" if row["target"] is not None else ""
+        print(f"{book.text(item.ref)}{target}  {RUNTIME_LABELS[item.runtime]}{mode}{extra}{mark}")
     if args.all_devices:
         _fed_all_devices_text()
     return EXIT_OK
@@ -589,12 +572,13 @@ def _local_send(args: argparse.Namespace, *, body: str | None = None) -> int:
             or (bool(started) and _wait_worker_up(state_dir(), WORKER_START_SECONDS))
         )
         hint = _hold_hint(target, origin_class)
+        names = NameBook.of(endpoints)
         if args.json:
-            document = _task_document(store, task)
+            document = _task_document(store, task, names=names)
             document["hint"] = hint
             _print_json(document)
         else:
-            print(f"任务 {short(task.id)} 已交给 {endpoint_text(target.ref)}：{DELIVERY_LABELS[current.delivery]}")
+            print(f"任务 {short(task.id)} 已交给 {names.text(target.ref)}：{DELIVERY_LABELS[current.delivery]}")
             warning = _no_pane_warning([current])
             if warning is not None:
                 print(warning)
@@ -627,6 +611,7 @@ def cmd_tasks(args: argparse.Namespace) -> int:
         tasks = store.list_tasks(include_finished=args.all)
         federation = _fed_task_list(args.all, now)
         endpoints, observed = _observations() if any(not task.finished for task in tasks) else ([], ObserverView())
+        names = NameBook.of(endpoints)
         hints = {
             task.id: _target_hint(store.attempts(task.id), endpoints, observed, now)
             for task in tasks
@@ -634,7 +619,8 @@ def cmd_tasks(args: argparse.Namespace) -> int:
         }
         if args.json:
             listing: dict[str, object] = {
-                "tasks": [_task_document(store, task, hint=hints.get(task.id, _NO_HINT)) for task in tasks]}
+                "tasks": [_task_document(store, task, hint=hints.get(task.id, _NO_HINT),
+                                         names=NO_NAMES if task.finished else names) for task in tasks]}
             if federation is not None:
                 listing["federation"] = federation[0]
             _print_json(listing)
@@ -644,7 +630,8 @@ def cmd_tasks(args: argparse.Namespace) -> int:
         for task in tasks:
             attempts = store.attempts(task.id)
             view = describe(task, attempts)
-            target = endpoint_text(view.current.target) if view.current else "-"
+            # 已结束的行与 status 一致：不借本轮发现的名字，完整 ID（§91.4.2）
+            target = (NO_NAMES if task.finished else names).text(view.current.target) if view.current else "-"
             hint = hints.get(task.id, _NO_HINT)
             withdrawals = _withdrawal_document(store, task)
             withdrawal_note = ""
@@ -687,13 +674,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         # 待办而 worker 不在时的补拉由 main 结束时统一做（DESIGN §45.28.3），这里不重复拉起
         task = _task(store, args.task)
         hint = _NO_HINT
+        names = NO_NAMES  # 已结束的任务不为排版另做发现：无同绑定名字证据即完整 ID（§91.4.2）
         if not task.finished:
             endpoints, observed = _observations()
             hint = _target_hint(store.attempts(task.id), endpoints, observed, now)
+            names = NameBook.of(endpoints)
         if args.json:
-            _print_json(_task_document(store, task, include_body=args.body, events=True, hint=hint))
+            _print_json(_task_document(store, task, include_body=args.body, events=True, hint=hint, names=names))
         else:
-            _print_task(store, task, now=now, show_body=args.body, hint=hint)
+            _print_task(store, task, now=now, show_body=args.body, hint=hint, names=names)
     return EXIT_OK
 
 
@@ -734,6 +723,7 @@ def cmd_report(args: argparse.Namespace) -> int:
                 caller_class=permission_class(caller),
                 now=time.time(),
                 cwd=Path.cwd(),
+                names=NameBook.of(endpoints),
             )
         except ReportError as error:
             raise CliError(error.code) from error
@@ -749,8 +739,9 @@ def cmd_report(args: argparse.Namespace) -> int:
             warnings.append(notification_capacity_hint(outcome.skipped['result'], reporter=True))
         if max(a.seq for a in store.attempts(outcome.task.id)) >= ATTEMPT_WARNING_THRESHOLD:
             warnings.append(reason_text('report_attempts_near_limit'))
+        names = NameBook.of(endpoints)
         if args.json:
-            document = _task_document(store, outcome.task)
+            document = _task_document(store, outcome.task, names=names)
             document['reportSkipped'] = outcome.skipped
             document['warnings'] = warnings
             _print_json(document)
@@ -758,7 +749,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         print(f"已记录：{EVENT_LABELS[kind.value]}（任务 {short(outcome.task.id)} #{outcome.attempt.seq}）")
         for followup in outcome.followups:
             label = "已排队发给复核方" if followup.role is Role.REVIEW else "已排队通知发起方"
-            print(f"{label} {endpoint_text(followup.target)}")
+            print(f"{label} {names.text(followup.target)}")
         for warning in warnings:
             print(f"提示：{warning}")
     return exit_code
@@ -895,11 +886,10 @@ def _may_decide(caller: Caller, task: Task) -> bool:
     return caller.endpoint is not None and task.origin is not None and caller.endpoint.ref.same_session(task.origin)
 
 
-def _closure_decider(caller: Caller) -> tuple[EndpointRef | None, str]:
-    """结束回执以谁的名义发出：决定者所在会话（用户在终端时为空）与正文里的显示名。"""
+def _closure_decider(caller: Caller, names: NameBook = NO_NAMES) -> tuple[EndpointRef | None, str]:
+    """结束回执以谁的名义发出：决定者所在会话（用户在终端时为空）与正文里的标识（本机已核实主名，否则完整 ID）。"""
     if caller.endpoint is not None:
-        from .notification_policy import wire_ref  # layout: allow Windows自动通知不携原生label，Linux原样
-        return caller.endpoint.ref, wire_ref(caller.endpoint.ref).display()
+        return caller.endpoint.ref, names.local_wire(caller.endpoint.ref)
     return None, "用户"
 
 
@@ -928,7 +918,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
         view = describe(task, store.attempts(task.id))
         if view.phase is not Phase.AWAITING_ACCEPTANCE and not args.force:
             raise CliError("no_result_to_accept")
-        sender, decider = _closure_decider(caller)
+        sender, decider = _closure_decider(caller, NameBook.of(endpoints))
         sender_class = permission_class(caller)
         now = time.time()
         with store.transaction():
@@ -945,10 +935,11 @@ def cmd_accept(args: argparse.Namespace) -> int:
             )
             store.update_task(task.id, now=now, event="accepted", accepted_at=now)
         if args.json:
-            _print_json({"ok": True, "id": task.id, "phase": Phase.DONE.value, "closure": _closure_document(outcome)})
+            _print_json({"ok": True, "id": task.id, "phase": Phase.DONE.value,
+                         "closure": _closure_document(outcome, NameBook.of(endpoints))})
         else:
             print(f"任务 {short(task.id)} 已验收")
-            _print_closure(outcome)
+            _print_closure(outcome, NameBook.of(endpoints))
     return EXIT_OK
 
 
@@ -968,7 +959,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             raise CliError("task_finished")
         if not _may_decide(caller, task):
             raise CliError("accept_not_allowed")
-        sender, decider = _closure_decider(caller)
+        sender, decider = _closure_decider(caller, NameBook.of(endpoints))
         sender_class = permission_class(caller)
         with store.transaction():
             current = store.get_task(task.id)
@@ -997,7 +988,7 @@ def cmd_close(args: argparse.Namespace) -> int:
         print(f"任务 {short(task.id)} 已停止追踪")
         if at_risk:
             print("注意：停止追踪不撤回已交接内容；可显式尝试移除仍在 Codex 队列中的项（withdraw），已开始的工作不能撤销")
-        _print_closure(outcome)
+        _print_closure(outcome, NameBook.of(endpoints))
     return EXIT_OK
 
 
@@ -1064,10 +1055,11 @@ def cmd_withdraw(args: argparse.Namespace) -> int:
                 "unknown": EXIT_UNKNOWN}.get(current["state"], EXIT_UNAVAILABLE)
 
 
-def _rework_body(first: Attempt, current: Attempt, task: Task, extra: str | None) -> str:
+def _rework_body(first: Attempt, current: Attempt, task: Task, extra: str | None,
+                 names: NameBook = NO_NAMES) -> str:
     lines = ["【返工】"]
     if current.role is Role.REVIEW and task.verdict is Verdict.CHANGES:
-        lines.append(f"复核方 {current.target.display()} 要求修改。")
+        lines.append(f"复核方 {names.local_wire(current.target)} 要求修改。")
     elif current.work is Work.BLOCKED:
         lines.append("上次处理受阻，情况已处理，请继续。")
     elif current.work is Work.FAILED:
@@ -1111,7 +1103,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
         except StoreError as error:
             raise CliError(error.code, _exit_for_store_error(error.code)) from error
         started = _start_worker()
-        print(f"已排队第 {attempt.seq} 次{ROLE_LABELS[attempt.role]} → {endpoint_text(attempt.target)}（任务 {short(attempt.task_id)}）")
+        print(f"已排队第 {attempt.seq} 次{ROLE_LABELS[attempt.role]} → {NameBook.of(endpoints).text(attempt.target)}（任务 {short(attempt.task_id)}）")
         if attempt.seq >= ATTEMPT_WARNING_THRESHOLD:
             print(f"提示：{reason_text('attempts_near_limit')}")
         if args.force and not undelivered and not rework:
@@ -1152,7 +1144,7 @@ def _retry_in_transaction(
             role = Role.HANDOFF
             implementer = next((item for item in reversed(attempts) if item.role is Role.HANDOFF), first)
             target_ref = implementer.target
-        body = _rework_body(first, current, task, args.message)
+        body = _rework_body(first, current, task, args.message, NameBook.of(endpoints))
     allow_shared = bool(args.allow_shared or current.allow_shared)
     if args.to:
         target = _resolve(args.to, endpoints)
@@ -1380,8 +1372,8 @@ def _fed_target_text(rt: FedRuntime, target: object) -> str:
     from .federation.refs import TargetRef  # layout: allow 联邦按需加载
     assert isinstance(target, TargetRef)
     remote = target.remote
-    label = remote.display_label or remote.native_id[:8]
-    return f"{fed.device_name(rt, remote.device_id)} 上的 {remote.provider.value}@{label}〔{remote.native_id[:8]}〕"
+    from .federation.views import remote_text  # layout: allow 联邦按需加载
+    return remote_text(target, fed.device_name(rt, remote.device_id))
 
 
 def _fed_peers(args: argparse.Namespace) -> int:
@@ -1444,7 +1436,8 @@ def _fed_send(args: argparse.Namespace) -> int:
                 _check_target(live, allow_shared=bool(args.allow_shared))
                 reviewer = fed.local_target(rt, live)
             else:
-                reviewer = fed.remote_target(rt, args.review_device, args.review_by)
+                reviewer = fed.remote_target(rt, args.review_device, args.review_by,
+                                             flags=("--review-device", "--review-by"))
         elif args.review_device:
             raise CliError("review_device_requires_reviewer")
         first_line = body.strip().splitlines()[0] if body.strip() else ""
@@ -1490,7 +1483,7 @@ def _fed_task_list(include_finished: bool, now: float) -> tuple[list[dict[str, o
             if view.current is not None:
                 row = next((item for item in document["attempts"] if item["seq"] == view.current.seq), None)
                 where = f"{row['targetDeviceName']}:" if row is not None else ""
-                target = where + endpoint_text(view.current.target)
+                target = where + NO_NAMES.text(view.current.target)  # 跨设备：设备名 + 完整 ID，不用对端名字（§91.4.2）
             role = "本机发起" if task.is_authority else f"发起设备 {document['authorityDeviceName']}"
             flag = "，需处理：远端离线/传输未恢复" if document["stalled"] else ""
             lines.append(f"{short(task.task_id)}  {PHASE_LABELS[view.phase]:<4} {target:<28} {task.title[:40]}"
@@ -1743,7 +1736,8 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     peers.set_defaults(handler=cmd_peers)
 
     send = commands.add_parser("send", help="把任务交给另一个会话")
-    send.add_argument("--to", required=True, help="目标：codex@会话名 / claude@会话名、pane（%%3）或会话 ID")
+    send.add_argument("--to", required=True,
+                      help="目标：provider@原生会话名、provider@id:<至少 8 位前缀或完整 ID>，或完整会话 ID")
     send.add_argument("-m", "--message", help="任务内容；- 表示从标准输入读取")
     send.add_argument("--file", help="从文件读取任务内容")
     send.add_argument("--title", help="任务标题（默认取内容第一行）")
@@ -1942,12 +1936,31 @@ def _main(argv: Sequence[str] | None = None) -> int:
             except NativeFailure as error:
                 _report_error(args, error.reason)
                 if error.reason in {'target_ambiguous','target_changed','target_names_unverified','target_not_found',
+                                    'target_id_unverified','target_id_invalid','target_provider_required',
                                     'discovery_incomplete','claude_discovery_incomplete','alias_target_unavailable'}:
                     print('目标未发送；请刷新 peers，可加 claude@ / codex@ 前缀明确指定 provider，或用已核实的完整 UUID 消歧。', file=sys.stderr)
+                if error.reason == 'target_names_unverified' and _alias_hint_applies(args):
+                    # 别名只在 Windows 本机、只对 Codex 可用，通用文案不提（§91.2.2）
+                    print(f'Windows 本机也可用 {command_name()} alias set <别名> <完整UUID> 登记本机别名（只在本机可用）。',
+                          file=sys.stderr)
                 if error.reason == 'windows_provider_not_enabled':
                     return EXIT_NOT_ENABLED
                 return EXIT_TARGET if error.reason.startswith(('target_', 'alias_')) else EXIT_REJECTED
         return _run_command(args)
+
+
+def _alias_hint_applies(args: argparse.Namespace) -> bool:
+    """Windows 别名只作用于 Codex：给出的目标都写明了别家（例如 claude@）时不提别名（Opus 实现审计 r1 P3-6）。"""
+    for raw in (getattr(args, 'to', None), getattr(args, 'review_by', None)):
+        if not isinstance(raw, str):
+            continue
+        try:
+            provider = parse_selector(raw).provider
+        except SelectorError:
+            return True
+        if provider in (None, Provider.CODEX):
+            return True
+    return not any(isinstance(getattr(args, key, None), str) for key in ('to', 'review_by'))
 
 
 def _run_command(args: argparse.Namespace) -> int:
@@ -1979,11 +1992,11 @@ def _run_command(args: argparse.Namespace) -> int:
             else:
                 codex_discovery.print_peers(result)
                 print('Windows Claude 原生 peer：' + ('发现完整' if peers.complete else reason_text(peers.reason)))
+                names = NameBook.of((*peers.endpoints, *peers.duplicates))
                 for endpoint in (*peers.endpoints, *peers.duplicates):
-                    # 原生名称只在 Endpoint.name 中；保留原 JSON 字符串转义，仅投影到本机文字。
-                    label = json.dumps(endpoint.name, ensure_ascii=False)[1:-1] if endpoint.name else None
+                    # 人读名字走本轮 NameView（未核实只作「名称=…（仅展示）」，转义由投影负责）；target 一律完整 ID
                     issues = '；'.join(reason_text('target_' + issue) for issue in endpoint.issues)
-                    print(endpoint_text(endpoint.ref, label=label) + '  target=claude@id:' + endpoint.ref.native_id
+                    print(names.text(endpoint.ref) + '  target=claude@id:' + endpoint.ref.native_id
                           + '  [root] 状态未知' + ('  ' + issues if issues else ''))
             _revive_for_federation()  # 这个入口不开本机账本、不走通用补查：只按联邦待办补拉（Codex r3-P2-02）
             return EXIT_OK
@@ -2008,6 +2021,8 @@ def _run_command(args: argparse.Namespace) -> int:
         return _exit_for_store_error(error.code)
     except FedCliError as error:
         _report_error(args, error.code)
+        if error.hint:
+            print(f"{command_name()}: {error.hint}", file=sys.stderr)
         return error.exit_code
     except KeyboardInterrupt:
         return 130

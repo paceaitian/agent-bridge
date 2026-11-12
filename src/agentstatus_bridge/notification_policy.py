@@ -5,12 +5,6 @@ Windows Codex and W3 Claude have native inboxes; Grok remains unsupported.
 """
 from .model import EndpointRef, Provider
 from .platforms.factory import get_platform
-from dataclasses import replace
-
-
-def wire_ref(target: EndpointRef) -> EndpointRef:
-    """Windows native labels stay local; protocol-generated text uses the id."""
-    return replace(target, label=None) if get_platform().name == 'windows' else target
 
 
 def can_notify(target: EndpointRef) -> bool:

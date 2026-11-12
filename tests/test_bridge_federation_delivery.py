@@ -36,8 +36,9 @@ from agentstatus_bridge.federation.errors import FedCliError
 from agentstatus_bridge.federation.fedstore import FederatedStore
 from agentstatus_bridge.federation.refs import RemoteEndpointRef, TargetRef
 from agentstatus_bridge.federation.relay import RelayPaths
+from agentstatus_bridge.federation.views import model_attempt
 from agentstatus_bridge.federation.directory import root_binding
-from agentstatus_bridge.model import Delivery, EndpointRef, Provider
+from agentstatus_bridge.model import Delivery, EndpointRef, NameSource, Provider
 from agentstatus_bridge.observer_dbus import ObserverView
 from agentstatus_bridge.platforms.linux import process as procfs
 from agentstatus_bridge.platforms.transport_codec import Receipt
@@ -46,7 +47,7 @@ from agentstatus_bridge.transports import DeliveryContext, DeliveryOutcome
 from agentstatus_bridge.transports.claude_peer import ClaudePeerTransport
 from agentstatus_bridge.transports.codex_queue import CodexQueueTransport, RunResult
 from agentstatus_bridge.transports.codex_rpc import RpcFallback
-from bridge_support import FakeProc, RecordingTransport, endpoint, register_claude_session
+from bridge_support import FakeProc, RecordingTransport, endpoint, ref, register_claude_session
 
 from test_bridge_federation_rules import DEV_A, DEV_B, T0, Device, pump
 
@@ -152,8 +153,10 @@ class IntentOrderTests(DeliveryTestCase):
         (_, text, context) = transport.calls[0]
         header = parse_header(text)
         assert header is not None
+        # 夹具里 actor 存的是旧式友好 wireToken（claude@vm）：新渲染按结构化身份写完整 ID，不照抄（§91.4.2）
         self.assertEqual((header.task_id, header.message_id, header.sender, header.device),
-                         (task.task_id, first.msg_id, "claude@vm", "vm"))
+                         (task.task_id, first.msg_id, f"claude@id:{CLAUDE_A}", "vm"))
+        self.assertEqual(context.sender_name, f"claude@id:{CLAUDE_A}（vm）")
         self.assertIn(f"ab report {task.task_id} --origin-device vm --attempt 1 --ack", text)
         self.assertEqual(context.sender_class, "bypass")
         pump(self.b, self.a, now=self.clock.now)
@@ -713,6 +716,20 @@ class ControlTests(DeliveryTestCase):
         assert attempt is not None
         self.assertTrue(authority.proven_undelivered(attempt, self.a.ident))  # 写前确定失败是证据
 
+    def test_name_drift_keeps_the_bound_local_target(self) -> None:
+        # §91 T6：B 上按绑定身份投递；另一会话现在的原生名恰好是原目标存下的 label，原目标已改名，也不改投
+        _, first = self.create()
+        pump(self.a, self.b, now=self.clock.now)
+        assert self.worker.local is not None and self.worker.local.label
+        other = endpoint(ref(Provider.CODEX, "019a2222-0000-7000-8000-00000000000c", pid=5000, start="9", label="o"),
+                         native_name=NameSource("named", self.worker.local.label))
+        mine = self.live(self.worker, native_name=NameSource("named", "renamed"))
+        transport = RecordingTransport(Provider.CODEX)
+        self.assertEqual(self.dispatcher(self.b, self.b_paths, transport, [mine, other]).run_once()["sent"], 1)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertTrue(transport.calls[0][0].ref.same_session(self.worker.local))
+        self.assertEqual(db_state(self.b, first.msg_id), ("finished", "queued"))
+
     def test_same_uuid_on_another_root_is_not_delivered(self) -> None:
         _, first = self.create()
         pump(self.a, self.b, now=self.clock.now)
@@ -735,8 +752,15 @@ class ControlTests(DeliveryTestCase):
                   "reporter": authority.actor_for(self.worker, wire_token="codex@win").to_dict(),
                   "reporterClass": "bypass", "source": "agent"}
         authority.apply_report_safely(self.a.store, self.a.ident, report, reporter_device=DEV_B, now=self.clock.now)
+        # 结果通知写执行方的结构化完整 ID，不照抄对端信封里的旧式友好 wireToken（附注 P3-4）
+        notice = self.a.store.attempts(DEV_A, task.task_id)[-1]
+        self.assertIn(f"（codex@id:{self.worker.remote.native_id}）", notice.body)
+        self.assertNotIn("codex@win", notice.body)
+        assert notice.sender is not None
+        self.assertIsNone(model_attempt(notice).sender.label)  # type: ignore[union-attr]  显示引用不把 wireToken 当名字
         claude = RecordingTransport(Provider.CLAUDE, DeliveryOutcome(Delivery.DELIVERED, "claude_delivered"))
         a_dispatcher = self.dispatcher(self.a, self.a_paths, claude, [self.live(self.origin)], reply="uds:/x")
+        self.assertEqual(a_dispatcher._device_name("e" * 32), "e" * 32)  # pyright: ignore[reportPrivateUsage]  未登记设备用完整 ID
         a_dispatcher.run_once()  # 结果通知交给本机发起方
         self.assertEqual(len(claude.calls), 1)
         self.clock.now += 31 * 60 * 1000
@@ -751,6 +775,9 @@ class ControlTests(DeliveryTestCase):
         self.assertEqual(a_dispatcher.queue_reminders(), 1)
         reminder = self.a.store.attempts(DEV_A, task.task_id)[-1]
         self.assertEqual(reminder.options["noticeKind"], "reminder")
+        # 远端接收方带设备：显示引用丢了设备，不能只交给本机 formatter（§91.4.2）
+        device = a_dispatcher._device_name(DEV_B)  # pyright: ignore[reportPrivateUsage]
+        self.assertIn(f"（{device} 上的 codex@id:{self.worker.remote.native_id}", reminder.body)
 
     def awaiting_origin(self, operation: str) -> tuple[Any, FederationDispatcher, RecordingTransport]:
         """A 上结果通知已交给发起方，再过 31 分钟：提醒到期、还没排出。"""

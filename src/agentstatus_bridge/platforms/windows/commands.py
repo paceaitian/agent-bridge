@@ -7,7 +7,8 @@ from dataclasses import dataclass
 
 from ...caller_values import Caller
 from ...model import Endpoint, Provider
-from ...transports.codex_native import NativeFailure, native_id
+from ...native_names import SelectorError, parse_selector
+from ...transports.codex_native import NativeFailure
 from ..factory import get_platform
 from ..types import Presence
 from .codex_discovery import Discovery, discover
@@ -63,22 +64,28 @@ def endpoints() -> list[Endpoint]:
 
 
 def resolve(reference: str) -> Endpoint:
-    if reference.startswith('claude@'):
-        return claude_evidence().select(reference)
+    """本机 `--to`（§91.2）：公用语法先分流 provider 与 ID/名字；无 provider 时两家都查，不首命中返回、
+    不吞另一家的未核实错误；只有完整 ID 容忍某一家发现不完整（未观察到不等于不存在，另一家可精确命中）。"""
+    try:
+        selector = parse_selector(reference)
+    except SelectorError as error:
+        raise NativeFailure(error.args[0]) from None
+    if selector.provider is Provider.CLAUDE:
+        return claude_evidence().select(selector)
+    if selector.provider not in (None, Provider.CODEX):
+        raise NativeFailure('target_not_found')
     result = evidence()
     if not isinstance(result, Discovery):
         raise NativeFailure('discovery_incomplete')
-    if reference.startswith('codex@'):
-        return result.endpoint(result.select(reference))
+    if selector.provider is Provider.CODEX:
+        return result.endpoint(result.select(selector))
     found: list[Endpoint] = []
     failures: list[NativeFailure] = []
-    exact = native_id(reference.removeprefix('id:'))
-    selector = 'id:' + exact if exact is not None else reference
     for choose in (lambda: result.endpoint(result.select(selector)), lambda: claude_evidence().select(selector)):
         try:
             found.append(choose())
         except NativeFailure as error:
-            if error.reason != 'target_not_found' and not (exact is not None and
+            if error.reason != 'target_not_found' and not (selector.kind == 'id' and
                     error.reason in {'discovery_incomplete', 'claude_discovery_incomplete'}):
                 raise
             failures.append(error)

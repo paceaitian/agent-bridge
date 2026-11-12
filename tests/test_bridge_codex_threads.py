@@ -76,7 +76,9 @@ class CodexThreadsBase(unittest.TestCase):
         connection = sqlite3.connect(folder / name)
         connection.execute(f"CREATE TABLE threads ({', '.join(f'{column} TEXT' for column in columns)})")
         for thread, source in rows.items():
-            values = {"id": thread, "source": source, "title": "不该被读的标题"}
+            # name/cwd/history_mode 只在 columns 带上时写入：§91 现行库形状，未起名的 thread 主名取 cwd 末段 proj
+            values = {"id": thread, "source": source, "title": "不该被读的标题", "name": None, "cwd": "/srv/proj",
+                      "history_mode": "paginated"}
             connection.execute(
                 f"INSERT INTO threads ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
                 [values[column] for column in columns],
@@ -105,7 +107,12 @@ class RootClassificationTests(CodexThreadsBase):
         [item] = self.found()
         self.assertEqual((item.ref.native_id, item.blocking_issues), (ROOT_A, ()))
         self.assertIn("subagent_threads", item.issues)
-        self.assertEqual(resolve_target("%4", self.found()).ref.native_id, ROOT_A)
+        # §91 起 pane 不再是输入：窗口里的根会话按完整 ID 寻址并回到这个窗口；子代理 thread 不是收件目标
+        target = resolve_target(f"codex@id:{ROOT_A}", self.found())
+        self.assertEqual((target.ref.native_id, target.ref.pane), (ROOT_A, "%4"))
+        with self.assertRaises(ResolveError) as child:
+            resolve_target(f"codex@id:{CHILD_C}", self.found())
+        self.assertEqual(child.exception.code, "target_not_found")
 
     def test_review_subagent_without_a_spawn_edge_also_counts_as_subagent(self) -> None:
         self.state_db({ROOT_A: "vscode", CHILD_C: REVIEW})
@@ -113,16 +120,29 @@ class RootClassificationTests(CodexThreadsBase):
         self.assertEqual(self.found()[0].ref.native_id, ROOT_A)
 
     def test_two_roots_give_one_endpoint_each_and_names_are_ambiguous(self) -> None:
-        self.state_db({ROOT_A: "cli", ROOT_B: "cli", CHILD_C: SPAWN})
+        # 现行库形状带原生名字列：两个根都没起名、cwd 相同，原生主名都是 cwd 末段 proj
+        self.state_db({ROOT_A: "cli", ROOT_B: "cli", CHILD_C: SPAWN},
+                      columns=("id", "source", "title", "name", "cwd", "history_mode"))
         self.codex(601, [self.rollout(ROOT_A), self.rollout(ROOT_B), self.rollout(CHILD_C)])
         found = self.found()
         self.assertEqual(sorted(item.ref.native_id for item in found), [ROOT_A, ROOT_B])
         for item in found:
             self.assertIn("multiple_roots", item.issues)
             self.assertEqual(item.blocking_issues, ())
+        # §91：同名的两个根都不能被证唯一，名字不任选其一；pane 与 tmux 会话名 work 已不是输入
         with self.assertRaises(ResolveError) as caught:
-            resolve_target("%4", found)
+            resolve_target("codex@proj", found)
+        self.assertEqual(caught.exception.code, "target_names_unverified")
+        for selector in ("%4", "codex@work"):
+            with self.subTest(selector=selector):
+                with self.assertRaises(ResolveError) as caught:
+                    resolve_target(selector, found)
+                self.assertEqual(caught.exception.code, "target_not_found")
+        # 两个根共用的 ID 前缀如实报歧义并列出两个候选；完整 ID 才能选定
+        with self.assertRaises(ResolveError) as caught:
+            resolve_target(f"codex@id:{ROOT_A[:8]}", found)
         self.assertEqual(caught.exception.code, "target_ambiguous")
+        self.assertEqual({item.ref.native_id for item in caught.exception.candidates}, {ROOT_A, ROOT_B})
         self.assertEqual(resolve_target(ROOT_B, found).ref.native_id, ROOT_B)
 
     def test_any_unknown_thread_keeps_the_process_ambiguous(self) -> None:
@@ -151,8 +171,14 @@ class RootClassificationTests(CodexThreadsBase):
         self.assertEqual((item.ref.native_id, item.blocking_issues), ("-", ("subagent_only",)))
         with self.assertRaises(ResolveError):
             resolve_target(CHILD_C, self.found())
+        # §91 起 pane 不再是输入：这个窗口既没有可寻址的 ID 也没有名字。它只持有子代理 thread，确知无名，
+        # 不会让其他 Codex 名字变成未核实；pane 写法只是找不到
+        with self.assertRaises(ResolveError) as pane:
+            resolve_target("%4", self.found())
+        self.assertEqual(pane.exception.code, "target_not_found")
+        # 投递检查照旧以 target_subagent_only 拒绝它
         with self.assertRaises(cli.CliError) as caught:
-            cli._check_target(resolve_target("%4", self.found()), allow_shared=True)  # noqa: SLF001
+            cli._check_target(item, allow_shared=True)  # noqa: SLF001
         self.assertEqual(str(caught.exception), "target_subagent_only")
 
     def test_all_subagents_and_no_root_only_leave_a_diagnostic_endpoint(self) -> None:

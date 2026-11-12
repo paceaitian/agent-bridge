@@ -22,6 +22,7 @@ from dataclasses import dataclass, field, replace
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import sqlite3
 import stat
@@ -38,6 +39,9 @@ from .codex_metadata import MetadataCache, discovery_cache
 from .codex_argv import _codex_class, _codex_non_interactive, codex_app_server
 from .ids import opaque_id
 from .model import UNRESOLVED_NATIVE_ID, Endpoint, EndpointRef, Provider, Runtime
+from .native_names import binding as native_binding
+from .native_names import (NO_NAME, TARGET_ID_UNVERIFIED, UNKNOWN_NAME, NameFacts, NameSource, NameView,
+                           SelectorError, canonical, codex_source, name_source, parse_selector, project)
 from .observer_dbus import ObserverRow, ObserverView, agentstatus_view
 from .paths import claude_sessions_dirs, codex_home as default_codex_home, codex_sqlite_home, grok_home
 
@@ -65,7 +69,6 @@ CODEX_STATE_TIMEOUT_SECONDS = 0.2
 _GROK_EVENTS = re.compile(
     r"/(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/events\.jsonl$"
 )
-_SELECTOR_NORMALIZE = re.compile(r"[\s_]+")
 # Claude 2.1.x 注册表 status：waiting 为对话框打开，shell 为正在执行 shell 命令
 _CLAUDE_STATUS = {
     "idle": Runtime.IDLE,
@@ -273,6 +276,7 @@ def _discover_claude(
                 socket_path=socket_path,
                 name=name[:80] if isinstance(name, str) and name else None,
                 issues=tuple(issues),
+                name_source=name_source(name, limit=80),  # 截断前原文：80 只是显示上限（§91.3）
             )
         )
     groups: dict[int, list[Endpoint]] = {}
@@ -350,6 +354,30 @@ class CodexThreadClasses:
     sql_checked: bool = False
     present: frozenset[str] = frozenset()
     parent_not_needed: frozenset[str] = frozenset()
+    # §91：thread → 原生主名采样（SQL paginated 行或新鲜的 thread/read）；没有的 thread 名字来源未知
+    names: dict[str, NameSource] = field(default_factory=dict)
+
+
+def _posix_tail(cwd: str) -> str:
+    return posixpath.basename(cwd.rstrip('/'))
+
+
+def _sql_codex_names(connection: sqlite3.Connection, found: list[str], names: dict[str, NameSource]) -> None:
+    """§91：在给出分类行的同一个库里补读原生名字。只认 history_mode=paginated 且 name/cwd 类型有效的行
+    （legacy 行的名字来自 title，可能是首条消息内容，不读）；缺列或出错只是没有名字证据，不影响分类。
+    """
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+        if not {"name", "cwd", "history_mode"} <= columns:
+            return
+        marks = ", ".join("?" for _ in found)
+        for key, name, cwd, mode in connection.execute(
+            f"SELECT id, name, cwd, history_mode FROM threads WHERE id IN ({marks})", found
+        ):
+            if isinstance(key, str) and mode == "paginated" and all(v is None or isinstance(v, str) for v in (name, cwd)):
+                names[key.lower()] = codex_source(name, cwd, basename=_posix_tail)
+    except sqlite3.Error:
+        return
 
 
 def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThreadClasses:
@@ -377,6 +405,7 @@ def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThr
     kinds: dict[str, str] = {}
     parents: dict[str, str] = {}
     parent_not_needed: set[str] = set()
+    thread_names: dict[str, NameSource] = {}
     newest_failed = False
     for position, (_, name) in enumerate(reversed(candidates)):
         if not remaining:
@@ -396,6 +425,9 @@ def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThr
             rows = connection.execute(
                 f"SELECT id, source FROM threads WHERE id IN ({placeholders})", wanted
             ).fetchall()
+            found = [row[0] for row in rows if isinstance(row[0], str)]
+            if found:
+                _sql_codex_names(connection, found, thread_names)  # 名字跟分类行出自同一个库，不倒查旧库
         except sqlite3.Error:
             newest_failed = newest_failed or position == 0
             continue
@@ -415,7 +447,7 @@ def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThr
                 if parent is not None:
                     parents[thread_id.lower()] = parent
     return CodexThreadClasses(kinds, parents, newest_failed, sql_checked=True, present=frozenset(threads - remaining),
-                              parent_not_needed=frozenset(parent_not_needed))
+                              parent_not_needed=frozenset(parent_not_needed), names=thread_names)
 
 
 def _classify_codex_threads(
@@ -429,15 +461,20 @@ def _classify_codex_threads(
     priority = set(preferred) & threads
     for _ in range(8):
         priority |= {sql.parents[thread] for thread in tuple(priority) if sql.parents.get(thread) in threads}
+    # §91：SQL 没给出名字的 thread 也向持有者读名字，与分类共用单批/预算/缓存，排在分类之后。
+    # 已分为子代理的 thread 不作收件目标，不为它取名
+    unnamed = {thread for thread in threads - needed - sql.names.keys() if sql.kinds.get(thread) != "subagent"}
     holders = {
         thread: tuple(sorted((pid, process.info.start_ticks) for pid, process in (processes or {}).items()
                              if process.app_server and thread in process.holdings))
-        for thread in needed
+        for thread in needed | unnamed
     }
     holders = {key: value for key, value in holders.items() if value}
-    batch = sources.native_metadata.read(sources.codex_home, holders, preferred=priority, absent=threads - sql.present)
+    batch = sources.native_metadata.read(sources.codex_home, holders, preferred=priority, absent=threads - sql.present,
+                                         deferred=unnamed)
     kinds: dict[str, str] = {}
     parents: dict[str, str] = {}
+    names: dict[str, NameSource] = {}
     conflicts = 0
     # 初扫不替代网络后的再证明；但每个pid只复验一次，不按记录数重复遍历fd。
     fresh_processes: dict[int, tuple[str, frozenset[str]] | None] = {}
@@ -455,6 +492,10 @@ def _classify_codex_threads(
         )
         if not fresh:
             continue
+        if value.name_source is not None and thread not in sql.names:
+            names[thread] = value.name_source
+        if thread not in needed:
+            continue  # 只为取名而读：SQL 已有分类，不让原生结论改写它
         if value.kind == "conflict":
             kinds[thread] = "subagent"  # 无父关系，标题路径阻断，不走单thread未知兼容
             conflicts += 1
@@ -462,7 +503,7 @@ def _classify_codex_threads(
             kinds[thread] = value.kind
             if value.parent is not None:
                 parents[thread] = value.parent
-    fallback = (sources.native_metadata.attempted & threads) - kinds.keys()
+    fallback = (sources.native_metadata.attempted & needed) - kinds.keys()
     sources.native_report = {
         "state": batch.reason, "serverVersion": batch.server_version,
         "confirmed": len(kinds) - conflicts, "conflicts": conflicts,
@@ -471,7 +512,8 @@ def _classify_codex_threads(
     }
     return CodexThreadClasses({**sql.kinds, **kinds},
                               {**{key: value for key, value in sql.parents.items() if key not in kinds}, **parents},
-                              sql.unavailable, sql.sql_checked, sql.present, sql.parent_not_needed)
+                              sql.unavailable, sql.sql_checked, sql.present, sql.parent_not_needed,
+                              {**sql.names, **names})
 
 
 @dataclass(frozen=True)
@@ -612,7 +654,20 @@ def _discover_codex(
         endpoints.append(
             _codex_titled_endpoint(sources.proc_root, members, processes, classes, consumers, runtime)
         )
-    return endpoints
+    return [_with_codex_name(item, classes) for item in endpoints]
+
+
+def _with_codex_name(item: Endpoint, classes: CodexThreadClasses) -> Endpoint:
+    """§91：给 Codex 端点挂原生主名采样。还没有 thread 的进程、只持有子代理 thread 的进程不可能有根会话的
+    名字（无名）；认不出是哪个 thread 或名字没读到的，名字来源未知。
+    """
+    thread = item.ref.native_id.lower()
+    if item.ref.native_id == UNRESOLVED_NATIVE_ID:
+        known_nameless = {"no_thread_yet", "subagent_only"} & set(item.issues)
+        return replace(item, name_source=NO_NAME if known_nameless else UNKNOWN_NAME)
+    if classes.kinds.get(thread) == "subagent":
+        return replace(item, name_source=NO_NAME)
+    return replace(item, name_source=classes.names.get(thread, UNKNOWN_NAME))
 
 
 def _codex_base(
@@ -975,7 +1030,11 @@ def _discover_selected(config: DiscoverySources) -> list[Endpoint]:
             found = [replace(item, issues=("no_inbox",) + item.issues) for item in found]
         endpoints.extend(found)
     endpoints.sort(key=lambda item: (item.ref.provider.value, item.ref.label or "", item.ref.pane or ""))
-    return endpoints
+    # 本轮来源完整性随端点带出（§91.2.2）：输出侧的名字投影与之后的 --to 解析用同一个口径
+    incomplete = frozenset(config.incomplete)
+    endpoints = [replace(item, round_incomplete=incomplete) for item in endpoints]
+    views = name_views(endpoints)  # 本轮名字投影随端点携带，输出侧只查表（§91.4.2）
+    return [replace(item, name_view=views[id(item)]) for item in endpoints]
 
 
 def codex_title_report(sources: DiscoverySources | None = None) -> dict[str, object]:
@@ -1031,68 +1090,87 @@ class ResolveError(Exception):
         self.candidates = candidates
 
 
-def _normalize(value: str) -> str:
-    return _SELECTOR_NORMALIZE.sub("-", value.strip().lower())
+# 没有原生主名的 provider（只用 ID）：它们没看全也藏不了同名会话，名字门不算它们，前缀门照算
+_NAMELESS_PROVIDERS = frozenset({Provider.GROK})
+
+
+def _name_source(item: Endpoint) -> NameSource:
+    """端点的原生主名来源（§91.3）：Grok 只用 ID；Claude 缺采样时按注册表名字补；Codex 缺采样即未知。"""
+    if item.ref.provider in _NAMELESS_PROVIDERS:
+        return NO_NAME
+    if item.name_source is not None:
+        return item.name_source
+    return name_source(item.name) if item.ref.provider is Provider.CLAUDE else UNKNOWN_NAME
+
+
+def _binding(item: Endpoint) -> tuple[object, ...]:
+    """本机实际绑定：同一 ID 的不同进程/代际/根是不同绑定，不按 nativeId 折叠（与 NameBook 同一定义）。"""
+    return native_binding(item.ref)
+
+
+# 认不出 ID、但已正证不是根会话候选的端点：还没 thread，或只持有子代理 thread（与 _with_codex_name 同口径）
+_KNOWN_NON_ROOT = frozenset({"no_thread_yet", "subagent_only"})
+
+
+def _ids_complete(endpoints: Sequence[Endpoint], provider: Provider) -> bool:
+    """该 provider 的身份全集是否完整：有认不出 thread、又不能排除是根会话的端点就不完整。"""
+    return not any(item.ref.provider is provider and item.ref.native_id == UNRESOLVED_NATIVE_ID
+                   and not _KNOWN_NON_ROOT & set(item.issues) for item in endpoints)
+
+
+def _round_incomplete(endpoints: Sequence[Endpoint]) -> frozenset[str]:
+    """本轮没看全的 provider：各端点带出的来源不完整集合取并集（夹具端点不带，即为空）。"""
+    return frozenset().union(*(item.round_incomplete for item in endpoints))
+
+
+def selection_complete(endpoints: Sequence[Endpoint], provider: Provider) -> bool:
+    """§91.2.2 的「相关 provider 候选完整」，Linux 唯一判定：本轮来源看全了它，且身份全集里没有未知的根候选。
+    名字投影与 --to 解析都用它；两者口径不一致会让名字在一处已核实、另一处未核实。"""
+    return provider.value not in _round_incomplete(endpoints) and _ids_complete(endpoints, provider)
+
+
+def name_views(endpoints: Sequence[Endpoint]) -> dict[int, NameView]:
+    """§91 Linux 适配器：本轮端点的 NameView，键为 id(端点)。Linux 没有本机名字否证来源（不移植 alias）。"""
+    facts = {id(item): NameFacts(_binding(item), item.ref.provider, item.ref.native_id, _name_source(item))
+             for item in endpoints}
+    views = project(facts.values(), complete={provider: selection_complete(endpoints, provider) for provider in Provider})
+    return {key: views[fact.binding] for key, fact in facts.items()}
 
 
 def resolve_target(selector: str, endpoints: list[Endpoint]) -> Endpoint:
-    """解析 `--to`：provider@id:<ID>、pane（%3）、完整会话 ID、provider@tmux会话名、tmux会话名、Claude 会话名或 ID 前缀。
+    """解析 `--to`（§91.2）：`provider@id:<≥8位前缀|完整ID>`、裸完整 UUID 或原生主名；名字与 ID 互不回退。
 
-    按以上优先级逐条匹配；某一条命中多个即报歧义，不挑第一个。
+    tmux 会话名与 pane 不再是输入。名字命中的每一行都须已核实且唯一；前缀与无 provider 的名字要求
+    相关 provider 全集完整。命中多个即报歧义，不挑第一个。
     """
-    value = selector.strip()
-    if not value:
-        raise ResolveError("target_not_found")
-    provider: Provider | None = None
-    label = value
-    if "@" in value:
-        head, _, tail = value.partition("@")
-        try:
-            provider = Provider(head.strip().lower())
-        except ValueError:
-            provider = None
-        else:
-            label = tail
-    if provider is not None and label.strip().lower().startswith("id:"):
-        # provider@id:<完整ID或≥8位唯一前缀>：强制按会话 ID（与 Windows、跨设备目标同一写法），不落到名字规则
-        wanted = label.strip()[3:].strip().lower()
-        same = [item for item in endpoints if item.ref.provider is provider]
-        found = tuple(item for item in same if wanted and item.ref.native_id.lower() == wanted)
-        if not found and len(wanted) >= 8:
-            found = tuple(item for item in same if item.ref.native_id.lower().startswith(wanted))
-        if len(found) == 1:
-            return found[0]
-        if found:
-            raise ResolveError("target_ambiguous", found)
-        raise ResolveError("target_not_found")
-    normalized = _normalize(label)
-    lowered = value.lower()
-    rules: list[Callable[[Endpoint], bool]] = [
-        lambda item: item.ref.pane == value,
-        lambda item: item.ref.native_id.lower() == lowered,
-        lambda item: (
-            provider is not None
-            and item.ref.provider is provider
-            and item.ref.label is not None
-            and _normalize(item.ref.label) == normalized
-        ),
-        lambda item: provider is None and item.ref.label is not None and _normalize(item.ref.label) == normalized,
-        lambda item: provider is None and item.name is not None and item.name == value,
-        lambda item: len(lowered) >= 8 and item.ref.native_id.lower().startswith(lowered),
-        # 没有 tmux 会话名时展示名是 provider@<原生 ID 前缀>，允许照抄它作为目标（DESIGN §45.33.3）
-        lambda item: (
-            provider is not None
-            and item.ref.provider is provider
-            and len(label) >= 8
-            and item.ref.native_id.lower().startswith(label.lower())
-        ),
-    ]
-    for rule in rules:
-        matches = tuple(item for item in endpoints if rule(item))
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            raise ResolveError("target_ambiguous", matches)
+    try:
+        wanted = parse_selector(selector)
+    except SelectorError as error:
+        raise ResolveError(error.args[0]) from None
+    pool = [item for item in endpoints if wanted.provider in (None, item.ref.provider)]
+    if wanted.provider is not None:
+        relevant = {wanted.provider}
+    else:
+        # 没写 provider：可见端点的 provider，并上本轮没看全的 provider（某家一个端点都没露出也算相关）
+        unseen = {provider for provider in Provider if provider.value in _round_incomplete(endpoints)}
+        relevant = {item.ref.provider for item in endpoints} | unseen
+    if wanted.kind == "id":
+        found = tuple(item for item in pool if item.ref.native_id.lower() == wanted.value)
+    elif wanted.kind == "prefix":
+        if not all(selection_complete(endpoints, provider) for provider in relevant):
+            raise ResolveError(TARGET_ID_UNVERIFIED)
+        found = tuple(item for item in pool if item.ref.native_id.lower().startswith(wanted.value))
+    else:
+        views = name_views(endpoints)
+        found = tuple(item for item in pool if canonical(_name_source(item)) == wanted.value)
+        names_complete = (all(_name_source(item).state != "unknown" for item in endpoints if item.ref.provider in relevant)
+                          and all(selection_complete(endpoints, provider) for provider in relevant - _NAMELESS_PROVIDERS))
+        if not names_complete or any(not views[id(item)].verified for item in found):
+            raise ResolveError("target_names_unverified", found)  # 带上命中行，CLI 列出它们的完整 ID
+    if len(found) == 1:
+        return found[0]
+    if found:
+        raise ResolveError("target_ambiguous", found)
     raise ResolveError("target_not_found")
 
 

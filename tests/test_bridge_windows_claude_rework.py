@@ -11,7 +11,7 @@ import test_bridge_windows_claude as F
 from agentstatus_bridge import cli, worker
 from agentstatus_bridge.dispatch import Dispatcher, DISCOVERY_PARK_SECONDS, needs_worker
 from agentstatus_bridge.labels import reason_text
-from agentstatus_bridge.model import Delivery, Provider
+from agentstatus_bridge.model import Delivery, NameSource, Provider
 from agentstatus_bridge.platforms.transport_codec import encode_address, parse_reply, same_address
 from agentstatus_bridge.platforms.windows import claude_discovery as D, claude_peer as P, commands, codex_discovery
 from agentstatus_bridge.platforms.windows import worker_identity
@@ -59,9 +59,12 @@ class ReworkTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertIsNotNone(selected)
         self.assertEqual(selected.ref.native_id, F.UUID)
-        for name in ('fixture-peer', 'claude@id:' + F.UUID[:8], 'claude@id:' + OTHER):
+        # 名字与未观察到的完整 ID 仍报发现不完整；id: 前缀的唯一性无法证明，报 target_id_unverified（§91.2.2）
+        for name in ('fixture-peer', 'claude@id:' + OTHER):
             with self.assertRaisesRegex(NativeFailure, 'claude_discovery_incomplete'):
                 result.select(name)
+        with self.assertRaisesRegex(NativeFailure, 'target_id_unverified'):
+            result.select('claude@id:' + F.UUID[:8])
 
     def test_duplicate_sessions_only_exclude_the_duplicate_group(self):
         self.another(300); self.another(400)
@@ -71,7 +74,7 @@ class ReworkTests(unittest.TestCase):
         self.assertEqual([e.ref.native_id for e in result.endpoints], [F.UUID])
         self.assertEqual(len(result.duplicates), 2)
         self.assertEqual(result.select('claude@id:' + F.UUID).ref.native_id, F.UUID)
-        with self.assertRaisesRegex(NativeFailure, 'target_ambiguous'):
+        with self.assertRaisesRegex(NativeFailure, '^target_ambiguous$'):
             result.select('claude@id:' + OTHER)
         self.assertEqual(sum(row['eligible'] for row in result.document()), 1)
 
@@ -227,22 +230,54 @@ class ReworkTests(unittest.TestCase):
                 self.assertIsNotNone(resolved)
                 self.assertEqual(resolved.attempt.id, attempt.id)
 
+    def peers_output(self, result, *argv):
+        output = io.StringIO()
+        with (patch.object(commands, 'claude_evidence', return_value=result),
+              patch.object(codex_discovery, 'discover', return_value=commands.Discovery(complete=True)),
+              patch.object(commands.claude, 'discover', return_value=result), redirect_stdout(output)):
+            self.assertEqual(cli.main(['peers', *argv]), 0)
+        return output.getvalue()
+
     def test_windows_peers_text_shows_name_and_readable_discovery_reason(self):
         ep, _ = D.inspect(self.p.transport, 200)
+        native = ep.ref.native_id
+        # 注册表名字同时进 Endpoint.name（显示用）与 name_source（截断前原文）；真实 discover() 末尾调 with_views()
+        named = replace(ep, name='测试名称', name_source=NameSource('named', '测试名称'))
         for complete in (True, False):
-            result = D.Discovery((replace(ep, name='测试名称'),), complete,
-                                 'complete' if complete else 'claude_discovery_incomplete')
-            output = io.StringIO()
-            with (patch.object(commands, 'claude_evidence', return_value=result),
-                  patch.object(codex_discovery, 'discover', return_value=commands.Discovery(complete=True)),
-                  patch.object(commands.claude, 'discover', return_value=result), redirect_stdout(output)):
-                self.assertEqual(cli.main(['peers']), 0)
-            self.assertIn('测试名称', output.getvalue())
-            self.assertIn('claude@测试名称〔'+ep.ref.native_id[:8]+'〕', output.getvalue())
-            self.assertIn('target=claude@id:'+ep.ref.native_id, output.getvalue())
+            result = D.Discovery((named,), complete, 'complete' if complete else 'claude_discovery_incomplete').with_views()
+            output = self.peers_output(result)
+            if complete:
+                self.assertIn('claude@测试名称〔'+native[:8]+'〕', output)
+            else:
+                # 发现不完整（§91.3）：名字未核实，只作展示名；消歧前缀没有全集证明，写完整 ID
+                self.assertIn('claude@id:'+native+' 名称=测试名称（仅展示）', output)
+                self.assertNotIn('claude@测试名称', output)
+            self.assertIn('target=claude@id:'+native, output)
             self.assertIsNone(ep.ref.label)
-            self.assertIn('发现完整' if complete else '发现不完整', output.getvalue())
-            self.assertNotIn('claude_discovery_incomplete', output.getvalue())
+            self.assertIn('发现完整' if complete else '发现不完整', output)
+            self.assertNotIn('claude_discovery_incomplete', output)
+            # JSON（§91 S4）：name 是可复制主名，另给 displayName 与 nameVerified；target 一律完整 ID
+            [row] = [item for item in json.loads(self.peers_output(result, '--json'))['peers']
+                     if item['provider'] == 'claude']
+            self.assertEqual((row['target'], row['name'], row['displayName'], row['nameVerified']),
+                             ('claude@id:'+native, '测试名称', '测试名称', complete))
+        # 不可复制的原生名（首尾空白）：JSON name 为 None，只作转义展示名；文本同样只作展示
+        edge = replace(ep, name=' 测试名称 ', name_source=NameSource('named', ' 测试名称 '))
+        edged = D.Discovery((edge,), True, 'complete').with_views()
+        output = self.peers_output(edged)
+        self.assertIn('claude@id:'+native[:8]+' 名称=" 测试名称 "（仅展示）', output)
+        [row] = [item for item in json.loads(self.peers_output(edged, '--json'))['peers'] if item['provider'] == 'claude']
+        self.assertEqual((row['name'], row['displayName'], row['nameVerified']), (None, '" 测试名称 "', False))
+        # 反例：端点没带本轮 NameView 时，文本不回退 Endpoint.name 或 label，只写完整 ID
+        bare = D.Discovery((named,), True, 'complete')
+        output = self.peers_output(bare)
+        self.assertNotIn('测试名称', output)
+        self.assertIn('claude@id:'+native+'  target=claude@id:'+native, output)
+        # 经真实 discover()：端点在发现末尾带上本轮 NameView，peers 文本据此显示已核实的注册表名字
+        found = D.discover(self.p.transport)
+        self.assertTrue(found.complete)
+        self.assertTrue(found.endpoints and all(item.name_view is not None for item in found.endpoints))
+        self.assertIn('claude@fixture-peer〔'+native[:8]+'〕  target=claude@id:'+native, self.peers_output(found))
 
     def test_dead_inbox_with_stale_address_parks_without_claim_or_send(self):
         tick = [1000.]

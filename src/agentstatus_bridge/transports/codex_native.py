@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
+import posixpath
 import re
 import time
 
@@ -12,6 +13,7 @@ from ..platforms.transport_types import LocalFailure, WINDOWS_READ_SECONDS
 from . import local_codex
 from .codex_rpc import CLIENT_NAME, parse_server_version
 from .websocket import WebSocket, _Closed, _Timeout
+from ..native_names import NameSource, codex_source
 
 READ_SECONDS = 1.0
 MAX_IDS = 32
@@ -78,6 +80,9 @@ def daemon_diagnostic(home: Callable[[], Path]) -> dict[str, object]:
 class ThreadMetadata:
     kind: str
     parent: str | None = None
+    # §91：原生主名采样（只保留 thread.name 或 cwd 末段，不留完整 cwd、preview 或正文）。None = 响应没有 name
+    # 字段（旧服务端）或类型无效，名字来源未知，不等于无名。分类相等性不含名字
+    name_source: NameSource | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,16 @@ class NativeBatch:
 
 
 def project_thread(value: object, requested: str) -> ThreadMetadata:
+    """thread/read 结果的分类投影，另附原生名字事实（§91.3）；名字事实不影响分类结论。"""
+    metadata = _project_kind(value, requested)
+    assert isinstance(value, dict)
+    name, cwd = value.get("name"), value.get("cwd")
+    if "name" in value and all(item is None or isinstance(item, str) for item in (name, cwd)):
+        return replace(metadata, name_source=codex_source(name, cwd, basename=lambda path: posixpath.basename(path.rstrip("/"))))
+    return metadata
+
+
+def _project_kind(value: object, requested: str) -> ThreadMetadata:
     if not isinstance(value, dict) or native_id(value.get("id")) != requested:
         raise NativeFailure("thread_id_mismatch")
     source = value.get("source")

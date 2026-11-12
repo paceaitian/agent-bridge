@@ -142,6 +142,8 @@ def record_linux():
             # §85 only changes local tasks/status endpoint text. Require the exact
             # new text before projecting it out; keep the frozen W1 JSON, wire,
             # files, locks, effects and every other byte unchanged. Old src still records.
+            # §91 S4 起 cli 不再导入 endpoint_text，本段只在 §85–§91 S3 的旧 src 上生效；新 src 的本机文字与 JSON
+            # name 改由 NameView 投影（夹具 thread 无名字证据 → 完整 ID），按原样定点改进 golden（outputs[2]–[6]）。
             if hasattr(cli, 'endpoint_text') and '--json' not in args and args[0] in ('tasks', 'status'):
                 old = 'codex@fixture\tlabel'
                 new = old + '〔019a0000〕'
@@ -179,7 +181,8 @@ def record_linux():
             return out.getvalue()
 
         command('peers'); command('peers', '--json')
-        sent = json.loads(command('send', '--to', '%1', '--no-wait', '--json', '-m', 'synthetic'))
+        # §91 移除 Linux tmux/%pane 输入；完整 ID 选择器在录制用的旧 src 上同样可用
+        sent = json.loads(command('send', '--to', 'codex@id:' + THREAD, '--no-wait', '--json', '-m', 'synthetic'))
         task_id = sent['id']
         command('tasks'); command('tasks', '--json')
         command('status', task_id); command('status', task_id, '--json')

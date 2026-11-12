@@ -142,7 +142,7 @@ class DiscoveryTests(unittest.TestCase):
         # Known collision is still ambiguous, and a blocked exact hit cannot borrow another provider.
         collision = replace(codex, rows=(replace(codex.rows[0], thread=F.UUID),))
         with patch.object(commands, 'evidence', return_value=collision), patch.object(commands, 'claude_evidence', return_value=claude):
-            with self.assertRaisesRegex(NativeFailure, 'target_ambiguous'): commands.resolve(F.UUID)
+            with self.assertRaisesRegex(NativeFailure, '^target_ambiguous$'): commands.resolve(F.UUID)
         blocked = replace(claude, endpoints=(replace(claude.endpoints[0], issues=('peer_protocol_unsupported',)),))
         with patch.object(commands, 'evidence', return_value=C.Discovery()), patch.object(commands, 'claude_evidence', return_value=blocked):
             with self.assertRaisesRegex(NativeFailure, 'target_peer_protocol_unsupported'): commands.resolve(F.UUID)
@@ -172,6 +172,18 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertEqual(cli.main(['send', '--to', 'fixture', '-m', 'fixture']), expected)
             self.assertIn('claude@', out.getvalue())
             self.assertIn('codex@', out.getvalue())
+            # §91.2.2：别名提示只在 Windows 本机、只对名字未核实追加；通用原因文案不提别名
+            self.assertEqual('alias set' in out.getvalue(), reason == 'target_names_unverified')
+        for to, hinted in (('claude@fixture', False), ('codex@fixture', True)):  # 别名只对 Codex 有意义
+            out = io.StringIO()
+            with patch.object(commands, 'scope', side_effect=NativeFailure('target_names_unverified')), redirect_stderr(out):
+                self.assertEqual(cli.main(['send', '--to', to, '-m', 'fixture']), cli.EXIT_TARGET)
+            self.assertEqual('alias set' in out.getvalue(), hinted, to)
+        for reason in ('target_id_unverified', 'target_id_invalid', 'target_provider_required'):  # 冻结附注二：三个新码
+            out = io.StringIO()
+            with patch.object(commands, 'scope', side_effect=NativeFailure(reason)), redirect_stderr(out):
+                self.assertEqual(cli.main(['send', '--to', 'codex@id:019a0000', '-m', 'fixture']), cli.EXIT_TARGET)
+            self.assertIn('刷新 peers', out.getvalue(), reason)
 
 
 class ResumeTests(unittest.TestCase):

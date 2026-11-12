@@ -497,6 +497,28 @@ class WakeTests(RelayTestCase):
         self.b.cycle()
         self.assertEqual(self.b.work, 2)
 
+    def test_name_only_change_republishes_the_directory(self) -> None:
+        # §91.6：目录 digest 覆盖整帧（含 name/namesVerified）；只改原生主名也要重发，远端才不会一直按旧名字寻址。
+        # 采样周期 30 秒（DIRECTORY_SAMPLE_MS），每步拨 31 秒
+        item: dict[str, Any] = {"provider": "codex", "nativeId": CODEX_B, "endpointId": "e" * 32, "endpointRevision": 1,
+                                "inbox": True, "eligible": True, "namesVerified": True, "name": "alpha"}
+        self.b.relay._directory = lambda: {  # pyright: ignore[reportPrivateUsage]
+            "endpoints": [dict(item)], "complete": True, "providers": {"codex": True}, "namePolicy": "agent-native-v1"}
+        self.b.cycle()
+        first = int(self.b.store.meta("directoryRevision") or "0")
+        self.assertGreaterEqual(first, 1)
+        self.tick(31_000)
+        self.b.cycle()
+        self.assertEqual(int(self.b.store.meta("directoryRevision") or "0"), first)  # 没变：不重发
+        item["name"] = "beta"
+        self.tick(31_000)
+        self.b.cycle()
+        self.assertEqual(int(self.b.store.meta("directoryRevision") or "0"), first + 1)
+        item["namesVerified"] = False  # 只改核实状态同样要重发
+        self.tick(31_000)
+        self.b.cycle()
+        self.assertEqual(int(self.b.store.meta("directoryRevision") or "0"), first + 2)
+
     def test_work_paused_after_wake_is_rewoken_on_resume(self) -> None:
         # 拉起之后才暂停：作业离开候选、记录随之清掉；恢复后算新作业，立即拉起（Opus r2-P3-2 N02）
         task, _ = self.create()

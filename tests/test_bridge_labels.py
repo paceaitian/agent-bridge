@@ -224,6 +224,22 @@ class NextStepTests(unittest.TestCase):
             self.assertIs(getattr(cli, name), getattr(labels, name))
 
 
+class NativeTargetTextTests(unittest.TestCase):
+    """§91 新增与改写的目标文案：三个新码有中文文案；通用文案不推荐别名、不推荐 pane。"""
+
+    def test_new_codes_have_texts_and_no_alias_or_pane_advice(self) -> None:
+        for code in ("target_provider_required", "target_id_invalid", "target_id_unverified"):
+            with self.subTest(code=code):
+                self.assertNotEqual(labels.reason_text(code), code)
+        for code in ("target_names_unverified", "target_ambiguous", "target_generation_ambiguous"):
+            with self.subTest(code=code):
+                text = labels.reason_text(code, command="ab")
+                self.assertNotIn("别名", text)
+                self.assertNotIn("pane", text)
+        self.assertIn("provider@id:<完整ID>", labels.reason_text("target_names_unverified"))
+        self.assertIn("ab peers", labels.reason_text("target_id_unverified", command="ab"))
+
+
 class ReasonTextCommandTests(unittest.TestCase):
     """原因文案里的 `{command}` 占位必须被换成实际入口名（DESIGN §45.36）。
 
@@ -241,7 +257,8 @@ class ReasonTextCommandTests(unittest.TestCase):
         # 清理范围是 6 条，不是 3 条：DESIGN 与提交信息原来都记错了（独立 Opus 审计 P2-1）；
         # §53.3.8 加了 3 条（标题缺 id 的目标文案、汇报与发起的未归属文案都指向 doctor）
         # §83 及审计 r1 按读者/原因分开的容量文案同样使用当前入口名。
-        self.assertEqual(len(carriers), 15, carriers)
+        # §91 的 target_id_unverified 提示用当前入口名刷新 peers。
+        self.assertEqual(len(carriers), 16, carriers)
         for code in labels.REASON_TEXTS:
             with self.subTest(code=code):
                 self.assertNotIn(labels.PLACEHOLDER, labels.reason_text(code, command="testcmd"))

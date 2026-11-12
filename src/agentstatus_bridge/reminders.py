@@ -13,7 +13,8 @@ from .labels import next_step, reason_text
 from .model import HANDED_OVER, REMINDER_OPTION, Attempt, Delivery, Role, Task, TaskView, describe
 from .store import attempt_limit
 from .summary import attention_at, attention_token, classify
-from .notification_policy import can_notify, wire_ref
+from .native_names import NO_NAMES, NameBook
+from .notification_policy import can_notify
 
 REMIND_AFTER_SECONDS = 30 * 60.0
 # 提醒记在 notice 尝试的 options 上：尝试不按条数裁剪，比每任务有上限的事件时间线更适合去重
@@ -111,12 +112,16 @@ def reminder_sender_class(attempts: list[Attempt]) -> str | None:
     return first.sender_class if first is not None else None
 
 
-def reminder_body(task: Task, attempts: list[Attempt], view: TaskView, *, command: str | None = None) -> str:
+def reminder_body(task: Task, attempts: list[Attempt], view: TaskView, *, command: str | None = None,
+                  names: NameBook = NO_NAMES, receiver: str | None = None) -> str:
     """提醒正文：哪一步卡住、接收方是谁，以及下一步命令；标题由 envelope 的「任务：」行给出。
 
     `command` 由 worker 传它启动时解析好的入口名（DESIGN §45.36）：提醒是发给发起方照抄的。
     """
-    receiver = wire_ref(view.current.target).display() if view.current is not None else "对方"
+    # 接收方标识走 NameView：本机已核实主名，否则完整 ID（§91.4.2）；跨设备调用方不传 names，即完整 ID
+    # 联邦调用方对远端接收方传 receiver（带设备的人读文本）：显示引用丢了设备，不能只交给本机 formatter（§91.4.2）
+    if receiver is None:
+        receiver = names.local_wire(view.current.target) if view.current is not None else "对方"
     minutes = int(REMIND_AFTER_SECONDS // 60)
     lines = [f"提醒：这项任务已超过 {minutes} 分钟没有处理——{reason_text(view.reason, command=command)}（{receiver}）。"]
     step = next_step(task, attempts, ref=short(task.id), command=command, reserved=1)

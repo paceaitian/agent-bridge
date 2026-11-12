@@ -33,7 +33,7 @@ from agentstatus_bridge.observer_dbus import (
     agentstatus_view,
 )
 from agentstatus_bridge.ids import opaque_id
-from agentstatus_bridge.model import Provider, Runtime
+from agentstatus_bridge.model import NameSource, Provider, Runtime
 from agentstatus_bridge.platforms.linux import process as procfs
 from agentstatus_bridge.codex_argv import _codex_non_interactive  # pyright: ignore[reportPrivateUsage]
 from agentstatus_bridge.transports import DeliveryContext
@@ -223,6 +223,38 @@ class DiscoveryTests(unittest.TestCase):
             (found.ref.provider, found.ref.native_id, found.ref.pane, found.ref.label, found.runtime, found.issues),
             (Provider.CLAUDE, "session-500", "%500", "proj", Runtime.IDLE, ()),
         )
+
+    def test_unreadable_registry_keeps_names_and_prefixes_unverified(self) -> None:
+        # §91.2.2/§91.3：本轮没看全 Claude（同名会话的注册记录读不到）时，名字与前缀都不能证唯一，完整 ID 照常。
+        # 走真实 discover(sources)：来源完整性由发现随端点带出，不靠手工给端点盖章
+        if os.geteuid() == 0:
+            self.skipTest("root 读得到 0000 权限的文件")
+        self._claude(500, name="alpha", sessionId="019a5555-0000-7000-8000-000000000500")
+        self._claude(700, name="alpha", sessionId="019a5555-0000-7000-8000-000000000700")
+        hidden = self.sessions / "700.json"
+        hidden.chmod(0)
+        try:
+            sources = self._sources()
+            [found] = discover(sources)
+        finally:
+            hidden.chmod(0o600)  # 临时目录在 tearDown 里删，权限要在用例内恢复
+        self.assertFalse(sources.provider_complete(Provider.CLAUDE))
+        assert found.name_view is not None
+        self.assertEqual((found.name_view.verified, found.name_view.id_prefix), (False, found.ref.native_id))
+        for selector, code in (("claude@alpha", "target_names_unverified"), ("alpha", "target_names_unverified"),
+                               ("claude@id:019a5555", "target_id_unverified"), ("id:019a5555", "target_id_unverified")):
+            with self.subTest(selector=selector), self.assertRaises(ResolveError) as caught:
+                resolve_target(selector, [found])
+            self.assertEqual(caught.exception.code, code)
+        self.assertIs(resolve_target(found.ref.native_id, [found]), found)
+
+    def test_claude_registry_long_name_keeps_the_truncation_fact(self) -> None:
+        # §91.4.1：注册表名字超过 80 字符时先记截断事实再截；截后的名字只作展示，不可核实、不能按它寻址
+        self._claude(500, name="x" * 81)
+        [found] = discover(self._sources())
+        self.assertEqual(found.name_source, NameSource("named", "x" * 80, True))
+        assert found.name_view is not None
+        self.assertFalse(found.name_view.verified)
 
     def test_stale_registry_and_missing_socket(self) -> None:
         self._claude(500, registry_start="1")
@@ -682,21 +714,32 @@ class ResolveTests(unittest.TestCase):
         self.endpoints = [self.codex, self.claude, self.other]
 
     def test_selectors(self) -> None:
-        self.assertIs(resolve_target("%2", self.endpoints), self.claude)
+        # §91：原生主名（夹具把 label 注入为 Codex 原生名，Claude 用注册表 name）、裸完整 UUID、显式 id: 前缀
         self.assertIs(resolve_target("codex@vm", self.endpoints), self.codex)
-        self.assertIs(resolve_target("claude@vm-claude", self.endpoints), self.claude)
-        self.assertIs(resolve_target("claude@vm claude", self.endpoints), self.claude)
         self.assertIs(resolve_target("审计", self.endpoints), self.claude)
         self.assertIs(resolve_target(UUID_A.upper(), self.endpoints), self.codex)
-        self.assertIs(resolve_target("5f000000", self.endpoints), self.other)
-        # 无 tmux 会话名时展示名是 provider@<原生 ID 前缀>，照抄也要能解析（DESIGN §45.33.3）
-        self.assertIs(resolve_target(f"codex@{UUID_A[:8]}", self.endpoints), self.codex)
-        # 无会话名无 pane 时 ab peers 给的目标就是这个形式（cli._selectors 用 token()）
+        self.assertIs(resolve_target("id:5f000000", self.endpoints), self.other)
+        self.assertIs(resolve_target(f"codex@id:{UUID_A[:8]}", self.endpoints), self.codex)
+        self.assertIs(resolve_target(f"codex@id:{UUID_A[:8].upper()}", self.endpoints), self.codex)
+        # 无会话名无 pane 时旧展示名仍是 provider@<原生 ID 前缀>（EndpointRef.token 不改），但它已不是选择器
         self.assertEqual(ref(Provider.CODEX, UUID_A, pane=None, label=None).token(), f"codex@{UUID_A[:8]}")
-        self.assertIs(resolve_target(f"codex@{UUID_A[:8].upper()}", self.endpoints), self.codex)
+        # §91 移除的旧写法一律不再命中：pane、tmux 会话名（含空白/连字符归一化）、裸 ID 前缀（含上面的旧展示名）。
+        # 裸值只按名字找，未命中绝不改按 ID 前缀找
+        for selector in ("%2", "claude@vm-claude", "claude@vm claude", "5f000000", f"codex@{UUID_A[:8]}",
+                         f"codex@{UUID_A[:8].upper()}", f"codex@{UUID_A[:7]}"):
+            with self.subTest(selector):
+                with self.assertRaises(ResolveError) as gone:
+                    resolve_target(selector, self.endpoints)
+                self.assertEqual(gone.exception.code, "target_not_found")
         with self.assertRaises(ResolveError) as short:
-            resolve_target(f"codex@{UUID_A[:7]}", self.endpoints)
-        self.assertEqual(short.exception.code, "target_not_found")
+            resolve_target(f"codex@id:{UUID_A[:7]}", self.endpoints)
+        self.assertEqual(short.exception.code, "target_id_invalid")
+        # tmux 会话名不是名字：没有原生主名的端点按 label 找不到，只能按 ID
+        unnamed = endpoint(ref(Provider.CODEX, UUID_B, pid=5, pane="%5", label="solo"), native_name=None)
+        with self.assertRaises(ResolveError) as label:
+            resolve_target("codex@solo", [unnamed])
+        self.assertEqual(label.exception.code, "target_not_found")
+        self.assertIs(resolve_target(f"codex@id:{UUID_B}", [unnamed]), unnamed)
 
     def test_provider_id_form_forces_id_match(self) -> None:
         # 与 Windows、跨设备目标同一写法：本机执行 + 远端复核时目标常照抄 provider@id:<完整ID>
@@ -709,10 +752,15 @@ class ResolveTests(unittest.TestCase):
         self.assertIs(pick(f"codex@id:{UUID_A}"), self.codex)
         self.assertIs(pick(f"CODEX@id: {UUID_A.upper()}"), self.codex)
         self.assertIs(pick(f"codex@id:{UUID_A[:8]}"), self.codex)
-        for selector in (f"claude@id:{UUID_A}", "codex@id:", f"codex@id:{UUID_A[:7]}", "claude@id:vm"):
-            with self.subTest(selector), self.assertRaises(ResolveError) as missing:
-                resolve_target(selector, self.endpoints)
-            self.assertEqual(missing.exception.code, "target_not_found")
+        with self.assertRaises(ResolveError) as missing:
+            resolve_target(f"claude@id:{UUID_A}", self.endpoints)
+        self.assertEqual(missing.exception.code, "target_not_found")
+        # §91.2.2：显式 id: 空、不足 8 位或不是 UUID 形状一律 target_id_invalid，不转按名字找（"vm" 是现成的名字）
+        for selector in ("codex@id:", f"codex@id:{UUID_A[:7]}", "claude@id:vm"):
+            with self.subTest(selector):
+                with self.assertRaises(ResolveError) as invalid:
+                    resolve_target(selector, self.endpoints)
+                self.assertEqual(invalid.exception.code, "target_id_invalid")
         twins = [self.claude, self.other, endpoint(ref(Provider.CLAUDE, "4e24a95f-9999-2222-3333-444444444444",
                                                         pid=4, pane="%4", label="x"))]
         with self.assertRaises(ResolveError) as ambiguous:

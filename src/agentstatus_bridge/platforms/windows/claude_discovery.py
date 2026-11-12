@@ -6,9 +6,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 import re
 import time
-from typing import Any
+from typing import Any, cast
 
 from ...model import Endpoint, EndpointRef, Provider, Runtime
+from ...native_names import (
+    TARGET_ID_UNVERIFIED, UNKNOWN_NAME, NameFacts, NameView, Selector, SelectorError, canonical, name_source,
+    parse_selector, project as project_names,
+)
 from ...transports.codex_native import NativeFailure, native_id
 from .claude_auth import PeerFiles, PIPE, generation
 from .local_transport import WindowsPlatform
@@ -53,11 +57,11 @@ def project(data: dict[str, Any], pid: int, birth: str, root: str) -> Endpoint:
     if not isinstance(pipe, str) or not PIPE.fullmatch(pipe):
         issues.append('socket_unavailable')
         pipe = None
-    name = data.get('name')
-    name = name[:80] if isinstance(name, str) and name.strip() else None
+    raw = data.get('name')
+    name = raw[:80] if isinstance(raw, str) and raw.strip() else None
     return Endpoint(EndpointRef(Provider.CLAUDE, session, pid, 'win-filetime:' + birth, data_root=root),
                     runtime=Runtime.UNKNOWN, runtime_source='none', name=name, socket_path=pipe,
-                    issues=tuple(issues))
+                    issues=tuple(issues), name_source=name_source(raw, limit=80))  # 截断前保存事实（§91.3）
 
 
 def inspect(backend: WindowsPlatform, pid: int, *, connect: bool = True,
@@ -105,6 +109,10 @@ def inspect(backend: WindowsPlatform, pid: int, *, connect: bool = True,
         return endpoint, data
 
 
+def _binding(endpoint: Endpoint) -> tuple[str, int, str]:
+    return (endpoint.ref.native_id, endpoint.ref.pid, endpoint.ref.start_ticks)
+
+
 @dataclass(frozen=True)
 class Discovery:
     endpoints: tuple[Endpoint, ...] = ()
@@ -117,29 +125,55 @@ class Discovery:
     # §92：本轮当前代际的非交互登记 PID（进程内事实，不进协议/doctor）；与 found 一起构成角色裁决的保护集
     noninteractive: frozenset[int] = frozenset()
 
-    def select(self, reference: str) -> Endpoint:
-        key = reference.removeprefix('claude@')
-        forced = key.startswith('id:')
-        key = key.removeprefix('id:')
-        if not key.strip():
-            raise NativeFailure('target_explicit_required')
-        exact = native_id(key)
-        if not self.complete and exact is None:
-            raise NativeFailure(self.reason)
-        matches = [e for e in (*self.endpoints, *self.duplicates) if (len(key) >= 8 and e.ref.native_id.startswith(key.lower()))
-                   or not forced and e.name == key]
-        if not matches and not self.complete:
-            raise NativeFailure(self.reason)  # An unobserved UUID is not proof of absence.
+    def select(self, reference: str | Selector) -> Endpoint:
+        """解析 Claude 目标（§91.2）：完整 ID 精确；`id:` 前缀要求发现完整；名字只认已核实的原生主名，互不回退。"""
+        try:
+            selector = reference if isinstance(reference, Selector) else parse_selector(reference)
+        except SelectorError as error:
+            raise NativeFailure(error.args[0]) from None
+        if selector.provider not in (None, Provider.CLAUDE):
+            raise NativeFailure('target_not_found')
+        rows = (*self.endpoints, *self.duplicates)
+        if selector.kind == 'id':
+            matches = [e for e in rows if e.ref.native_id == selector.value]
+            if not matches and not self.complete:
+                raise NativeFailure(self.reason)  # An unobserved UUID is not proof of absence.
+        elif not self.complete:
+            raise NativeFailure(TARGET_ID_UNVERIFIED if selector.kind == 'prefix' else self.reason)
+        elif selector.kind == 'prefix':
+            matches = [e for e in rows if e.ref.native_id.startswith(selector.value)]
+        else:
+            views = self.name_views()
+            matches = [e for e in rows if canonical(e.name_source or UNKNOWN_NAME) == selector.value]
+            if any(not views[_binding(e)].verified for e in matches):
+                raise NativeFailure('target_names_unverified')
         if len(matches) != 1:
             raise NativeFailure('target_ambiguous' if matches else 'target_not_found')
         if matches[0].blocking_issues:
             raise NativeFailure('target_' + matches[0].blocking_issues[0])
         return matches[0]
 
+    def name_views(self) -> dict[tuple[str, int, str], NameView]:
+        """§91.3 的 NameView：按 (会话 ID, PID, 出生代际) 绑定，重复会话的两份登记各算一个绑定。"""
+        facts = [NameFacts(_binding(e), Provider.CLAUDE, e.ref.native_id, e.name_source or UNKNOWN_NAME)
+                 for e in (*self.endpoints, *self.duplicates)]
+        views = project_names(facts, complete={Provider.CLAUDE: self.complete})
+        return {cast(tuple[str, int, str], binding): view for binding, view in views.items()}
+
+    def with_views(self) -> Discovery:
+        """让端点携带本轮名字投影（§91.4.2：输出侧只查表）；不改身份字段。"""
+        views = self.name_views()
+        def attach(items: tuple[Endpoint, ...]) -> tuple[Endpoint, ...]:
+            return tuple(replace(item, name_view=views[_binding(item)]) for item in items)
+        return replace(self, endpoints=attach(self.endpoints), duplicates=attach(self.duplicates))
+
     def document(self) -> list[dict[str, object]]:
+        views = self.name_views()
         return [{'provider': 'claude', 'target': 'claude@id:' + e.ref.native_id, 'nativeId': e.ref.native_id,
                  'pane': None, 'runtime': 'unknown', 'kind': 'root',
-                 'eligible': not e.blocking_issues, 'name': e.name, 'issues': list(e.issues)}
+                 'eligible': not e.blocking_issues, 'name': views[_binding(e)].name,
+                 'displayName': views[_binding(e)].display_name, 'nameVerified': views[_binding(e)].verified,
+                 'issues': list(e.issues)}
                 for e in (*self.endpoints, *self.duplicates)]
 
 
@@ -231,4 +265,4 @@ def discover(backend: WindowsPlatform, *, connect: bool = True) -> Discovery:
                        for e in found if counts[e.ref.native_id] > 1)
     eligible = tuple(e for e in found if counts[e.ref.native_id] == 1)
     return Discovery(eligible, complete, 'complete' if complete else 'claude_discovery_incomplete', duplicates,
-                     tuple(registries), scan.diagnostics, frozenset(known_noninteractive))
+                     tuple(registries), scan.diagnostics, frozenset(known_noninteractive)).with_views()

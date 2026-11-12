@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from functools import cached_property
 import re
 import time
 
@@ -15,9 +16,12 @@ from ...transports.websocket import _Closed, _Timeout
 from .codex_sql import read_classes, source_class
 from .local_transport import WindowsPlatform
 from .target_aliases import AliasFile, AliasSet, ALIAS
-from .thread_names import names, fields_valid
-from ...model import Endpoint, EndpointRef, Provider
-from ...display import endpoint_text
+from .thread_names import names, fields_valid, native_source
+from ...model import Endpoint, EndpointRef, NameSource, Provider
+from ...native_names import (
+    NO_NAME, TARGET_ID_UNVERIFIED, UNKNOWN_NAME, NameFacts, NameView, Selector, SelectorError, endpoint_text,
+    id_prefixes, parse_selector, project,
+)
 
 PAGE_SIZE, MAX_LOADED = 256, 4096
 NO_PANE_WARNING = ('可能没有窗口在显示；若窗口已关闭，可 codex resume 查看；'
@@ -46,10 +50,31 @@ class Candidate:
     source_class: str = 'other'
     sql_present: bool = False
     stable: bool = True
+    # §91 原生主名事实（原文、未转义、保留截断标志）；name/cwd_label 是旧的本机名字分支用的转义值
+    name_source: NameSource | None = field(default=None, repr=False, compare=False)
 
     @property
     def eligible(self) -> bool:
         return self.kind == 'root' and self.metadata_verified and self.stable
+
+    @property
+    def native_name(self) -> NameSource:
+        """§91.3 的 NameFacts 来源：已正证不属收件类别（子代理、internal）不取名；其余行（含元数据未核实、
+        冲突）读到名字就用，读不到即来源未知，使 Codex 原生名一律未核实。"""
+        if self.metadata_verified and self.kind in ('subagent', 'internal'):
+            return NO_NAME
+        return self.name_source if self.name_source is not None else UNKNOWN_NAME
+
+
+def _selector(reference: str | Selector | None) -> Selector:
+    if isinstance(reference, Selector):
+        return reference
+    if reference is None:
+        raise NativeFailure('target_explicit_required')
+    try:
+        return parse_selector(reference)
+    except SelectorError as error:
+        raise NativeFailure(error.args[0]) from None
 
 
 @dataclass(frozen=True)
@@ -66,28 +91,24 @@ class Discovery:
     native_reads: int = 0
     native_read_budget_hit: bool = False
 
-    def select(self, reference: str | None) -> Candidate:
+    def select(self, reference: str | Selector | None) -> Candidate:
+        """解析 Codex 目标（§91.2）：先按公用语法分流 ID 与名字，二者互不回退。
+
+        ID 只认完整 ID 或显式 `id:` 前缀；名字走旧的本机名字分支（alias、原生名、次级 cwd，沿原优先级、
+        资格与错误语义），不再并入 ID 前缀。
+        """
+        selector = _selector(reference)
         if not self.complete:
-            raise NativeFailure('discovery_incomplete')
-        if not reference:
-            raise NativeFailure('target_explicit_required')
-        reference = reference.removeprefix('codex@')
-        # id: is an explicit disambiguation escape, including UUID-shaped names.
-        forced = reference.startswith('id:')
-        if forced:
-            reference = reference[3:]
-        if not reference.strip():
-            raise NativeFailure('target_explicit_required')
-        explicit_id = forced or native_id(reference) is not None
-        if not explicit_id and reference in self.aliases.unavailable:
-            raise NativeFailure('alias_target_unavailable')
-        alias = self.aliases.names.get(reference) if ALIAS.fullmatch(reference) and not explicit_id else None
-        key = alias or (reference.lower() if PREFIX.fullmatch(reference) else None)
-        matches = [row for row in self.rows if key is not None and row.thread.startswith(key)]
-        if alias is None and not explicit_id:
-            if not self.names_complete:
-                raise NativeFailure('target_names_unverified')
-            matches = list({r.thread: r for r in (*matches, *self._named(reference))}.values())
+            # 本机前缀缺证用 target_id_unverified（§91.2.2，与 Windows Claude、Linux 同口径）；完整 ID 与名字照旧
+            raise NativeFailure(TARGET_ID_UNVERIFIED if selector.kind == 'prefix' else 'discovery_incomplete')
+        if selector.provider not in (None, Provider.CODEX):
+            raise NativeFailure('target_not_found')
+        if selector.kind == 'id':
+            matches = [row for row in self.rows if row.thread == selector.value]
+        elif selector.kind == 'prefix':
+            matches = [row for row in self.rows if row.thread.startswith(selector.value)]
+        else:
+            matches = [self._by_thread[thread] for thread in self._legacy_threads(selector.value)]
         if len(matches) != 1:
             raise NativeFailure('target_ambiguous' if matches else 'target_not_found')
         row = matches[0]
@@ -97,23 +118,82 @@ class Discovery:
             raise NativeFailure('target_metadata_unverified' if row.kind == 'unknown' else 'target_not_root')
         return row
 
-    def _named(self, reference: str) -> list[Candidate]:
-        # Independent empty-name guard: unnamed rows are never selectors.
-        return [r for r in self.rows if r.kind == 'root' and r.metadata_verified
-                and reference and reference in (r.name, r.cwd_label)]
+    def _legacy_threads(self, name: str) -> frozenset[str]:
+        """旧的本机名字分支命中的 thread 集合（查表，不扫 rows）；门错误照旧抛出。"""
+        if name in self.aliases.unavailable:
+            raise NativeFailure('alias_target_unavailable')
+        alias = self.aliases.names.get(name) if ALIAS.fullmatch(name) else None
+        if alias is not None:
+            return frozenset({alias} & self._by_thread.keys())
+        if not self.names_complete:
+            raise NativeFailure('target_names_unverified')
+        return self._legacy_index.get(name, frozenset())
 
-    @property
+    def _legacy_pick(self, name: str) -> str | None:
+        """旧名字分支对 name 的完整结果：唯一命中且可选的 thread，否则 None（等价于 select 名字分支不抛错）。"""
+        try:
+            threads = self._legacy_threads(name)
+        except NativeFailure:
+            return None
+        if len(threads) != 1:
+            return None
+        row = self._by_thread[next(iter(threads))]
+        return row.thread if row.eligible else None
+
+    @cached_property
+    def _by_thread(self) -> dict[str, Candidate]:
+        return {row.thread: row for row in self.rows}
+
+    @cached_property
+    def _aliases_by_thread(self) -> dict[str, tuple[str, ...]]:
+        """active alias 的反查表（按名字排序），一次建好，避免每行扫一遍 alias 表。"""
+        found: dict[str, list[str]] = {}
+        for alias, thread in sorted(self.aliases.names.items()):
+            found.setdefault(thread, []).append(alias)
+        return {thread: tuple(names) for thread, names in found.items()}
+
+    @cached_property
+    def _legacy_index(self) -> dict[str, frozenset[str]]:
+        """一次遍历建旧名字分支的索引：贡献条件沿原 _named（已核实的 root），原生名与次级 cwd 同等。"""
+        index: dict[str, set[str]] = {}
+        for row in self.rows:
+            if row.kind == 'root' and row.metadata_verified:
+                for value in {row.name, row.cwd_label} - {''}:
+                    index.setdefault(value, set()).add(row.thread)
+        return {value: frozenset(threads) for value, threads in index.items()}
+
+    @cached_property
     def names_complete(self) -> bool:
         return all(r.metadata_verified and (r.kind != 'root' or r.names_verified) for r in self.rows)
+
+    @cached_property
+    def name_views(self) -> dict[str, NameView]:
+        """§91.3 的 NameView：先原生全集唯一，再用本机 alias 与旧名字分支的同轮索引否证（只能 true→false）。
+
+        alias 文件读失败时全部未核实；暂不可用的 alias 与指向别处的 active alias 否证同名原生名；
+        最后往返：旧名字分支对该名字的结果不是本行，就未核实（次级 cwd、names_complete 为假都在此体现）。
+        """
+        facts = [NameFacts(row.thread, Provider.CODEX, row.thread, row.native_name) for row in self.rows]
+
+        def negated(fact: NameFacts, name: str) -> bool:
+            return self.aliases.reason != 'ok' or self._legacy_pick(name) != fact.native_id
+        views = project(facts, complete={Provider.CODEX: self.complete}, negated=negated)
+        return {str(binding): view for binding, view in views.items()}
+
+    @cached_property
+    def _prefixes(self) -> dict[str, str]:
+        return id_prefixes((row.thread for row in self.rows), complete=True)
 
     def endpoint(self, row: Candidate) -> Endpoint:
         if not self.complete or self.daemon is None or not row.eligible or not self.root_identity:
             raise NativeFailure('target_metadata_unverified')
         label = self.target_name(row).removeprefix('codex@')
         return Endpoint(EndpointRef(Provider.CODEX, row.thread, self.daemon[0],
-                                   'win-filetime:'+self.daemon[1], label=label, data_root=self.root_identity), consumers=0)
+                                   'win-filetime:'+self.daemon[1], label=label, data_root=self.root_identity), consumers=0,
+                        name_source=row.native_name, name_view=self.name_views[row.thread])
 
     def document(self) -> dict[str, object]:
+        views = self.name_views
         return {'discovery': self.reason, 'complete': self.complete, 'providerEnabled': True,
                 'namingComplete': self.names_complete,
                 'hiddenEphemeral': self.hidden_ephemeral, 'loadedTotal': self.loaded_total,
@@ -121,34 +201,30 @@ class Discovery:
                 'aliasState': self.aliases.reason, 'warning': NO_PANE_WARNING,
                 'unavailableAliases': [{'alias': a, 'reason': 'alias_target_unavailable',
                                         'message': '别名目标当前不可用'} for a in self.aliases.unavailable],
-                'peers': [{'target': self.target_name(r) if r.eligible else None, 'nativeId': r.thread, 'provider': 'codex',
+                # peers 的 target 一律完整 ID（§91.4.2）；alias 与 label 只是本机诊断字段
+                'peers': [{'target': views[r.thread].target if r.eligible else None, 'nativeId': r.thread, 'provider': 'codex',
                            'pane': None, 'runtime': 'unknown', 'kind': r.kind, 'eligible': r.eligible, 'stable': r.stable,
-                           'label': r.label, 'aliases': [a for a, t in self.aliases.names.items() if t == r.thread],
-                           'nameVerified': r.names_verified,
+                           'label': r.label, 'aliases': list(self._aliases_by_thread.get(r.thread, ())),
+                           'name': views[r.thread].name, 'displayName': views[r.thread].display_name,
+                           'nameVerified': views[r.thread].verified,
                            'metadataSource': r.metadata_source, 'sourceClass': r.source_class,
                            'sqlPresent': r.sql_present, 'parentPresent': r.parent is not None,
                            'metadata': r.kind if r.metadata_verified else '元数据未核实',
                            'warning': NO_PANE_WARNING} for r in self.rows]}
 
     def target_name(self, row: Candidate) -> str:
-        aliases = sorted(a for a, thread in self.aliases.names.items() if thread == row.thread)
-        for name in (*aliases, row.name, row.cwd_label):
-            if name:
-                try:
-                    if self.select('codex@'+name).thread == row.thread:
-                        return 'codex@'+name
-                except NativeFailure:
-                    pass
-        length = 8
-        while sum(r.thread.startswith(row.thread[:length]) for r in self.rows) > 1 and length < 36:
-            length += 1
-        short = row.thread[:length]
-        try:
-            if self.select(short).thread != row.thread:
-                short = 'id:'+row.thread
-        except NativeFailure:
-            short = 'id:'+row.thread
-        return 'codex@'+short
+        """本机私有 label（§91.6：endpoint() 仍用它生成 EndpointRef.label）：能往返选回本行的 alias、旧名字或
+        次级 cwd，否则 `codex@id:<消歧前缀>`。不是规范名字来源，不进网络输出。"""
+        for name in (*self._aliases_by_thread.get(row.thread, ()), row.name, row.cwd_label):
+            if not name:
+                continue
+            try:
+                selector = parse_selector('codex@' + name)
+            except SelectorError:
+                continue
+            if selector == Selector(Provider.CODEX, 'name', name) and self._legacy_pick(name) == row.thread:
+                return 'codex@' + name
+        return 'codex@id:' + self._prefixes.get(row.thread, row.thread)
 
 
 class Reader:
@@ -216,6 +292,7 @@ def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = No
             reader = Reader(client, deadline)
             loaded = reader.loaded()
             labels: dict[str, tuple[str, str]] = {}
+            name_sources: dict[str, NameSource] = {}
             sources: dict[str, str] = {}
             records: dict[str, ThreadMetadata] = {}
             sql_present: set[str] = set()
@@ -226,10 +303,12 @@ def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = No
             def classify(ids: tuple[str, ...]) -> None:
                 nonlocal native_reads
                 batch_labels: dict[str, tuple[str, str]] = {}
+                batch_names: dict[str, NameSource] = {}
                 batch_sources: dict[str, str] = {}
                 sql = read_classes(files, sql_root or home, ids, deadline, clock,
-                                   labels=batch_labels, sources=batch_sources)
+                                   labels=batch_labels, sources=batch_sources, name_sources=batch_names)
                 labels.update(batch_labels)
+                name_sources.update(batch_names)
                 sources.update(batch_sources)
                 records.update(sql)
                 sql_present.update(sql)
@@ -260,6 +339,9 @@ def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = No
                     records[thread] = fact
                     if fields_valid(value):
                         labels[thread] = names(value)
+                    native = native_source(value)
+                    if native is not None:
+                        name_sources[thread] = native
             classify(loaded)
             after = reader.loaded()
             first_set = set(loaded)
@@ -283,7 +365,8 @@ def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = No
             rows = tuple(Candidate(t, fact.kind, fact.parent, (labels.get(t, ('', ''))[0] or labels.get(t, ('', ''))[1]),
                                    fact.kind != 'unknown' and not (fact.kind == 'subagent' and fact.parent is None),
                                    *labels.get(t, ('', '')), t in labels,
-                                   metadata_sources.get(t, 'none'), sources.get(t, 'other'), t in sql_present, t in stable)
+                                   metadata_sources.get(t, 'none'), sources.get(t, 'other'), t in sql_present, t in stable,
+                                   name_sources.get(t))
                          for t in loaded if t not in hidden for fact in (records.get(t, ThreadMetadata('unknown')),))
             aliases = aliases.bind(home_identity, daemon, {r.thread for r in rows if r.eligible})
             return Discovery(rows, True, 'metadata_unverified' if any(not r.metadata_verified for r in rows)
@@ -300,16 +383,16 @@ def print_peers(result: Discovery) -> None:
     print(NO_PANE_WARNING)
     if not result.complete:
         print(result.reason)
+    views = result.name_views
     for row in result.rows:
         suffix = row.kind if row.metadata_verified else '元数据未核实'
-        if row.eligible and not row.names_verified:
-            suffix += '/名称未核实'
-        target = result.target_name(row) if row.eligible else '不可投递 '+row.thread[:8]
-        selected_id = target.removeprefix('codex@').removeprefix('id:')
-        prefix = selected_id if row.thread.startswith(selected_id) else None
-        # 只构造展示值；目标选择仍使用上面的原 target，JSON 与发现身份不变。
-        ref = EndpointRef(Provider.CODEX, row.thread, 0, '', label=row.label)
-        print(f'{endpoint_text(ref, id_prefix=prefix)}  target={target}  [{suffix}] 状态未知')
+        # 人读名字走 NameView（未核实时只作「名称=…（仅展示）」）；可复制 target 一律完整 ID（§91.4.2）
+        view = views[row.thread]
+        target = view.target if row.eligible else '不可投递'
+        # 现役 alias 只作本机旁注（§91.3 本机例外），不是规范 target，也不进 JSON 以外的网络输出
+        aliases = result._aliases_by_thread.get(row.thread, ())
+        note = f"  本机别名={'、'.join(aliases)}（仅本机可用）" if aliases else ''
+        print(f'{endpoint_text(view)}  target={target}  [{suffix}] 状态未知{note}')
     for name in result.aliases.unavailable:
         print(f'别名 {name}  别名目标当前不可用')
     if result.aliases.reason != 'ok':

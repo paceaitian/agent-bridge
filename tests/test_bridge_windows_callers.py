@@ -87,25 +87,44 @@ class CallerTests(unittest.TestCase):
     alias_row = fixture.DiscoveryTests.alias_row
 
     def test_report_keeps_local_name_and_wire_id_visible_together(self):
+        """§91.4.2 取代 wire_ref 的平台屏障：Windows 上名字只来自本轮 NameView，私有 label（target_name，可能是
+        alias）不进协议头、自动正文、本机文字或 JSON；没有同绑定名字证据就写完整 ID。账本里的 ref 原样保留。"""
         from agentstatus_bridge import envelope
-        from agentstatus_bridge.notification_policy import wire_ref
+        from agentstatus_bridge.model import NameView
+        from agentstatus_bridge.native_names import NameBook
         origin = EndpointRef(Provider.CODEX, '01a15e9f-0000-4000-8000-000000000001',
                              201, 'win-filetime:1', label='回复 W3-ONE')
+        full = 'codex@id:' + origin.native_id
+        # 本轮原生主名与私有 label 不同：输出里出现的名字只能来自 NameView
+        named = Endpoint(origin, name_view=NameView(Provider.CODEX, origin.native_id, 'w3-native', 'w3-native',
+                                                    True, '01a15e9f'))
         with self.scope(), Store.open(self.state) as store:
-            task, attempt = self.task(store, origin=origin)
-            text = envelope.render(task, attempt, sender=wire_ref(origin).token(), device='testbox')
-            self.assertIn(' from=codex@01a15e9f device=', text.splitlines()[0])
-            args = cli.build_parser().parse_args(['report', task.id, '--attempt', '1', '--result', '--note', 'OK'])
-            with (patch.object(cli, 'discover', return_value=[]),
-                  patch.object(cli, 'identify_caller', return_value=endpoints.Caller(Endpoint(attempt.target), None, agent_env=True)),
-                  patch.object(cli, 'permission_class', return_value=None),
-                  patch.object(cli, '_start_worker', return_value=False), redirect_stdout(io.StringIO()) as out):
-                code = cli.cmd_report(args)
-            self.assertEqual(code, 0)
-            self.assertIn('已排队通知发起方 codex@回复 W3-ONE〔01a15e9f〕', out.getvalue())
-            followup = store.attempts(task.id)[-1]
-            self.assertEqual(followup.target.label, '回复 W3-ONE')
-            self.assertEqual(views._ref_document(followup.target)['name'], 'codex@回复 W3-ONE')
+            for discovered, header_from, local, json_name in (
+                ([], full, full, full),
+                ([named], 'codex@w3-native', 'codex@w3-native〔01a15e9f〕', 'codex@w3-native'),
+            ):
+                with self.subTest(named=bool(discovered)):
+                    task, attempt = self.task(store, origin=origin)
+                    names = NameBook.of(discovered)
+                    text = envelope.render(task, attempt, sender=names.local_wire(origin), device='testbox')
+                    self.assertIn(f' from={header_from} device=', text.splitlines()[0])
+                    self.assertNotIn('回复', text.splitlines()[0])
+                    args = cli.build_parser().parse_args(['report', task.id, '--attempt', '1', '--result', '--note', 'OK'])
+                    with (patch.object(cli, 'discover', return_value=discovered),
+                          patch.object(cli, 'identify_caller', return_value=endpoints.Caller(Endpoint(attempt.target), None, agent_env=True)),
+                          patch.object(cli, 'permission_class', return_value=None),
+                          patch.object(cli, '_start_worker', return_value=False), redirect_stdout(io.StringIO()) as out):
+                        code = cli.cmd_report(args)
+                    self.assertEqual(code, 0)
+                    self.assertIn('已排队通知发起方 ' + local, out.getvalue())
+                    self.assertNotIn('回复 W3-ONE', out.getvalue())
+                    followup = store.attempts(task.id)[-1]
+                    self.assertEqual(followup.target.label, '回复 W3-ONE')  # 账本 ref 原样保留，不反写
+                    # 结果通知正文里的执行方本轮未发现：完整 ID，不带任何 label
+                    self.assertIn('（codex@id:' + attempt.target.native_id + '）', followup.body)
+                    self.assertNotIn('回复 W3-ONE', followup.body)
+                    self.assertEqual(views._ref_document(followup.target, names)['name'], json_name)
+                    self.assertEqual(views._ref_document(followup.target)['name'], full)
 
     def chain(self):
         self.k.processes[100] = (201,134362090001712230,self.k.sid,False,'python.exe')
@@ -259,10 +278,15 @@ class CallerTests(unittest.TestCase):
             self.assertNotIn('expiresAt',row)
             result=D.discover(self.p.transport)
             self.assertEqual(result.select('codex@work').thread,uuid(1))
-            self.assertEqual(result.document()['peers'][0]['target'],'codex@work')
+            # §91：alias 仍是本机输入、本机诊断字段与私有 label；peers target 一律完整 ID，alias 不进 target、
+            # 也不当名字打印（alias 只能否证原生名，不能成为主名）
+            peer=result.document()['peers'][0]
+            self.assertEqual((peer['target'],peer['aliases']),('codex@id:'+uuid(1),['work']))
+            self.assertEqual(result.target_name(result.rows[0]),'codex@work')
             out=io.StringIO()
             with redirect_stdout(out):D.print_peers(result)
-            self.assertIn('codex@work',out.getvalue())
+            self.assertIn('target=codex@id:'+uuid(1),out.getvalue())
+            self.assertNotIn('codex@work',out.getvalue())
             with patch.object(A,'discover',side_effect=AssertionError('local list/rm')):
                 code,out,err=self.run_cli('alias','list','--json')
                 self.assertEqual(code,0)

@@ -40,7 +40,8 @@ from .model import (
 from .labels import next_step, review_capacity_hint
 from .paths import codex_home as default_codex_home
 from .store import CAPACITY_CODES, MAX_BODY_BYTES, MAX_FILES, Store, StoreError
-from .notification_policy import can_notify, wire_ref
+from .native_names import NO_NAMES, NameBook
+from .notification_policy import can_notify
 
 MAX_NOTE_CHARS = 4000
 MAX_HASH_BYTES = 256 * 1024 * 1024
@@ -156,20 +157,21 @@ def _fit_body(lines: list[str], tail: str) -> str:
     return f"{head}\n{tail}" if tail else head
 
 
-def review_request_body(implement: Attempt, result: dict[str, object]) -> str:
-    """复核请求：固定结果在前，原始任务要求在后。"""
-    lines = [f"请复核 {wire_ref(implement.target).display()} 完成的这项工作。", "", "【结果】"]
+def review_request_body(implement: Attempt, result: dict[str, object], names: NameBook = NO_NAMES) -> str:
+    """复核请求：固定结果在前，原始任务要求在后；执行方标识走 NameView（本机已核实主名，否则完整 ID）。"""
+    lines = [f"请复核 {names.local_wire(implement.target)} 完成的这项工作。", "", "【结果】"]
     lines.extend(_describe_result(result) or ["（对方未附说明）"])
     lines.extend(["", "【原始任务要求】"])
     return _fit_body(lines, implement.body.rstrip())
 
 
 def notice_body(
-    task: Task, attempt: Attempt, kind: ReportKind, result: dict[str, object], *, next_text: str | None = None
+    task: Task, attempt: Attempt, kind: ReportKind, result: dict[str, object], *, next_text: str | None = None,
+    names: NameBook = NO_NAMES,
 ) -> str:
     """回告发起方的结果通知；next_text 是写入后任务阶段对应的下一步（DESIGN §45.28.2）。"""
     title = f"「{task.title}」" if task.title else ""
-    lines = [f"你发起的任务{title}{REPORT_LABELS[kind]}（{wire_ref(attempt.target).display()}）。"]
+    lines = [f"你发起的任务{title}{REPORT_LABELS[kind]}（{names.local_wire(attempt.target)}）。"]
     lines.extend(_describe_result(result))
     if next_text:
         lines.append(f"下一步：{next_text}")
@@ -296,6 +298,7 @@ def apply_report(
     git: GitRunner = _git_resolve_commit,
     proc_root: Path = procfs.DEFAULT_PROC,
     codex_home: Path | None = None,
+    names: NameBook = NO_NAMES,
 ) -> ReportOutcome:
     """核验并原子记录一条汇报；必要时一并排队复核请求或发起方通知（由 worker 发送）。"""
     task = store.resolve_task(report.task_ref)
@@ -371,7 +374,7 @@ def apply_report(
                     task.id,
                     role=Role.REVIEW,
                     target=current_task.reviewer,
-                    body=review_request_body(attempt, result),
+                    body=review_request_body(attempt, result, names),
                     refs=files,
                     now=now,
                     sender=first.sender,
@@ -404,7 +407,7 @@ def apply_report(
                     task.id,
                     role=Role.NOTICE,
                     target=current_task.origin,
-                    body=notice_body(current_task, attempt, kind, result, next_text=next_text),
+                    body=notice_body(current_task, attempt, kind, result, next_text=next_text, names=names),
                     refs=files,
                     now=now,
                     sender=caller.endpoint.ref if caller.endpoint else None,

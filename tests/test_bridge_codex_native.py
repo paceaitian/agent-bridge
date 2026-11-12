@@ -32,7 +32,7 @@ class NativeDaemon(FakeDaemon):
     def __init__(self, root: Path, replies=None, *, version="0.162.1", before=(), init=None):
         self.replies = replies or (lambda request: {"result": {"thread": {
             "id": request["params"]["threadId"], "source": "cli", "preview": CANARY,
-            "name": CANARY, "cwd": CANARY, "items": [CANARY],
+            "name": "fixture-thread", "cwd": "/work/" + CANARY, "items": [CANARY],
         }}})
         self.version, self.before, self.init = version, before, init
         super().__init__(root)
@@ -323,8 +323,10 @@ class NativeTests(unittest.TestCase):
         ))
         sources = endpoints.DiscoverySources(proc_root=proc.root, codex_home=home, codex_sqlite_home=home)
         with sqlite3.connect(home / "state_1.sqlite") as db:
-            db.execute("CREATE TABLE threads(id TEXT, source TEXT)")
-            db.executemany("INSERT INTO threads VALUES (?, ?)", ((THREAD, "cli"), (ITEM.lower(), "unknown")))
+            # §91 起 SQL 也要答出名字才算「SQL 全答」：用带 name/cwd/history_mode 的现行库形状
+            db.execute("CREATE TABLE threads(id TEXT, source TEXT, name TEXT, cwd TEXT, history_mode TEXT)")
+            db.executemany("INSERT INTO threads VALUES (?, ?, ?, ?, ?)", ((THREAD, "cli", "alpha", "/w/a", "paginated"),
+                                                                          (ITEM.lower(), "unknown", None, "/w/item", "paginated")))
         processes = endpoints.scan_codex_holdings(proc.root, home)
         reader = sources.native_metadata.reader
         with patch.object(reader, "read", return_value=NativeBatch({THREAD: ThreadMetadata("subagent", ITEM.lower())}, "ok")):
@@ -355,9 +357,9 @@ class NativeTests(unittest.TestCase):
         home.mkdir()
         parent = ITEM.lower()
         with sqlite3.connect(home / "state_1.sqlite") as db:
-            db.execute("CREATE TABLE threads(id TEXT, source TEXT)")
-            db.executemany("INSERT INTO threads VALUES (?, ?)", ((parent, "cli"),
-                (THREAD, json.dumps({"subagent": {"thread_spawn": {"parent_thread_id": parent}}}))))
+            db.execute("CREATE TABLE threads(id TEXT, source TEXT, name TEXT, cwd TEXT, history_mode TEXT)")
+            db.executemany("INSERT INTO threads VALUES (?, ?, ?, ?, ?)", ((parent, "cli", "lead", "/w/lead", "paginated"),
+                (THREAD, json.dumps({"subagent": {"thread_spawn": {"parent_thread_id": parent}}}), None, None, "paginated")))
         proc = FakeProc(self.root / "proc")
         proc.add(20, comm="codex", argv=("codex", "app-server"), fds=tuple(
             str(home / "thread-writer-locks" / f"{thread}.lock") for thread in (THREAD, parent)))
@@ -375,8 +377,9 @@ class NativeTests(unittest.TestCase):
         child = "019affff-0000-7000-8000-000000000001"
         parent = ITEM.lower()
         with sqlite3.connect(home / "state_1.sqlite") as db:
-            db.execute("CREATE TABLE threads(id TEXT, source TEXT)")
-            db.executemany("INSERT INTO threads VALUES (?, ?)", ((parent, "cli"), (THREAD, '{"subagent":"review"}')))
+            db.execute("CREATE TABLE threads(id TEXT, source TEXT, name TEXT, cwd TEXT, history_mode TEXT)")
+            db.executemany("INSERT INTO threads VALUES (?, ?, ?, ?, ?)", ((parent, "cli", "lead", "/w/lead", "paginated"),
+                                                                          (THREAD, '{"subagent":"review"}', None, None, "paginated")))
         proc = FakeProc(self.root / "proc")
         ids = {THREAD, child, parent}
         proc.add(20, comm="codex", argv=("codex", "app-server"), fds=tuple(

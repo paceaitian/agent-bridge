@@ -504,11 +504,10 @@ def _to_authority(store: FederatedStore, ident: authority.Identity, envelope: di
         report = dict(data.get("report") or {})
         report.update({"authorityDeviceId": ident.device_id, "taskId": task.task_id,
                        "operationId": envelope["operationId"], "attempt": envelope.get("attempt")})
-        reporter_token = (envelope.get("actor") or {}).get("wireToken") if isinstance(envelope.get("actor"), dict) else None
         report["reporter"] = envelope.get("actor")
         report["reporterClass"] = envelope.get("senderClass")
         authority.apply_report_safely(store, ident, report, reporter_device=source_device, now=now,
-                                      reporter_token=reporter_token, command=command)
+                                      command=command)
     elif kind == "delivery_status":
         msg_id = data.get("msgId")
         evidence = data.get("evidence")
@@ -625,7 +624,7 @@ def submit_report(store: FederatedStore, ident: authority.Identity, report: Loca
                 "reporterClass": report.reporter_class}
         if current.authority_device == ident.device_id:
             decision = authority.apply_report_safely(store, ident, fact, reporter_device=ident.device_id, now=now,
-                                                     reporter_token=report.reporter.wire_token, command=command)
+                                                     command=command)
             return ReportResult(report_no, operation_id, decision.decision, decision.reason)
         store.add_report(authority_device=current.authority_device, task_id=current.task_id, attempt_seq=attempt.seq,
                          reporter_device=ident.device_id, report_no=report_no, operation_id=operation_id, report=fact)

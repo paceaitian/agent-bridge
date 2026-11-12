@@ -137,7 +137,9 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(result.complete)
         self.assertTrue(result.select(uuid(1)).eligible)
         self.assertFalse(replace(result.rows[0],metadata_verified=False).eligible)
-        self.assertEqual(result.select('00000000').thread, uuid(1))
+        # §91.2.1：短 ID 前缀要显式写 id:；裸 '00000000' 只按名字找，不改找 ID 前缀
+        self.assertEqual(result.select('id:00000000').thread, uuid(1))
+        with self.assertRaisesRegex(NativeFailure, 'target_not_found'): result.select('00000000')
         self.assertEqual(result.daemon, (200, '134362090000012230'))
         with self.assertRaisesRegex(NativeFailure, 'target_explicit_required'): result.select(None)
         self.assertEqual([m['method'] for m in self.k.messages],
@@ -248,7 +250,9 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(result.complete, result.reason)
         self.assertEqual(len(result.rows), 257)
         self.assertEqual(sum(r.eligible for r in result.rows), 1)
-        with self.assertRaisesRegex(NativeFailure, 'target_ambiguous'): result.select('00000000')
+        # id: 前缀在过滤资格之前按全部 257 行判歧义，不自动选唯一可投的根；裸值只按名字（§91.2.1）
+        with self.assertRaisesRegex(NativeFailure, '^target_ambiguous$'): result.select('id:00000000')
+        with self.assertRaisesRegex(NativeFailure, 'target_not_found'): result.select('00000000')
         self.assertTrue(result.select(uuid(1)).eligible)
         with self.assertRaisesRegex(NativeFailure, 'target_not_root'): result.select(uuid(257))
         pages = [m['params'] for m in self.k.messages if m['method']=='thread/loaded/list']
@@ -518,7 +522,10 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(NativeFailure,'discovery_incomplete'):
             replace(result,complete=False).select('owner-task')
         collision=replace(result,rows=result.rows+(D.Candidate(uuid(2),'subagent'),),aliases=AliasSet({'00000000':uuid(1)}))
-        with self.assertRaisesRegex(NativeFailure,'target_ambiguous'): collision.select('00000000')
+        # ID 形状的 alias 键不生效：裸值只按名字，既不经 alias 选中 uuid(1)，也不并入前缀（§91.2.1）；
+        # id: 前缀仍按全部行（含子代理）判歧义
+        with self.assertRaisesRegex(NativeFailure,'target_not_found'): collision.select('00000000')
+        with self.assertRaisesRegex(NativeFailure,'target_ambiguous'): collision.select('id:00000000')
 
     def test_alias_private_limits_expiry_cleanup_no_read_side_effects(self):
         alias=AliasFile(self.p.files,self.state);row=self.alias_row();now=time.time()

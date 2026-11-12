@@ -22,7 +22,7 @@ from ..ids import short
 from ..labels import reason_text
 from ..model import PHASE_LABELS, Attempt, EndpointRef, Phase, Provider, ReportKind, Task, TaskView, describe
 from ..naming import command_name
-from ..notification_policy import wire_ref
+from ..native_names import full_id_token
 from ..platforms import process as procfs
 from ..platforms.factory import get_platform
 from ..platforms.types import Capability
@@ -146,27 +146,43 @@ def is_local_device(rt: Runtime, reference: str | None) -> bool:
 def local_target(rt: Runtime, endpoint: Endpoint) -> TargetRef:
     """本机已核端点 → 带持久 endpointId 的 TargetRef；根核实不了按用户可读错误拒绝。"""
     try:
-        return directory.bind_local(rt.store, rt.ident.device_id, endpoint.ref, label=endpoint.name)
+        return directory.bind_local(rt.store, rt.ident.device_id, endpoint.ref,
+                                    verified_name=directory.published_name(endpoint, publish_names=rt.config.publish_names))
     except directory.DirectoryError as error:
         raise FedCliError(error.code, 2) from error
 
 
-def remote_target(rt: Runtime, device: str, selector: str) -> TargetRef:
-    """在缓存目录里解析远端目标；本机 slug 不当远端。"""
+def remote_target(rt: Runtime, device: str, selector: str, *, now: int | None = None,
+                  flags: tuple[str, str] = ("--device", "--to")) -> TargetRef:
+    """在缓存目录里解析远端目标；本机 slug 不当远端。名字/前缀要求目录新鲜（now 缺省取当前时刻）。
+
+    flags 是这一对参数在命令行上的写法（执行方 `--device/--to`，复核方 `--review-device/--review-by`），
+    候选提示按它给出可照抄的写法，免得把复核方抄成执行方（Opus 实现审计 r2 P2-1）。"""
     if is_local_device(rt, device):
         raise FedCliError("target_is_local_device", 2)
     try:
-        return directory.resolve_remote(rt.store, device, selector)
+        return directory.resolve_remote(rt.store, device, selector, now=now_ms() if now is None else now)
     except directory.DirectoryError as error:
-        raise FedCliError(error.code, 2) from error
+        raise FedCliError(error.code, 2, hint=_candidate_hint(device, error.candidates, flags)) from error
+
+
+def _candidate_hint(device: str, candidates: tuple[str, ...], flags: tuple[str, str]) -> str | None:
+    """名字未核实/不唯一时把候选给成可照抄的完整写法（§91.2.2「提示 peers --device 及全 ID」）；
+    设备引用不唯一时候选是完整 deviceId。参数名取调用方给的那一对，不固定写执行方的。"""
+    if not candidates:
+        return None
+    device_flag, target_flag = flags
+    if all("@id:" in item for item in candidates):
+        return "可选目标：" + "、".join(f"{device_flag} {device} {target_flag} {item}" for item in candidates)
+    return "可选设备：" + "、".join(f"{device_flag} {item}" for item in candidates)
 
 
 def _actor(rt: Runtime, ref: EndpointRef) -> WireActor:
     try:
-        bound = directory.bind_local(rt.store, rt.ident.device_id, ref)
+        bound = directory.bind_local(rt.store, rt.ident.device_id, ref, verified_name=None)  # actor 一律完整 ID
     except directory.DirectoryError as error:
         raise FedCliError(error.code, 2) from error
-    return authority.actor_for(bound, wire_token=wire_ref(ref).token())
+    return authority.actor_for(bound, wire_token=full_id_token(ref))
 
 
 # ---- send ----
@@ -210,10 +226,11 @@ def send(rt: Runtime, *, target: TargetRef, body: str, title: str, ref_paths: li
         if reviewer.remote.same_endpoint(target.remote):
             raise FedCliError("reviewer_is_target")
     origin_actor = _actor(rt, origin) if origin is not None else None
-    origin_target = directory.bind_local(rt.store, rt.ident.device_id, origin) if origin is not None else None
+    origin_target = (directory.bind_local(rt.store, rt.ident.device_id, origin, verified_name=None)
+                     if origin is not None else None)
     frozen = freeze_refs(rt, ref_paths, cwd)
     blobs, blob_bytes, references = attachments.transfer_summary(frozen)
-    reviewer_token = wire_ref(reviewer.local).token() if reviewer is not None and reviewer.local is not None else None
+    reviewer_token = full_id_token(reviewer.local) if reviewer is not None and reviewer.local is not None else None
     try:
         task, attempt = authority.create_task(
             rt.store, rt.ident, title=title, flow="review" if reviewer else "handoff", body=body,
@@ -308,7 +325,7 @@ def report(rt: Runtime, *, task: FedTask, kind: ReportKind, attempt_seq: int | N
             commit_ref = _commit_reference(commit, cwd=cwd, git=_git_resolve_commit)
         except ReportError as error:
             raise FedCliError(error.code) from error
-    reporter = authority.actor_for(attempt.target, wire_token=wire_ref(attempt.target.local).token())
+    reporter = authority.actor_for(attempt.target, wire_token=full_id_token(attempt.target.local))
     try:
         result = mirror.submit_report(rt.store, rt.ident, mirror.LocalReport(
             task=task, attempt=attempt, kind=kind.value, note=(note or "").strip()[:MAX_NOTE_CHARS],
@@ -377,7 +394,9 @@ def finish(rt: Runtime, task: FedTask, state: str, *, caller: Caller, caller_cla
     elif task.state.get("closedAt") is not None:
         raise FedCliError("task_finished")
     sender = _actor(rt, caller.endpoint.ref) if caller.endpoint is not None else None
-    decider = wire_ref(caller.endpoint.ref).display() if caller.endpoint is not None else "用户"
+    # 结束回执一份正文、同一事务发给全部参与方（可能跨设备）：decider 一律完整 ID（附注 P3-3）。
+    # 不按参与方另渲染：正文随事实固化，本机参与方看到完整 ID 也能复制，代价只是不显示友好名
+    decider = full_id_token(caller.endpoint.ref) if caller.endpoint is not None else "用户"
     try:
         return authority.finish(rt.store, rt.ident, task, state=state, reason=reason, decider=decider, sender=sender,
                                 sender_class=caller_class or "unknown", now=now_ms(), command=command_name())
@@ -422,7 +441,7 @@ def device_name(rt: Runtime, device_id: str) -> str:
     for row in rt.store.device_states():
         if row["device_id"] == device_id and row["name"]:
             return str(row["name"])
-    return device_id[:8]
+    return device_id  # 这个值会进 --origin-device/--device 等可复制命令：8 位前缀解析不了，用完整 deviceId
 
 
 def view_of(rt: Runtime, task: FedTask) -> TaskView:

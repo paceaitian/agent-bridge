@@ -121,7 +121,7 @@ class RemoteEndpointRef:
 
 @dataclass(frozen=True)
 class WireActor:
-    """逻辑发送者：在来源设备按 wire_ref 生成 wireToken 并随事实保存，下游不重造。"""
+    """逻辑发送者：wireToken 在来源设备生成（一律完整 ID，§91.4.2）并随事实保存，下游不重造。"""
 
     device_id: str
     provider: Provider

@@ -23,6 +23,7 @@ from ..dispatch import TARGET_GONE_GRACE_SECONDS, message_uuid, native_priority,
 from ..endpoints import ADAPTERS, Endpoint
 from ..ids import short
 from ..model import REMINDER_OPTION, Delivery, Provider
+from ..native_names import id_token, sender_display
 from ..naming import command_name
 from ..platforms import process as procfs
 from ..platforms.factory import get_platform
@@ -35,7 +36,7 @@ from .directory import root_binding
 from .attachments import REFERENCE_NOTICE, AttachmentError
 from .fedstore import FederatedStore, FedAttempt, FedTask, dump, load_dict
 from .relay import RelayPaths, local_blob
-from .views import model_attempt, model_attempts, model_task
+from .views import model_attempt, model_attempts, model_task, remote_text
 
 LogFn = Callable[[str, Mapping[str, object]], None]
 REMINDER_RETRY_MS = 60_000
@@ -401,7 +402,7 @@ class FederationDispatcher:
         for row in self.store.device_states():
             if row["device_id"] == device_id and row["name"]:
                 return str(row["name"])
-        return device_id[:8]
+        return device_id  # 进消息头 device= 与页脚 --origin-device：用完整 deviceId，8 位前缀解析不了
 
     def _render(self, task: FedTask, attempt: FedAttempt, lines: list[str] | None,
                 provider: Provider) -> tuple[str, DeliveryContext]:
@@ -409,11 +410,14 @@ class FederationDispatcher:
         view_attempt = replace(model_attempt(attempt), refs=[])
         sender = attempt.sender
         sender_device = self._device_name(sender.device_id) if sender is not None else self.ident.device_name
-        text = envelope.render(view_task, view_attempt, sender=sender.wire_token if sender else "user",
+        # 头 from 与帧 from-name 按 actor 的结构化身份生成完整 ID，不照抄存下的 wireToken：旧账本与 W3.9 对端的
+        # actor 带的是友好名，跨设备照抄会让漏 --device 时命中本机同名会话（§91.4.2）
+        token = id_token(sender.provider, sender.native_id) if sender is not None else "user"
+        text = envelope.render(view_task, view_attempt, sender=token,
                                device=sender_device, command=self.command,
                                origin_device=self._device_name(task.authority_device), attachment_lines=lines)
         if sender is not None:
-            name = f"{sender.wire_token}（{sender_device}）"
+            name = sender_display(token, sender_device)
         elif REMINDER_OPTION in attempt.options:
             name = "AgentStatus 协作桥（提醒）"
         elif attempt.is_closure:
@@ -575,10 +579,15 @@ class FederationDispatcher:
                 continue
             attempts = self.store.attempts(task.authority_device, task.task_id)
             view_task, view_attempts = model_task(task), model_attempts(attempts)
+            current = reminder.view.current
+            stuck = next((item for item in attempts if current is not None and item.seq == current.seq), None)
+            receiver = (remote_text(stuck.target, self._device_name(stuck.target_device))
+                        if stuck is not None and stuck.target_device != self.ident.device_id else None)
             try:
                 _, notice = authority.add_attempt(
                     self.store, self.ident, task, role="notice", target=origin,
-                    body=reminder_body(view_task, view_attempts, reminder.view, command=self.command), refs=[],
+                    body=reminder_body(view_task, view_attempts, reminder.view, command=self.command,
+                                       receiver=receiver), refs=[],
                     sender=None, sender_class=reminder_sender_class(view_attempts) or "unknown",
                     options={"noticeKind": "reminder", REMINDER_OPTION: reminder.token}, now=now,
                     event="origin_reminded")
