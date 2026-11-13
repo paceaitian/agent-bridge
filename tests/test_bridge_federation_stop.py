@@ -1226,6 +1226,14 @@ class SignalEndToEndTests(unittest.TestCase):
         self.hello = self.root / "hello.frame"
         self.hello.write_bytes(encode_frame(hello))
 
+    def pid_file(self, name: str) -> int | None:
+        """读子进程写下的 pid 文件；还没写完（空或不完整）时返回 None。"""
+        try:
+            text = (self.root / name).read_text().strip()
+        except OSError:
+            return None
+        return int(text) if text.isdigit() else None
+
     def alive(self, pid: int) -> bool:
         try:
             state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
@@ -1239,10 +1247,12 @@ class SignalEndToEndTests(unittest.TestCase):
         relay = subprocess.Popen([sys.executable, "-c", SIGNAL_SCRIPT, str(self.root), mode, str(self.hello)],
                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(lambda: relay.poll() is None and relay.kill())
-        self.assertTrue(wait_until(lambda: (self.root / "ssh.pid").exists(), 30.0), "relay 没有建立连接")
+        # write_text 先建空文件再写内容：只看 exists() 会读到空串（2026-11-13 CI desktop 偶发 ValueError），等到内容可解析
+        self.assertTrue(wait_until(lambda: self.pid_file("ssh.pid") is not None, 30.0), "relay 没有建立连接")
         worker = int((self.root / "worker.pid").read_text())
         self.addCleanup(lambda: self.alive(worker) and os.kill(worker, signal.SIGKILL))
-        ssh = int((self.root / "ssh.pid").read_text())
+        ssh = self.pid_file("ssh.pid")
+        assert ssh is not None
         time.sleep(0.5)  # 让主线程进入阻塞（握手读或写 flush）
         self.assertTrue(fed_commands.relay_running(self.root))
         started = time.monotonic()

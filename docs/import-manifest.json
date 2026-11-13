@@ -162,7 +162,7 @@
     "tests/test_bridge_federation_relay.py": "3c9c165b8423c70b45d4dbfd9a2667af6c364f41c1635dda6456a13c3480372b",
     "tests/test_bridge_federation_retention.py": "102a1ca3c8fa0e915e84f070d62620ba93465177c84cc7ec52e9dfecc13f65dd",
     "tests/test_bridge_federation_rules.py": "9ebdf079335dd70c96ba970daead32c1f4983fbb64b6969d07dae812de22388b",
-    "tests/test_bridge_federation_stop.py": "7b004cfb317e54900d601d9458b70abdd24c2eb5db4c322aa851ccd88067c4e7",
+    "tests/test_bridge_federation_stop.py": "73d26a538b192ec9fec6089f7f13b3e04db7c5d20ca4dc3ab97992a05d436e05",
     "tests/test_bridge_federation_summary.py": "6413fff04b51f504c3766963da00a7cc4ee79a98980009c099c417e805b7903c",
     "tests/test_bridge_federation_transport_close.py": "0f33844e647eec568b2ba254cb97d7c103e6c600cedd689db18e24bedf127110",
     "tests/test_bridge_federation_windows.py": "1948fea3c4513dfd9a7ed193cd57da58c650f99fe332a95927e92a2c825bd7eb",
@@ -213,7 +213,7 @@
     "tests/test_bridge_worker.py": "bb2dfa8ed234c0e9043adce329dc5b0f5ef73906426e2127f1cc90d41a448eee"
   },
   "source": {
-    "commit": "870274da6daacd4b9734fbe8dba79036290f25c4",
+    "commit": "2942f8b48a5f9799a10615fba4d6383f17362bbe",
     "repository": "agentstatus"
   }
 }
