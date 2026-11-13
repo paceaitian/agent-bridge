@@ -130,9 +130,9 @@ REASON_TEXTS: dict[str, str] = {
     "message_too_large": f"任务内容过长（上限 {MAX_BODY_BYTES // 1024} KiB），请改用 --ref 引用文件",
     "capacity_active_tasks": "进行中的任务过多（上限 100），请先验收或关闭一些",
     "capacity_pending": "排队中的消息过多，请稍后再试",
-    "capacity_attempts": "这项任务的交接次数已达上限；请 {command} close 旧任务，再 {command} send 新任务",
-    "attempts_near_limit": "接近交接上限，长迭代建议 {command} close 旧任务、{command} send 新任务",
-    "report_attempts_near_limit": "接近交接上限，后续由发起方决定 {command} close 本任务、{command} send 新任务",
+    "capacity_attempts": "这项任务的交接次数已达上限；请 {command} close 旧任务，再 {command} send 新任务（可加 --follows <旧ID> 关联）",
+    "attempts_near_limit": "接近交接上限，长迭代建议 {command} close 旧任务、{command} send 新任务（可加 --follows <旧ID> 关联）",
+    "report_attempts_near_limit": "接近交接上限，后续由发起方决定 {command} close 本任务、{command} send 新任务（可加 --follows <旧ID> 关联）",
     "notification_attempts_report": "汇报已提交，通知未能排队（交接次数已达上限），发起方需 {command} status 查看；不要重复汇报",
     "notification_pending_report": "汇报已提交，通知未能排队（全局待投递容量已满），发起方需 {command} status 查看；不要重复汇报。队列腾空后，若本任务还有提醒名额且仍符合提醒条件，提醒会照常叫醒发起方",
     "notification_attempts_status": "对方汇报已提交，通知因交接次数已达上限未排队；请查看本任务结果并决定 {command} close 后新开任务",
@@ -186,6 +186,17 @@ REASON_TEXTS: dict[str, str] = {
     "accept_not_allowed": "只有用户或发起任务的会话可以验收",
     "no_result_to_accept": "还没有可验收的结果；确需验收加 --force",
     "not_paused": "任务未暂停",
+    # tasks 筛选（DESIGN §93.1）
+    "mine_requires_session": "--mine 按会话 ID 匹配，需要在认得出的 agent 会话里运行；用户终端或 /clear 后的新会话请用不带 --mine 的 {command} tasks",
+    "since_invalid": "--since 格式不对：写 <正整数>m/h/d（如 30m、2h、7d）或 YYYY-MM-DD",
+    "grep_empty": "--grep 的文字不能为空",
+    # 决定类命令 --json 的 notes（DESIGN §93.2）；worker_not_running、relay_not_running 沿用已有说明
+    "native_risk": "停止追踪不撤回已交接内容；可显式尝试移除仍在 Codex 队列中的项（withdraw），已开始的工作不能撤销",
+    "remote_unconfirmed": "对方设备尚未确认最新状态：还没发出的由对方按最新状态投递或抑制，已交出的消息与工作不能撤回",
+    "retry_may_duplicate": "上一条消息可能已送达，对方可能重复执行",
+    # send --follows（DESIGN §93.3）：与 task_not_found 同类，退出 2
+    "follows_not_found": "找不到 --follows 指定的旧任务（本机账本与联邦库都没有）",
+    "follows_ambiguous": "--follows 指定的旧任务不唯一（本机账本与联邦库里命中不止一个），请多写几位或用完整 ID",
     "worker_not_running": "后台 worker 未运行（可运行 {command} worker 查看原因）",
     "interrupted_during_send": "发送过程中断，是否送达不明",
     "transport_exception": "投递通道出错，是否送达不明",
@@ -367,7 +378,7 @@ def next_step(
     reason = view.reason
     at_capacity = max((item.seq for item in attempts), default=0) + reserved >= attempt_limit(Role.HANDOFF)
     close_command = f"{cmd} close {ref}"
-    close_text = f"交接次数已达上限，{close_command} 后 {cmd} send 新任务"
+    close_text = f"交接次数已达上限，{close_command} 后 {cmd} send 新任务（可加 --follows <旧ID> 关联）"
     if view.phase is Phase.DONE or view.phase is Phase.CLOSED:
         return None
     if reason == "paused":
@@ -381,7 +392,7 @@ def next_step(
         return NextStep("approve_at_target", f"去对方会话里批准这条消息；过期后可 {cmd} retry")
     if reason == "delivery_unknown":
         if at_capacity:
-            return NextStep("confirm_then_force_retry", f"不会自动重发。交接次数已达上限；先确认对方没收到（也不会再汇报），再 {close_command} 后 {cmd} send 新任务", close_command)
+            return NextStep("confirm_then_force_retry", f"不会自动重发。交接次数已达上限；先确认对方没收到（也不会再汇报），再 {close_command} 后 {cmd} send 新任务（可加 --follows <旧ID> 关联）", close_command)
         return NextStep(
             "confirm_then_force_retry",
             f"不会自动重发。确认对方没收到后可 {cmd} retry {ref} --force",

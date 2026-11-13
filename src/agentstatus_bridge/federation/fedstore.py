@@ -591,6 +591,19 @@ class FederatedStore:
         ).fetchall()
         return [_task_from_row(row) for row in rows]
 
+    def followers(self, task_id: str) -> list[tuple[float, str]]:
+        """以 task_id 为 `follows` 的联邦任务（只有本机发起的才有这个键，DESIGN §93.3）：(创建时间秒, 完整 ID)。"""
+        rows = self._conn.execute(
+            "SELECT task_id, state_json, last_sync_at FROM fed_tasks WHERE CASE WHEN json_valid(state_json)"
+            " THEN json_extract(state_json,'$.follows') END = ?", (task_id,),
+        ).fetchall()
+        found: list[tuple[float, str]] = []
+        for row in rows:
+            created = load_dict(row["state_json"]).get("createdAt")
+            when = created if isinstance(created, int) and not isinstance(created, bool) else int(row["last_sync_at"])
+            found.append((when / 1000, str(row["task_id"])))
+        return sorted(found)
+
     def find_tasks(self, task_ref: str, *, authority_device: str | None = None) -> list[FedTask]:
         """按完整 ID 或前缀查联邦任务；authority_device 给出时只在该权威下找。"""
         value = task_ref.strip().lower()

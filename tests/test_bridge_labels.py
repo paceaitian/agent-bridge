@@ -258,7 +258,8 @@ class ReasonTextCommandTests(unittest.TestCase):
         # §53.3.8 加了 3 条（标题缺 id 的目标文案、汇报与发起的未归属文案都指向 doctor）
         # §83 及审计 r1 按读者/原因分开的容量文案同样使用当前入口名。
         # §91 的 target_id_unverified 提示用当前入口名刷新 peers。
-        self.assertEqual(len(carriers), 16, carriers)
+        # §93.1 的 mine_requires_session 提示改用当前入口名的不带 --mine 的 tasks。
+        self.assertEqual(len(carriers), 17, carriers)
         for code in labels.REASON_TEXTS:
             with self.subTest(code=code):
                 self.assertNotIn(labels.PLACEHOLDER, labels.reason_text(code, command="testcmd"))

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import re
 import time
@@ -209,6 +209,9 @@ def _task_document(
         document['targetWindowWarning'] = warning
     if get_platform().name == 'windows' and task.options.get('receiptMode') == 'poll_only':
         document['receiptMode'] = 'poll_only'
+    follows = task.options.get("follows")
+    if isinstance(follows, str):
+        document["follows"] = follows  # send --follows 记下的旧任务（§93.3）；无关联时不出现该键
     return document
 
 
@@ -237,7 +240,8 @@ def _describe_result(result: dict[str, Any] | None) -> list[str]:
 
 
 def _print_task(
-    store: Store, task: Task, *, now: float, show_body: bool, hint: _TargetHint = _NO_HINT, names: NameBook = NO_NAMES
+    store: Store, task: Task, *, now: float, show_body: bool, hint: _TargetHint = _NO_HINT, names: NameBook = NO_NAMES,
+    relations: Sequence[str] = (),
 ) -> None:
     attempts = store.attempts(task.id)
     view = describe(task, attempts)
@@ -250,6 +254,8 @@ def _print_task(
     flow = "交接" if task.flow is Flow.HANDOFF else f"实现 → 复核（{names.text(task.reviewer) if task.reviewer else '?'}）"
     origin = names.text(task.origin) if task.origin else "用户"
     print(f"流程：{flow}；发起：{origin}；创建于 {_age(task.created_at, now)}")
+    for line in relations:  # 承接/后续任务（§93.3），由 cli 跨本机账本与联邦库查好
+        print(line)
     if get_platform().name == 'windows' and task.options.get('receiptMode') == 'poll_only':
         print('回执方式：poll_only；用 status / wait 读取，不推送通知。')
     warning = _no_pane_warning(attempts)

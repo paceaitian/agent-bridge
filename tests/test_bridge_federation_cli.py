@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -389,15 +390,53 @@ class BoundaryTests(FedCliCase):
         self.assertEqual(code, 0, err)
         self.assertIn("跨设备任务", out)
 
-    def test_local_hit_never_opens_the_federation_store(self) -> None:
+    def test_local_hit_never_resolves_through_the_federation_store(self) -> None:
+        # §93.3 起本机 status 会用只读连接打开联邦库查「后续任务」（设计要求本机账本与联邦库都查），所以不再断言零打开；
+        # 本机命中时仍不经联邦库解析任务、不走可写的联邦运行时，联邦库真实损坏也不影响本机 status（§88.7）
         self.run_on("vm", "send", "--to", "codex@review", "-m", "本机任务", "--no-wait", caller=as_agent(ORIGIN))
         with cli.Store.open(self.states["vm"]) as local:
             [local_task] = local.list_tasks()
-        with patch.object(fed_commands, "try_runtime", wraps=fed_commands.try_runtime) as probe, \
-                patch.object(fed_commands, "open_runtime", wraps=fed_commands.open_runtime) as opened:
-            code, _, err = self.run_on("vm", "status", local_task.id)
+        with patch.object(fed_commands, "find_task", wraps=fed_commands.find_task) as resolved, \
+                patch.object(fed_commands, "try_runtime", wraps=fed_commands.try_runtime) as probe, \
+                patch.object(fed_commands, "open_runtime", wraps=fed_commands.open_runtime) as opened, \
+                patch.object(FederatedStore, "open_readonly", wraps=FederatedStore.open_readonly) as readonly:
+            code, out, err = self.run_on("vm", "status", local_task.id)
         self.assertEqual(code, 0, err)
-        self.assertEqual((probe.call_count, opened.call_count), (0, 0))
+        self.assertEqual((resolved.call_count, probe.call_count, opened.call_count), (0, 0, 0))
+        self.assertEqual(readonly.call_count, 1)
+
+        def steady(text: str) -> str:
+            return re.sub(r"[0-9]+ 秒前", "N 秒前", text)  # 两次运行之间可能跨过一秒
+
+        path = self.states["vm"] / FED_DB_NAME
+        faults = [
+            ("版本过新", lambda: self._raw_sql(path, "PRAGMA user_version=999")),
+            ("表缺失", lambda: self._raw_sql(path, "PRAGMA user_version=1", "DROP TABLE fed_tasks")),
+            ("垃圾文件", lambda: self._garbage(path)),
+        ]
+        for name, damage in faults:
+            damage()
+            with self.subTest(fault=name):
+                broken = self.run_on("vm", "status", local_task.id)
+                self.assertEqual((broken[0], steady(broken[1])), (0, steady(out)), broken[2])
+                self.assertNotIn("Traceback", broken[2])
+
+    @staticmethod
+    def _raw_sql(path: Path, *statements: str) -> None:
+        """不经产品代码直接改联邦库文件（制造真实结构故障）；不开外键，DROP 不会被子表拦下。"""
+        connection = sqlite3.connect(path, isolation_level=None)
+        try:
+            for statement in statements:
+                connection.execute(statement)
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _garbage(path: Path) -> None:
+        for suffix in ("-wal", "-shm"):
+            Path(f"{path}{suffix}").unlink(missing_ok=True)
+        path.write_bytes(b"not a sqlite database" * 64)
 
     def test_windows_federation_report_checks_only_the_relevant_local_ref(self) -> None:
         task_id = self.delivered_task()

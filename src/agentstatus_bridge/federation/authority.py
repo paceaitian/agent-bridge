@@ -226,8 +226,12 @@ def create_task(
     notify_origin: bool = True,
     allow_shared: bool = False,
     now: int,
+    follows: str | None = None,
 ) -> tuple[FedTask, FedAttempt]:
-    """A 上建联邦任务与第一次交接（L0）：任务、attempt、路由、operation 与 outbox 同一事务。"""
+    """A 上建联邦任务与第一次交接（L0）：任务、attempt、路由、operation 与 outbox 同一事务。
+
+    follows（§93.3）只进本机 state_json：build_checkpoint 按字段挑选，不会把它带进 checkpoint 与信封。
+    """
     if not can_notify(target):
         raise StoreError("target_no_inbox")
     with store.transaction():
@@ -246,6 +250,7 @@ def create_task(
                 "reviewerToken": reviewer_token,
                 "notifyOrigin": notify_origin, "allowShared": allow_shared,
                 "createdAt": now, "updatedAt": now, "hubId": ident.hub_id,
+                **({"follows": follows} if follows is not None else {}),
             },
         )
         store.insert_task(task)

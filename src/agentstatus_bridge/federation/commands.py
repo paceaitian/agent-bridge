@@ -36,6 +36,7 @@ from ..reports import (  # pyright: ignore[reportPrivateUsage]
     _git_resolve_commit,
 )
 from ..store import MAX_BODY_BYTES, MAX_FILES, StoreError
+from ..task_filter import TASK_LIST_LIMIT, Party, TaskFilter
 from ..worker import ensure_worker
 from . import attachments, authority, budget, config as fed_config, directory, mirror
 from .attachments import AttachmentError, Frozen
@@ -213,8 +214,11 @@ def freeze_refs(rt: Runtime, paths: list[str], cwd: Path) -> list[Frozen]:
 
 def send(rt: Runtime, *, target: TargetRef, body: str, title: str, ref_paths: list[str], cwd: Path,
          origin: EndpointRef | None, origin_class: str | None, reviewer: TargetRef | None, allow_shared: bool,
-         no_notify: bool) -> SendOutcome:
-    """A 上建联邦任务（L0）。至少一方在别的设备（本机目标 + 远端复核也算）；参与设备超过两台写前拒绝（§88.14/T16）。"""
+         no_notify: bool, follows: str | None = None) -> SendOutcome:
+    """A 上建联邦任务（L0）。至少一方在别的设备（本机目标 + 远端复核也算）；参与设备超过两台写前拒绝（§88.14/T16）。
+
+    follows 是 `--follows` 解析出的旧任务完整 ID，只写进本机 state（§93.3），不进 checkpoint 与信封。
+    """
     if len(body.encode("utf-8")) > MAX_BODY_BYTES:
         raise FedCliError("message_too_large")
     local_target_only = target.remote.device_id == rt.ident.device_id
@@ -236,7 +240,7 @@ def send(rt: Runtime, *, target: TargetRef, body: str, title: str, ref_paths: li
             rt.store, rt.ident, title=title, flow="review" if reviewer else "handoff", body=body,
             refs=[item.manifest for item in frozen], origin=origin_target, origin_actor=origin_actor,
             origin_class=origin_class or "unknown", target=target, reviewer=reviewer, reviewer_token=reviewer_token,
-            notify_origin=not no_notify, allow_shared=allow_shared, now=now_ms())
+            notify_origin=not no_notify, allow_shared=allow_shared, now=now_ms(), follows=follows)
     except StoreError as error:
         raise FedCliError(error.code) from error
     return SendOutcome(task, attempt, target, blobs, blob_bytes, references, device_name(rt, target.remote.device_id))
@@ -514,6 +518,9 @@ def task_document(rt: Runtime, task: FedTask, *, now: int, include_body: bool = 
         "lastSyncAt": task.last_sync_at, "syncRequired": task.sync_required, "archived": task.local_archived,
         "stalled": stalled(rt, task, now=now), "attempts": _attempt_rows(rt, task), "reports": _report_rows(rt, task),
     }
+    follows = task.state.get("follows")
+    if isinstance(follows, str):
+        document["follows"] = follows  # 只在发起设备本机有（§93.3）；无关联时不出现该键
     if include_body:
         first = next((item for item in attempts if item.role != "notice"), None)
         document["body"] = first.body if first is not None else ""
@@ -559,9 +566,63 @@ def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False)
     return lines
 
 
-def list_tasks(rt: Runtime, *, include_finished: bool) -> list[FedTask]:
-    tasks = rt.store.tasks(include_finished=include_finished)
+def list_tasks(rt: Runtime, *, include_finished: bool, wanted: TaskFilter | None = None) -> list[FedTask]:
+    """tasks 的联邦部分，最近同步在前；有筛选时先取全部候选再筛、留最新的 200 条（DESIGN §93.1）。"""
+    if wanted is None or not wanted.active:
+        tasks = rt.store.tasks(include_finished=include_finished)
+    else:
+        candidates = rt.store.tasks(include_finished=include_finished, limit=-1)
+        tasks = [item for item in candidates if matches(rt, item, wanted)][:TASK_LIST_LIMIT]
     return sorted(tasks, key=lambda item: item.last_sync_at, reverse=True)
+
+
+def _actor_party(raw: object) -> Party | None:
+    """账本里的 WireActor/RemoteEndpointRef 字典投影成 (provider, 会话 ID)；形状不对视为没有。"""
+    if not isinstance(raw, dict):
+        return None
+    provider, native_id = raw.get("provider"), raw.get("nativeId")  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+    return (provider, native_id) if isinstance(provider, str) and isinstance(native_id, str) else None
+
+
+def _checkpoint_targets(checkpoint: object) -> list[Party]:
+    """checkpoint 里各 handoff/review 尝试的目标（不看 notice）；形状不对的项跳过。"""
+    raw = checkpoint.get("attempts") if isinstance(checkpoint, dict) else None  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+    if not isinstance(raw, list):
+        return []
+    found: list[Party] = []
+    for item in raw:  # pyright: ignore[reportUnknownVariableType]
+        if isinstance(item, dict) and item.get("role") != "notice":  # pyright: ignore[reportUnknownMemberType]
+            party = _actor_party(item.get("target"))  # pyright: ignore[reportUnknownMemberType]
+            if party is not None:
+                found.append(party)
+    return found
+
+
+def matches(rt: Runtime, task: FedTask, wanted: TaskFilter) -> bool:
+    """联邦任务是否符合筛选：会话一律比远端完整 ID；最近活动取 state.updatedAt（毫秒），缺失用 last_sync_at。
+
+    镜像（B）上只有 checkpoint 里的 originActor/reviewer，没有 A 的 origin/reviewer 引用，所以发起方取 originActor、
+    复核方先取 A 的 reviewer、没有再取 checkpoint 里的 reviewer。镜像的 fed_attempts 只有发给本机的尝试，
+    所以目标另并入 checkpoint 里全部 handoff/review 尝试的目标（含发给其他设备会话的）。
+    正文取本机库里 seq 1 的那条，没有就只看标题。
+    """
+    attempts = rt.store.attempts(task.authority_device, task.task_id)
+    state = task.state
+    origin = _actor_party(state.get("originActor"))
+    if origin is None and (found := task.origin()) is not None:
+        origin = (found.remote.provider.value, found.remote.native_id)
+    reviewer_ref = task.reviewer()
+    checkpoint = state.get("checkpoint")
+    reviewer = ((reviewer_ref.remote.provider.value, reviewer_ref.remote.native_id) if reviewer_ref is not None
+                else _actor_party(checkpoint.get("reviewer") if isinstance(checkpoint, dict) else None))  # pyright: ignore[reportUnknownMemberType]
+    updated = state.get("updatedAt")
+    updated_ms = updated if isinstance(updated, int) and not isinstance(updated, bool) else task.last_sync_at
+    first = next((item for item in attempts if item.seq == 1), None)
+    return wanted.accepts(
+        origin=origin, reviewer=reviewer,
+        targets=[*((item.target.remote.provider.value, item.target.remote.native_id) for item in attempts
+                   if item.role != "notice"), *_checkpoint_targets(checkpoint)],
+        updated_at=updated_ms / 1000, title=task.title, body=first.body if first is not None else None)
 
 
 # ---- 启停 ----

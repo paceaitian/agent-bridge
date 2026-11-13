@@ -689,11 +689,15 @@ class Store:
             raise StoreError("task_not_found")
         return task
 
-    def list_tasks(self, *, include_finished: bool = False, limit: int = 200) -> list[Task]:
-        """列出任务；单条坏记录跳过，不拖垮整个列表。"""
+    def list_tasks(self, *, include_finished: bool = False, limit: int | None = 200) -> list[Task]:
+        """列出任务（按创建时间升序）；单条坏记录跳过，不拖垮整个列表。
+
+        limit 为 None 时不限条数：`ab tasks` 先取全部候选再筛选、留最新的若干条（DESIGN §93.1）。
+        """
         where = "" if include_finished else " WHERE closed_at IS NULL AND accepted_at IS NULL"
+        # SQLite 的 LIMIT -1 即不限
         rows = self._conn.execute(
-            f"SELECT * FROM tasks{where} ORDER BY created_at, id LIMIT ?", (limit,)
+            f"SELECT * FROM tasks{where} ORDER BY created_at, id LIMIT ?", (-1 if limit is None else limit,)
         ).fetchall()
         tasks: list[Task] = []
         for row in rows:
@@ -702,6 +706,18 @@ class Store:
             except ValueError:
                 continue
         return tasks
+
+    def followers(self, task_id: str) -> list[tuple[float, str]]:
+        """以 task_id 为 `follows` 的本机任务（DESIGN §93.3）：(创建时间秒, 完整 ID)，按创建时间升序。
+
+        坏 JSON 的 options 不参与比较（CASE 先判 json_valid），单条坏记录不让查询失败。
+        """
+        rows = self._conn.execute(
+            "SELECT id, created_at FROM tasks WHERE CASE WHEN json_valid(options)"
+            " THEN json_extract(options, '$.follows') END = ? ORDER BY created_at, id",
+            (task_id,),
+        ).fetchall()
+        return [(float(row["created_at"]), str(row["id"])) for row in rows]
 
     def attempts(self, task_id: str) -> list[Attempt]:
         rows = self._conn.execute(
