@@ -2,22 +2,34 @@
 
 经真实 `cli.main` 解析 argv；本机与跨设备夹具复用 `test_bridge_task_filters`/`test_bridge_federation_cli`（只取不含用例的基类）。
 跨设备的关联只写发起设备本机的 state：用例核对它不出现在 checkpoint、出站信封与对方镜像里。
+本模块在 `bridge-windows` CI 选择集里（§94.3）：本机与跨设备夹具类沿用 `LocalCliCase`/`FedCliCase` 的 POSIX-only 跳过，
+Windows 上真跑的是假 Win32 内核下的 status 关联用例。
 """
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+import os
+from pathlib import Path
 import json
 import secrets
+import shutil
 import sqlite3
 from unittest.mock import patch
 import unittest
+from tempfile import TemporaryDirectory
+
+from bridge_support import new_task, ref
+from bridge_winapi import Kernel
 
 from agentstatus_bridge import cli, labels, store as store_module
 from agentstatus_bridge.federation import authority
 from agentstatus_bridge.federation.authority import build_checkpoint
+from agentstatus_bridge.platforms.factory import make_platform, using_platform
 from agentstatus_bridge.ids import short
 from agentstatus_bridge.model import Delivery, Flow, Role
-from agentstatus_bridge.federation.fedstore import FED_DB_NAME
+from agentstatus_bridge.federation.fedstore import FED_DB_NAME, FederatedStore
 from agentstatus_bridge.store import DB_NAME, Store
 from test_bridge_federation_cli import DEV_A, ORIGIN, THREAD_B, FedCliCase
 from test_bridge_federation_cli import as_agent as fed_agent
@@ -210,6 +222,8 @@ class BrokenFederationFollowsTests(FedCliCase):
                                          caller=fed_agent(ORIGIN))
         self.assertEqual((code, out), (cli.EXIT_TARGET, ""))
         self.assertIn("[follows_not_found]", err)
+        # 说明里写明联邦库读不了时只查了本机账本，不只说「两边都没有」（§94.2 第 2 条）
+        self.assertIn("联邦库读不了时只查了本机账本", err)
         with Store.open(self.states["vm"]) as store:
             task = store.get_task(new)
             assert task is not None
@@ -218,6 +232,50 @@ class BrokenFederationFollowsTests(FedCliCase):
         code, out, err = self.run_on("vm", "status", old)
         self.assertEqual(code, 0, err)
         self.assertIn(f"后续任务 {short(new)}", out)  # 本机一侧照常显示
+
+    def test_status_shows_gone_when_the_federated_title_lookup_fails(self) -> None:
+        # 本机新任务承接联邦旧任务，之后联邦库表被删：取旧标题那一步查询失败也只当旧任务已不在（§94.2 第 1 条）
+        old = self.send()
+        with patch.object(cli, "worker_running", return_value=True):
+            code, out, err = self.run_on("vm", "send", "--to", "codex@review", "-m", "后续", "--no-wait", "--json",
+                                         "--follows", old[:10], caller=fed_agent(ORIGIN))
+        self.assertEqual(code, 0, err)
+        new = json.loads(out)["id"]
+        self.assertIn(f"承接任务 {short(old)}（请处理 X）", self.run_on("vm", "status", new)[1])  # 删表前取得到标题
+        connection = sqlite3.connect(self.states["vm"] / FED_DB_NAME, isolation_level=None)
+        try:
+            connection.execute("DROP TABLE fed_tasks")  # 能只读打开（版本号仍对），查询时才失败
+        finally:
+            connection.close()
+        code, out, err = self.run_on("vm", "status", new)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"承接任务 {short(old)}（已不在账本）", out)
+        self.assertEqual(json.loads(self.run_on("vm", "status", new, "--json")[1])["follows"], old)
+
+
+class StateRootFollowsTests(FedCliCase):
+    def test_status_skips_a_federation_store_configured_for_another_root(self) -> None:
+        # 状态目录整份复制到别处：federation.json 的 expectedStateRoot 仍指原处，status 不查联邦库（§94.2 第 4 条）
+        with patch.object(cli, "worker_running", return_value=True):
+            code, out, err = self.run_on("vm", "send", "--to", "codex@review", "-m", "本机旧任务", "--no-wait", "--json",
+                                         caller=fed_agent(ORIGIN))
+        self.assertEqual(code, 0, err)
+        old = json.loads(out)["id"]
+        new = self.send("--follows", old)  # 联邦后续任务：只在联邦库里
+        self.assertEqual(json.loads(self.run_on("vm", "status", old, "--json")[1])["followedBy"], [new])
+        copied = self.root / "vm-copy"
+        shutil.copytree(self.states["vm"], copied)
+        self.states["vm"] = copied
+        with patch.object(FederatedStore, "open_readonly", wraps=FederatedStore.open_readonly) as readonly:
+            code, out, err = self.run_on("vm", "status", old)
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("后续任务", out)
+            code, out, err = self.run_on("vm", "status", old, "--json")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("followedBy", json.loads(out))
+        self.assertEqual(readonly.call_count, 0)  # 核对不过就不打开联邦库
+        with FederatedStore.open_readonly(copied) as store:
+            self.assertEqual([item for _, item in store.followers(old)], [new])  # 副本里确有这条后续任务
 
 
 class LimitTextTests(LocalCliCase):
@@ -239,6 +297,38 @@ class LimitTextTests(LocalCliCase):
         code, _, err = self.run_cli("retry", task_id)
         self.assertEqual(code, cli.EXIT_REJECTED)
         self.assertIn("--follows <旧ID>", err)
+
+
+class WindowsFollowsTests(unittest.TestCase):
+    """Windows 走同一套 status：承接/后续两行与 JSON 键不随平台分叉（假 Win32 内核，不碰真实系统，§94.3）。"""
+
+    def setUp(self) -> None:
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.kernel = Kernel(self.root)
+        self.platform = make_platform("windows", win_api=self.kernel.api)
+        self.addCleanup(lambda: self.assertEqual(self.kernel.handles, {}))
+
+    def test_status_shows_both_sides_of_the_link(self) -> None:
+        state = self.root / "state"
+        target = ref(native="019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa", pid=200, start="win-filetime:1", pane=None, label=None)
+        with using_platform(self.platform), patch.dict(os.environ, {"AB_STATE_DIR": str(state)}):
+            with Store.open(state) as store:
+                old, _ = new_task(store, title="旧任务标题", target=target)
+                new, _ = new_task(store, title="后续", target=target, task_options={"follows": old.id})
+                for task_id in (old.id, new.id):  # 已结束：status 不为排版另做发现
+                    store.update_task(task_id, now=200.0, event="closed", closed_at=200.0, close_reason="fixture")
+            out, err = StringIO(), StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                self.assertEqual(cli.main(["status", new.id]), 0, err.getvalue())
+            self.assertIn(f"承接任务 {short(old.id)}（旧任务标题）", out.getvalue())
+            out = StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(cli.main(["status", old.id, "--json"]), 0)
+            document = json.loads(out.getvalue())
+            self.assertEqual(document["followedBy"], [new.id])
+            self.assertNotIn("follows", document)
 
 
 if __name__ == "__main__":

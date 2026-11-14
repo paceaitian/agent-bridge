@@ -143,7 +143,9 @@ class ReleaseTests(unittest.TestCase):
             'test_bridge_federation_codec','test_bridge_federation_attachments','test_bridge_federation_windows',
             'test_bridge_federation_packaging',
             # §89：relay 子进程通道的关闭顺序用真实本地子进程验证，Windows 也要跑
-            'test_bridge_federation_transport_close'})
+            'test_bridge_federation_transport_close',
+            # §94.3：tasks 筛选与 --follows；假内核的 Windows 调用方用例真跑，Linux 夹具与联邦库类按 POSIX-only 跳过
+            'test_bridge_task_filters','test_bridge_task_follows'})
         for name in ci.MODULES:self.assertTrue((ROOT/'tests'/f'{name}.py').is_file())
         native=(ROOT/'tests/test_bridge_windows_native.py').read_text()
         self.assertIn('if api.token(api.k.GetCurrentProcess()).elevated:',native)

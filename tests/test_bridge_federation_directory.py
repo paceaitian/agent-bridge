@@ -20,15 +20,22 @@ from agentstatus_bridge.federation.codec import canonical_bytes
 from agentstatus_bridge.federation.directory import DirectoryError
 from agentstatus_bridge.federation.fedstore import FederatedStore
 from agentstatus_bridge.federation.refs import RemoteEndpointRef
-from agentstatus_bridge.model import EndpointRef, Provider
+from agentstatus_bridge.model import UNRESOLVED_NATIVE_ID, EndpointRef, NameView, Provider
 from agentstatus_bridge.observer_dbus import ObserverView
+from agentstatus_bridge.platforms.factory import make_platform, using_platform
 import bridge_legacy_directory_104f286 as legacy
 from bridge_support import endpoint, ref, with_name_views
+from bridge_winapi import Kernel
+import test_bridge_codex_daemon as daemon_fixture
 
 DEV_A = "a" * 32
 DEV_B = "b" * 32
 THREAD = "019a0000-1111-7222-8333-44445555bbbb"
 NOW = 1_800_000_000_000
+# D-A（§94.1）用例：两个同前缀的 Codex 会话（一个看得清、一个看不清）与一个 Claude 会话
+DA_CODEX = "019a1234-0000-7000-8000-000000000001"
+DA_HIDDEN = "019a1234-1111-7000-8000-000000000002"
+DA_CLAUDE = "019a7777-0000-4000-8000-000000000002"
 
 
 def row(native: str, name: str | None = None, *, verified: bool = True, inbox: bool = True,
@@ -63,6 +70,24 @@ class DirectoryCase(unittest.TestCase):
         with self.assertRaises(DirectoryError) as caught:
             directory.resolve_remote(self.store, device, selector, now=NOW)
         return caught.exception.code
+
+    def assert_only_codex_lowered(self, snapshot: dict[str, object]) -> None:
+        """D-A 的读方后果（§94.1）：把写方真实发布的目录交给真实读方 resolve_remote。
+
+        Codex 身份不全只拒 Codex 名字/前缀与无 provider 的前缀；带 provider 的 Claude 名字与前缀照常，完整 ID 不受门限制。
+        """
+        self.store.put_device_state(device_id=DEV_B, name="win", revision=1, snapshot=snapshot, last_seen=NOW,
+                                    state="online")
+        for selector in (f"codex@id:{DA_CODEX[:8]}", f"id:{DA_CODEX[:8]}", f"id:{DA_CLAUDE[:8]}", "codex@impl"):
+            with self.subTest(selector=selector):
+                self.assertEqual(self.code(selector), "remote_directory_incomplete")
+        self.assertEqual(self.code("lead"), "target_provider_required")  # 远端裸名本来就拒，与 D-A 无关
+        for selector in ("claude@lead", f"claude@id:{DA_CLAUDE[:8]}"):
+            with self.subTest(selector=selector):
+                self.assertEqual(directory.resolve_remote(self.store, "win", selector, now=NOW).remote.native_id,
+                                 DA_CLAUDE)
+        self.assertEqual(directory.resolve_remote(self.store, "win", f"codex@id:{DA_CODEX}", now=NOW).remote.native_id,
+                         DA_CODEX)
 
 
 class ResolveTests(DirectoryCase):
@@ -209,6 +234,80 @@ class PeerTextTests(DirectoryCase):
         self.assertIn("codex@impl〔019a0000-1111-7222-8333-44445555b〕", text)
 
 
+class PeerCompletenessTests(DirectoryCase):
+    """peers 设备行的三种目录完整性与 JSON 的 providers 增量键（§94.1）。"""
+
+    def snapshot(self, *, complete: bool, providers: object) -> None:
+        document: dict[str, object] = {"endpoints": [row(DA_CODEX, "impl"), row(DA_CLAUDE, "lead", provider="claude")],
+                                       "complete": complete, "namePolicy": directory.NAME_POLICY}
+        if providers is not None:
+            document["providers"] = providers
+        self.store.put_device_state(device_id=DEV_B, name="win", revision=1, snapshot=document, last_seen=NOW,
+                                    state="online")
+
+    def device_line(self) -> str:
+        return directory.peer_lines(self.store, "win", now=NOW)[0]
+
+    def test_three_device_line_forms(self) -> None:
+        self.snapshot(complete=True, providers={"codex": True, "claude": True})
+        self.assertEqual(self.device_line(), f"设备 win〔{DEV_B[:8]}〕：在线，目录完整")
+        self.snapshot(complete=True, providers={"codex": False, "claude": True, "grok": False})
+        self.assertEqual(self.device_line(), f"设备 win〔{DEV_B[:8]}〕：在线，目录部分完整（codex、grok 未核全：codex、grok"
+                                             " 与不带 provider 的名字/前缀不可用，只能用完整 ID）")
+        # 部分完整时 Codex 行的〔ID〕回到完整 ID（同一 _relevant_complete 判据），Claude 行仍取最短唯一前缀
+        text = "\n".join(directory.peer_lines(self.store, "win", now=NOW))
+        self.assertIn(f"codex@impl〔{DA_CODEX}〕", text)
+        self.assertIn("claude@lead〔019a7777〕", text)
+        self.snapshot(complete=False, providers={"codex": False, "claude": True})
+        self.assertEqual(self.device_line(), f"设备 win〔{DEV_B[:8]}〕：在线，目录不完整")
+
+    def assert_line_matches_reader(self, providers: object, pending: str | None) -> None:
+        """设备行与真实读方同口径（§94.1，r1 两方 P3）：写部分完整当且仅当不带 provider 的前缀被拒。"""
+        self.snapshot(complete=True, providers=providers)
+        line = self.device_line()
+        try:
+            directory.resolve_remote(self.store, "win", f"id:{DA_CLAUDE[:8]}", now=NOW)
+            rejected = False
+        except DirectoryError as error:
+            self.assertEqual(error.code, "remote_directory_incomplete")
+            rejected = True
+        self.assertEqual(rejected, pending is not None, line)
+        if pending is None:
+            self.assertTrue(line.endswith("目录完整"), line)
+        else:
+            self.assertIn(f"目录部分完整（{pending} 未核全：", line)
+
+    def test_non_boolean_and_missing_keys_count_as_unverified(self) -> None:
+        self.assert_line_matches_reader({"codex": 1, "claude": True}, "codex")  # 非布尔：不是明确 true
+        self.assert_line_matches_reader({"codex": None, "claude": True}, "codex")
+        self.assert_line_matches_reader({"codex": True}, "claude")  # 行里有 Claude、providers 缺键
+        self.assert_line_matches_reader({"codex": True, "claude": True}, None)
+
+    def test_hostile_provider_keys_are_never_printed(self) -> None:
+        # 对端快照里的键只经 hub 布尔校验：带换行与 ESC 的键不能在本机文字里伪造出第二行设备行或终端控制序列
+        forged = "x\n设备 forged〔ffffffff〕：在线，目录完整\x1b[2K"
+        self.assert_line_matches_reader({"codex": True, "claude": True, forged: False}, "其他")
+        lines = directory.peer_lines(self.store, "win", now=NOW)
+        text = "\n".join(lines)
+        self.assertNotIn("forged", text)
+        self.assertNotIn("\x1b", text)
+        self.assertFalse(any(line.startswith("设备 forged") for line in lines))
+        self.assertEqual(sum(line.startswith("设备 ") for line in lines), 1)
+        # JSON 原样转述完整的表（键名由 JSON 编码负责转义），文字只说「其他」
+        [device] = directory.peer_devices(self.store, "win", now=NOW)
+        self.assertIn(forged, device["providers"])
+        self.assert_line_matches_reader({"codex": False, "claude": True, forged: False}, "codex、其他")
+
+    def test_json_relays_the_provider_table_verbatim(self) -> None:
+        table = {"codex": False, "claude": True}
+        self.snapshot(complete=True, providers=table)
+        [device] = directory.peer_devices(self.store, "win", now=NOW)
+        self.assertEqual((device["complete"], device["providers"]), (True, table))
+        self.snapshot(complete=True, providers=None)  # 历史快照没有 providers：空表，不猜
+        [device] = directory.peer_devices(self.store, "win", now=NOW)
+        self.assertEqual(device["providers"], {})
+
+
 class CompletenessTests(DirectoryCase):
     def test_names_need_a_complete_directory_but_exact_ids_do_not(self) -> None:
         self.store.put_device_state(device_id=DEV_B, name="win", revision=1, snapshot={
@@ -236,7 +335,7 @@ class LinuxPublisherTests(DirectoryCase):
         claude.mkdir()
         proc = self.root / "proc"
         proc.mkdir()
-        sources = endpoint_module.DiscoverySources(
+        sources = self.sources = endpoint_module.DiscoverySources(
             proc_root=proc, claude_sessions=claude, codex_home=self.root / "codex", grok_home=self.root / "grok",
             panes=lambda: {}, titles=lambda: {}, runtime=lambda: ObserverView())
         runtime = SimpleNamespace(store=self.store, ident=SimpleNamespace(device_id=DEV_A),
@@ -274,6 +373,141 @@ class LinuxPublisherTests(DirectoryCase):
     def test_fully_read_empty_sample_is_complete(self) -> None:
         snapshot = self.collect(denied=False)
         self.assertTrue(snapshot["complete"])
+
+    def adapters(self, *, claude_unread: bool = False) -> dict[Provider, object]:
+        """Codex 一个看得清的会话加一个认不出 thread 的窗口（不能排除是根会话），Claude 一个已命名会话。"""
+        seen = endpoint(ref(Provider.CODEX, DA_CODEX, pid=4242, pane="%1"), name="impl")
+        hidden = endpoint(ref(Provider.CODEX, UNRESOLVED_NATIVE_ID, pid=4343, pane=None, label=None),
+                          issues=("title_thread_missing",), native_name=None)
+        lead = endpoint(ref(Provider.CLAUDE, DA_CLAUDE, pid=4444, pane="%2", label="lead"), name="lead")
+
+        def claude(config: endpoint_module.DiscoverySources, *_rest: object) -> list[object]:
+            if claude_unread:
+                config.incomplete.add("claude")  # 与注册表读失败同一记账：本轮 Claude 来源没看全
+            return [lead]
+
+        found = {Provider.CODEX: lambda *_a: [seen, hidden], Provider.CLAUDE: claude}
+        return {provider: replace(adapter, discover=found.get(provider, lambda *_a: []))
+                for provider, adapter in endpoint_module.ADAPTERS.items()}
+
+    def test_codex_identity_gap_only_lowers_providers_codex(self) -> None:
+        # D-A（§94.1）：认不出 thread 的 Codex 窗口只让 providers.codex=false，顶层 complete 仍按来源为 true
+        with patch.dict(endpoint_module.ADAPTERS, self.adapters()), \
+                patch.object(directory, "root_binding", return_value="f" * 32):
+            snapshot = self.collect(denied=False)
+            found = endpoint_module.discover(self.sources)  # 同一份夹具来源与替身再发现一次，取本机判据（不碰宿主 tmux/D-Bus）
+        self.assertEqual((snapshot["complete"], snapshot["providers"]),
+                         (True, {"claude": True, "codex": False, "grok": True}))
+        # 发布值与本机 --to 解析、名字投影是同一判据（selection_complete），不另算一份
+        self.assertEqual(snapshot["providers"],
+                         {provider.value: endpoint_module.selection_complete(found, provider) for provider in Provider})
+        self.assert_only_codex_lowered(snapshot)
+
+    def test_source_gap_still_clears_the_top_level_flag(self) -> None:
+        # 来源没看全仍让顶层 complete=false：D-A 只把身份不全从顶层拆出去，来源不全照旧连带
+        with patch.dict(endpoint_module.ADAPTERS, self.adapters(claude_unread=True)), \
+                patch.object(directory, "root_binding", return_value="f" * 32):
+            snapshot = self.collect(denied=False)
+        self.assertEqual((snapshot["complete"], snapshot["providers"]),
+                         (False, {"claude": False, "codex": False, "grok": True}))
+        self.store.put_device_state(device_id=DEV_B, name="win", revision=1, snapshot=snapshot, last_seen=NOW,
+                                    state="online")
+        self.assertEqual(self.code("claude@lead"), "remote_directory_incomplete")
+
+
+class DaemonPublisherTests(daemon_fixture.DaemonBase):
+    """D-A 在真实 Linux 发现上（§94.1）：托管 daemon 下有一个认不出 thread 的 TUI 时，目录发布 providers.codex=false。"""
+
+    def test_unreadable_tui_title_lowers_only_codex(self) -> None:
+        self.daemon(self.lock(DA_CODEX), self.lock(DA_HIDDEN))
+        self.tui(1000, "%1", shows=DA_CODEX)
+        self.tui(3000, None, tty=34817)  # 实际显示另一个 thread，但在 tmux 外、没有标题可读
+        self.state_db({DA_CODEX: "cli", DA_HIDDEN: "cli"})
+        sources = self.sources()
+        store = FederatedStore.create(self.root / "fed")
+        self.addCleanup(store.close)
+        store.set_meta("deviceId", DEV_A)
+        runtime = SimpleNamespace(store=store, ident=SimpleNamespace(device_id=DEV_A),
+                                  config=SimpleNamespace(publish_names=True))
+        with patch.object(commands, "DiscoverySources", return_value=sources), \
+                patch.object(directory, "root_binding", return_value="f" * 32):
+            snapshot = commands.directory_source(runtime)()  # type: ignore[arg-type]
+        self.assertTrue(sources.provider_complete(Provider.CODEX))  # 来源看全了：缺的是身份
+        self.assertEqual((snapshot["complete"], snapshot["providers"]["codex"]), (True, False))  # type: ignore[index]
+        self.assertEqual(sorted(item["nativeId"] for item in snapshot["endpoints"]),  # type: ignore[union-attr]
+                         sorted([DA_CODEX, UNRESOLVED_NATIVE_ID]))
+
+
+class WindowsPublisherTests(DirectoryCase):
+    """D-A 的 Windows 写方（§94.1）：一行 Codex 元数据未核实只降 providers.codex，Claude 远端名字与前缀不连带失效。
+
+    假内核只提供 Windows 平台组合根；Codex/Claude 发现结果按真实数据类型合成，经真实 directory_source 发布。
+    """
+
+    def discoveries(self, *, codex_complete: bool = True, hidden_verified: bool = False,
+                    hidden_stable: bool = True) -> tuple[object, object]:
+        """合成的 Codex 与 Claude 发现结果：Codex 一行已核实且稳定，另一行按参数（元数据核实、稳定）合成。"""
+        from agentstatus_bridge.platforms.windows import claude_discovery as wc  # layout: allow 合成 Windows 发现结果
+        from agentstatus_bridge.platforms.windows import codex_discovery as wd  # layout: allow 合成 Windows 发现结果
+        from agentstatus_bridge.platforms.windows.target_aliases import AliasSet  # layout: allow 合成 Windows 候选
+        from agentstatus_bridge.model import NameSource
+
+        rows = (wd.Candidate(DA_CODEX, "root", None, "impl", True, "impl", "", True, stable=True,
+                             name_source=NameSource("named", "impl")),
+                wd.Candidate(DA_HIDDEN, "root", None, "", hidden_verified, "", "", False, stable=hidden_stable))
+        codex = wd.Discovery(rows, codex_complete, "metadata_unverified", "a" * 64, (200, "1"), AliasSet({}, "ok"),
+                             "b" * 64)
+        lead = replace(endpoint(EndpointRef(Provider.CLAUDE, DA_CLAUDE, 300, "win-filetime:1", data_root="c" * 64)),
+                       name_view=NameView(Provider.CLAUDE, DA_CLAUDE, "lead", "lead", True, DA_CLAUDE[:8]))
+        return codex, wc.Discovery((lead,), True, "complete")
+
+    def collect(self, **kwargs: bool) -> dict[str, object]:
+        from agentstatus_bridge.platforms.windows import claude_discovery as wc  # layout: allow 合成 Windows 发现结果
+        from agentstatus_bridge.platforms.windows import commands as wcommands  # layout: allow 合成 Windows 发现结果
+
+        codex, claude = self.discoveries(**kwargs)
+        kernel = Kernel(self.root)
+        runtime = SimpleNamespace(store=self.store, ident=SimpleNamespace(device_id=DEV_A),
+                                  config=SimpleNamespace(publish_names=True))
+        with using_platform(make_platform("windows", win_api=kernel.api)), \
+                patch.object(wcommands, "discover", return_value=codex), \
+                patch.object(wc, "discover", return_value=claude):
+            return commands.directory_source(runtime)()  # type: ignore[arg-type]
+
+    def test_unverified_codex_row_only_lowers_providers_codex(self) -> None:
+        snapshot = self.collect()
+        self.assertEqual((snapshot["complete"], snapshot["providers"]), (True, {"codex": False, "claude": True}))
+        self.assertEqual(sorted(item["nativeId"] for item in snapshot["endpoints"]),  # type: ignore[union-attr]
+                         sorted([DA_CODEX, DA_CLAUDE]))  # 未核实的行不可投，不发布
+        self.assert_only_codex_lowered(snapshot)
+
+    def test_verified_rows_publish_complete_and_source_gap_clears_the_top_level_flag(self) -> None:
+        self.assertEqual(self.collect(hidden_verified=True)["providers"], {"codex": True, "claude": True})
+        snapshot = self.collect(codex_complete=False)
+        self.assertEqual((snapshot["complete"], snapshot["providers"]), (False, {"codex": False, "claude": True}))
+
+    def test_verified_but_unstable_row_only_lowers_providers_codex(self) -> None:
+        # 身份判据的另一半（§94.1「全部行 metadata_verified and stable」）：元数据已核实但不稳定的行同样降 providers.codex
+        snapshot = self.collect(hidden_verified=True, hidden_stable=False)
+        self.assertEqual((snapshot["complete"], snapshot["providers"]), (True, {"codex": False, "claude": True}))
+        self.assert_only_codex_lowered(snapshot)
+
+    def test_worker_keeps_the_combined_provider_completeness(self) -> None:
+        # 给 worker 的 provider_complete 保持「来源 and 身份」组合语义（§94.1）；目录发布才拆开用两半
+        from agentstatus_bridge.platforms.windows import commands as wcommands  # layout: allow 合成 Windows 发现结果
+
+        sampler = wcommands.WorkerDiscovery(make_platform("windows", win_api=Kernel(self.root).api).transport)  # type: ignore[arg-type]
+        cases = {"未核实": dict(hidden_verified=False), "不稳定": dict(hidden_verified=True, hidden_stable=False),
+                 "全部核实": dict(hidden_verified=True), "来源不全": dict(hidden_verified=True, codex_complete=False)}
+        expected = {"未核实": (True, False, False), "不稳定": (True, False, False), "全部核实": (True, True, True),
+                    "来源不全": (False, True, False)}
+        for label, kwargs in cases.items():
+            with self.subTest(case=label):
+                sampler.codex, sampler.claude = self.discoveries(**kwargs)  # type: ignore[assignment]
+                self.assertEqual((sampler.source_complete(Provider.CODEX), sampler.ids_complete(Provider.CODEX),
+                                  sampler.provider_complete(Provider.CODEX)), expected[label])
+                self.assertTrue(sampler.provider_complete(Provider.CLAUDE))
+                self.assertEqual(sampler.complete(), expected[label][2])
 
 
 class DiscoveryCompletenessTests(unittest.TestCase):

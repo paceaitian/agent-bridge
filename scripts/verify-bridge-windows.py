@@ -6,6 +6,8 @@ the private Store gate explicitly SKIPs elevated tokens instead of weakening ACL
 Federation (DESIGN 88): portable attachment freeze/land, the Windows delivery
 model and protocol codec run here; tests needing POSIX permission bits, FIFOs,
 symlinks or Linux link-based landing SKIP with a reason starting "POSIX-only:".
+Task filters/follows (DESIGN 93, 94.3): pure and Fake-kernel Windows cases run;
+the Linux-fixture and federation-store classes SKIP with the same "POSIX-only:" prefix.
 """
 from pathlib import Path
 import sys
@@ -26,7 +28,8 @@ MODULES = ('test_bridge_windows', 'test_bridge_windows_streams',
            'test_bridge_windows_native', 'test_bridge_local_display',
            'test_bridge_federation_codec', 'test_bridge_federation_attachments',
            'test_bridge_federation_windows', 'test_bridge_federation_packaging',
-           'test_bridge_federation_transport_close')
+           'test_bridge_federation_transport_close',
+           'test_bridge_task_filters', 'test_bridge_task_follows')
 # Only these skips may appear; any other skip means a module silently did not qualify.
 NATIVE_PREFIX = 'test_bridge_windows_native.'
 POSIX_ONLY = "POSIX-only:"

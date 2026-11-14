@@ -62,6 +62,12 @@ def as_agent(item: Endpoint) -> Caller:
 USER = Caller(None, None)
 
 
+# §94.3：引用本夹具的 tasks 用例模块进了 Windows CI 选择集；这里用联邦库与替身 Linux 发现，原因按选择器放行的前缀写
+# （test_bridge_federation_windows 导入常量核对前缀）
+FED_FIXTURE_REASON = "POSIX-only: 联邦库与替身 Linux 发现（提权的 Windows CI 不建联邦库，§88.18）"
+
+
+@unittest.skipUnless(os.name == "posix", FED_FIXTURE_REASON)
 class FedCliCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

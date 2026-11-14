@@ -793,8 +793,9 @@ def _follow_links(task_id: str, follows: str | None, *, store: Store | None = No
                   fed_store: FederatedStore | None = None) -> tuple[list[str], list[str]]:
     """status 的任务关联（§93.3）：返回（显示行, 后续任务完整 ID 列表）。
 
-    本机账本与联邦库都查，调用方已开的那一边直接用。另一边按需打开：联邦库用只读连接（mode=ro、query_only，
-    忙时约 50 ms 即放弃，不做配置核对、不写库），本机账本按普通方式打开；未配置联邦时不导入联邦实现。
+    本机账本与联邦库都查，调用方已开的那一边直接用。另一边按需打开：联邦库先做与 §90.6 投影相同的配置核对
+    （配置读不了或 expectedStateRoot 与本根不符就不查联邦库），再用只读连接（mode=ro、query_only，忙时约 50 ms
+    即放弃、不写库），本机账本按普通方式打开；未配置联邦时不导入联邦实现。
     关联只是展示：打开或查询任一步出任何故障都只少显示，不让已命中的 status 失败（§88.7）。
     """
     root = state_dir()
@@ -807,10 +808,15 @@ def _follow_links(task_id: str, follows: str | None, *, store: Store | None = No
             except (StoreError, OSError, sqlite3.Error):
                 store = None
         if fed_store is None and _fed_configured(root):
+            from .federation import config as fed_config  # layout: allow 联邦按需加载
             from .federation.fedstore import FederatedStore as FedStore  # layout: allow 联邦按需加载
             try:
-                fed_store = own_fed = FedStore.open_readonly(root)
-            except Exception:  # noqa: BLE001 - 关联只是展示：联邦库任何故障都不能让已命中的本机 status 失败
+                # 状态目录被复制或挪走时配置指向别处：不显示一个与当前配置不符的联邦库里的后续任务（§94.2）
+                config = fed_config.load(root)
+                if config is not None:
+                    fed_config.check_state_root(config, root)
+                    fed_store = own_fed = FedStore.open_readonly(root)
+            except Exception:  # noqa: BLE001 - 关联只是展示：配置或联邦库任何故障都不能让已命中的本机 status 失败
                 fed_store = None
         lines: list[str] = []
         if follows is not None:

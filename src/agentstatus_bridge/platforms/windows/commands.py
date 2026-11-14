@@ -206,10 +206,18 @@ class WorkerDiscovery:
         return ([self.codex.endpoint(row) for row in self.codex.rows if row.eligible]
                 if self.codex.complete else []) + list(self.claude.endpoints) + list(self.claude.duplicates)
 
-    def provider_complete(self, provider: Provider) -> bool:
+    def source_complete(self, provider: Provider) -> bool:
+        """本轮该 provider 的来源是否看全（§94.1）：Codex loaded 集合、Claude 注册表各自独立。"""
+        return self.claude.complete if provider is Provider.CLAUDE else self.codex.complete
+
+    def ids_complete(self, provider: Provider) -> bool:
+        """身份全集是否完整（§94.1）：Codex 每一行元数据都已核实且稳定，否则可能有看不清的根会话；Claude 恒为 true。"""
         if provider is Provider.CLAUDE:
-            return self.claude.complete
-        return self.codex.complete and all(r.metadata_verified and r.stable for r in self.codex.rows)
+            return True
+        return all(r.metadata_verified and r.stable for r in self.codex.rows)
+
+    def provider_complete(self, provider: Provider) -> bool:
+        return self.source_complete(provider) and self.ids_complete(provider)
 
     def complete(self) -> bool:
         return self.provider_complete(Provider.CODEX) and self.provider_complete(Provider.CLAUDE)

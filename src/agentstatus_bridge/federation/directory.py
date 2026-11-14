@@ -103,11 +103,16 @@ def bind_local(store: FederatedStore, ident_device: str, ref: EndpointRef, *, ve
 
 
 def snapshot(store: FederatedStore, device_id: str, endpoints: Iterable[Endpoint], *,
-             publish_names: bool = True, provider_complete: Mapping[str, bool] | None = None) -> dict[str, Any]:
+             publish_names: bool = True, provider_complete: Mapping[str, bool] | None = None,
+             ids_complete: Mapping[str, bool] | None = None) -> dict[str, Any]:
     """整帧目录：每个本机端点一行（绑定标识、名字、收件能力、eligible）；超预算标 incomplete。
 
     名字的证明与否证已在发现时对全集算好（NameView），这里只投影：先对全集定名，再按预算降级，不先裁冲突证据。
     单行超限时先丢名字（降为纯 ID、namesVerified=false）保住身份，并标快照不完整；名字本身超过 120 字符也只丢名字。
+
+    完整性分两层（§94.1）：provider_complete 是各 provider 本轮来源是否看全，ids_complete 是身份全集里有没有
+    认不出、又不能排除是根会话的端点（缺省或缺键视为完整）。providers[p] 取两者之与，只拒该 provider 的名字与
+    前缀；顶层 complete 只看来源与预算，不因某家身份不全连带拒掉别家。
     """
     rows: list[dict[str, Any]] = []
     reason = None
@@ -139,8 +144,10 @@ def snapshot(store: FederatedStore, device_id: str, endpoints: Iterable[Endpoint
             reason = "too_many_endpoints"
             break
         rows.append(row)
-    providers = {key: bool(value) for key, value in (provider_complete or {}).items()}
-    complete = reason is None and all(providers.values())
+    sources = {key: bool(value) for key, value in (provider_complete or {}).items()}
+    identities = ids_complete or {}
+    providers = {key: value and bool(identities.get(key, True)) for key, value in sources.items()}
+    complete = reason is None and all(sources.values())
     document: dict[str, Any] = {"endpoints": rows, "complete": complete, "providers": providers,
                                 "namePolicy": NAME_POLICY}
     if reason is not None:
@@ -255,6 +262,9 @@ def peer_devices(store: FederatedStore, device_reference: str | None, *, now: in
         seen = row.get("last_seen")
         online = fresh(row, now=now)
         snapshot_data = row["snapshot"] if isinstance(row.get("snapshot"), dict) else {}
+        raw_providers = snapshot_data.get("providers")
+        # 原样转述快照里各 provider 的完整性表（§94.1 增量键）；历史快照没有就是空表
+        providers: dict[str, Any] = dict(raw_providers) if isinstance(raw_providers, dict) else {}  # pyright: ignore[reportUnknownArgumentType]
         # 可复制的 --device 值：登记 slug，没有就用完整 deviceId（device_row 两者都认；8 位前缀解析不了）
         reference = str(row["name"] or row["device_id"])
         peers: list[dict[str, Any]] = []
@@ -274,7 +284,7 @@ def peer_devices(store: FederatedStore, device_reference: str | None, *, now: in
         devices.append({"device": row["name"], "deviceId": row["device_id"], "online": online,
                         "state": "revoked" if row["state"] == "revoked" else ("online" if online else "unknown"),
                         "lastSeen": seen if isinstance(seen, int) else None,
-                        "complete": snapshot_data.get("complete") is True,
+                        "complete": snapshot_data.get("complete") is True, "providers": providers,
                         "namePolicy": snapshot_data.get("namePolicy"), "peers": peers})
     return devices
 
@@ -295,6 +305,29 @@ def _shown_ids(row: Mapping[str, Any], *, now: int) -> dict[tuple[str, str], str
     return shown
 
 
+_PROVIDER_KEYS = frozenset(provider.value for provider in Provider)
+
+
+def _completeness_text(device: Mapping[str, Any]) -> str:
+    """设备行的目录完整性（§94.1）：顶层不完整照旧写「不完整」；顶层完整但有 provider 未核全时写部分完整。
+
+    未核全的集合与 _relevant_complete 同口径：providers 的键并上行里出现的 provider，值不是明确 true（含缺键、非布尔）
+    即未核全，它们的名字与前缀、以及不带 provider 的前缀都解析不了。文字只列本机认识的 provider 名，对端快照里的
+    其他字符串（可能含换行、控制字符）一律合并成「其他」，不原样输出。
+    """
+    if not device["complete"]:
+        return "不完整"
+    providers: Mapping[Any, Any] = device["providers"]
+    relevant = {key for key in providers if isinstance(key, str)} | {
+        str(peer["remoteRef"]["provider"]) for peer in device["peers"]}
+    pending = {key for key in relevant if providers.get(key) is not True}
+    shown = sorted(pending & _PROVIDER_KEYS) + (["其他"] if pending - _PROVIDER_KEYS else [])
+    if not shown:
+        return "完整"
+    names = "、".join(shown)
+    return f"部分完整（{names} 未核全：{names} 与不带 provider 的名字/前缀不可用，只能用完整 ID）"
+
+
 def peer_lines(store: FederatedStore, device_reference: str | None, *, now: int) -> list[str]:
     """文字版：按设备展示缓存目录，附可直接复制的完整目标。"""
     lines: list[str] = []
@@ -303,8 +336,7 @@ def peer_lines(store: FederatedStore, device_reference: str | None, *, now: int)
     for device in peer_devices(store, device_reference, now=now):
         shown_ids = _shown_ids(rows.get(str(device["deviceId"])) or {}, now=now)
         state = {"online": "在线", "revoked": "已撤销"}.get(device["state"], "离线或未知")
-        complete = "完整" if device["complete"] else "不完整"
-        lines.append(f"设备 {device['device']}〔{str(device['deviceId'])[:8]}〕：{state}，目录{complete}")
+        lines.append(f"设备 {device['device']}〔{str(device['deviceId'])[:8]}〕：{state}，目录{_completeness_text(device)}")
         where = device["device"] or device["deviceId"]
         for peer in device["peers"]:
             ref = peer["remoteRef"]

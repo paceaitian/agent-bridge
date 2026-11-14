@@ -18,6 +18,7 @@ from typing import Any
 
 from ..closure import ACCEPTED
 from ..endpoints import ADAPTERS, Caller, DiscoverySources, Endpoint, discover
+from ..endpoints import _ids_complete  # pyright: ignore[reportPrivateUsage]  与本机解析/名字投影同一身份判据（§94.1）
 from ..ids import short
 from ..labels import reason_text
 from ..model import PHASE_LABELS, Attempt, EndpointRef, Phase, Provider, ReportKind, Task, TaskView, describe
@@ -856,10 +857,15 @@ def _require_unelevated() -> None:
 
 
 def directory_source(rt: Runtime) -> Callable[[], dict[str, Any]]:
-    """relay 目录采样：Linux 走 discover()，Windows 按 provider 完整性发现；只发最小公开目录。"""
+    """relay 目录采样：Linux 走 discover()，Windows 按 provider 完整性发现；只发最小公开目录。
+
+    来源完整与身份完整分开交给 snapshot（§94.1）：某家有认不出的根候选只降它自己的 providers[p]，
+    顶层 complete 仍按来源算，别家的名字与前缀不连带失效。
+    """
 
     def collect() -> dict[str, Any]:
         complete: dict[str, bool] = {}
+        identities: dict[str, bool] = {}
         if get_platform().name == "windows":
             from ..platforms.windows.commands import WorkerDiscovery  # layout: allow Windows 按 provider 完整性发现
             from ..platforms.windows.local_transport import WindowsPlatform  # layout: allow 已选择后端
@@ -869,8 +875,10 @@ def directory_source(rt: Runtime) -> Callable[[], dict[str, Any]]:
                 return {"endpoints": [], "complete": False, "providers": {}, "reason": "windows_provider_not_enabled"}
             sampler = WorkerDiscovery(backend)
             found = sampler()
-            complete = {provider.value: sampler.provider_complete(provider)
+            complete = {provider.value: sampler.source_complete(provider)
                         for provider in (Provider.CODEX, Provider.CLAUDE)}
+            identities = {provider.value: sampler.ids_complete(provider)
+                          for provider in (Provider.CODEX, Provider.CLAUDE)}
         else:
             # Linux 按本轮实际采样的完整性：注册目录读不到、预算截断或 /proc 不可列举的 provider 标不完整
             # （消费端据此不按名字在它上面消歧）；平台能力只是前提，不代表这一轮看全了
@@ -878,8 +886,10 @@ def directory_source(rt: Runtime) -> Callable[[], dict[str, Any]]:
             found = discover(sources) if get_platform().discovery is Capability.VERIFIED else []
             complete = {provider.value: get_platform().discovery is Capability.VERIFIED
                         and sources.provider_complete(provider) for provider in ADAPTERS}
+            # 身份全集与本机 --to 解析、名字投影共用 _ids_complete（selection_complete 的身份部分），不另算一份
+            identities = {provider.value: _ids_complete(found, provider) for provider in ADAPTERS}
         return directory.snapshot(rt.store, rt.ident.device_id, found, publish_names=rt.config.publish_names,
-                                  provider_complete=complete)
+                                  provider_complete=complete, ids_complete=identities)
 
     return collect
 

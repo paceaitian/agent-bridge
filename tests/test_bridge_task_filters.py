@@ -2,17 +2,22 @@
 
 全部经真实 `cli.main`（即真实 `build_parser`）解析 argv；账本、状态根与发现都在临时目录与替身里，不连真实 HOME、
 Codex daemon 或现役账本。本机用例的夹具 `LocalCliCase` 也供 §93.3 的关联用例复用（反向不依赖）。
+
+本模块在 `bridge-windows` CI 选择集里（§94.3）：纯函数与假 Win32 内核用例两种系统都跑；替身 Linux 发现与联邦库的
+夹具类在 Windows 上按选择器放行的 `POSIX-only:` 前缀跳过（缺省平台是真实 Win32，Linux 平台要导入 fcntl，
+提权的 Windows CI 不建联邦库）。
 """
 
 from __future__ import annotations
 
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import closing, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 import datetime
 from io import StringIO
 import json
 import os
 from pathlib import Path
+import sqlite3
 from tempfile import TemporaryDirectory
 import time
 import unittest
@@ -20,18 +25,23 @@ from unittest.mock import patch
 
 from bridge_support import discovering, endpoint, ref, with_name_views
 from bridge_winapi import Kernel
+import test_bridge_windows_callers as windows_callers
+import test_bridge_windows_claude as windows_claude
+import test_bridge_windows_discovery as windows_discovery
+from test_bridge_windows_discovery import uuid
 
-from agentstatus_bridge import cli, observer_dbus
+from agentstatus_bridge import cli, observer_dbus, summary
 from agentstatus_bridge.endpoints import Caller
-from agentstatus_bridge.model import Delivery, Endpoint, Provider, Role
+from agentstatus_bridge.model import Delivery, Endpoint, EndpointRef, Flow, Provider, Role
 from agentstatus_bridge.platforms.factory import make_platform, using_platform
 from agentstatus_bridge.platforms.linux.process import ProcessInfo
+from agentstatus_bridge.platforms.windows import commands as windows_commands
 from agentstatus_bridge.store import Store
 from agentstatus_bridge.task_filter import FilterError, SessionMatch, TaskFilter, parse_since
 from agentstatus_bridge.transports.codex_native import NativeFailure
 from agentstatus_bridge.federation import commands as fed_commands, directory
 from agentstatus_bridge.ids import new_id
-from agentstatus_bridge.federation.fedstore import now_ms
+from agentstatus_bridge.federation.fedstore import FederatedStore, now_ms
 from test_bridge_federation_cli import CLAUDE_A, DEV_A, DEV_B, LOCAL_REVIEW, ORIGIN, THREAD_B, WORKER, FedCliCase
 from test_bridge_federation_cli import USER as FED_USER
 from test_bridge_federation_cli import as_agent as fed_agent
@@ -52,6 +62,13 @@ OTHER_WIN = endpoint(ref(Provider.CODEX, "019a0000-ffff-7fff-8fff-ffffffffffff",
                          server=100))
 
 
+# Windows CI 上的跳过原因（§94.3）：必须以选择器放行的 POSIX-only: 开头，否则整份选择判失败；
+# test_bridge_federation_windows 导入这两个常量核对前缀。跨设备夹具 FedCliCase 在它自己的模块里同样用常量
+LINUX_FIXTURE_REASON = "POSIX-only: 替身 Linux 发现与调用方、Linux 私有状态目录（Windows 缺省平台是真实 Win32，Linux 平台要导入 fcntl）"
+TZSET_REASON = "POSIX-only: 需要 time.tzset 固定时区"
+linux_fixture = unittest.skipUnless(os.name == "posix", LINUX_FIXTURE_REASON)
+
+
 def as_agent(item: Endpoint) -> Caller:
     return Caller(item, ProcessInfo(item.ref.pid, 1, item.ref.provider.value, item.ref.start_ticks))
 
@@ -61,6 +78,7 @@ def dumped(document: object) -> str:
     return json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
+@linux_fixture
 class LocalCliCase(unittest.TestCase):
     """本机命令的公共夹具：临时状态根、替身发现与调用者、worker 不真起；不含用例。"""
 
@@ -127,7 +145,7 @@ class SinceAndMatchTests(unittest.TestCase):
         # 日期取本机时区当天 0 点（与 datetime 本地解释同口径）
         self.assertEqual(parse_since("2026-11-13", now), datetime.datetime(2026, 11, 13).timestamp())
 
-    @unittest.skipUnless(hasattr(time, "tzset"), "需要 time.tzset 固定时区")
+    @unittest.skipUnless(hasattr(time, "tzset"), TZSET_REASON)
     def test_date_form_is_local_midnight_even_when_the_runner_is_utc(self) -> None:
         # 显式设成 UTC+8（POSIX 写法，不依赖 tzdata）：CI 跑在 UTC 时也能抓住「按 UTC 解释日期」的错误
         try:
@@ -660,18 +678,30 @@ class FederatedDecisionJsonTests(FedCliCase):
 
 class LocalHitDecisionTests(FedCliCase):
     def test_local_task_decisions_never_open_the_federation_store(self) -> None:
-        # §88.7：本机任务命中时，决定类命令（含 --json）不经联邦库；只看命令本身，不算命令后补拉 worker 的联邦判断
+        # §88.7/§94.2：本机任务命中时，决定类命令（含 --json）本身不经联邦库；命令后补拉 worker 的联邦判断与
+        # 命令结束时的摘要刷新（§45.14 的可重建投影，会开联邦库）都不算命令本身，守卫期间置空
         with patch.object(cli, "worker_running", return_value=True):
             code, out, err = self.run_on("vm", "send", "--to", "codex@review", "-m", "本机任务", "--no-wait", "--json",
                                          caller=fed_agent(ORIGIN))
         self.assertEqual(code, 0, err)
         task_id = json.loads(out)["id"]
+        # 对照：摘要刷新照常时，开联邦库的是它（所以守卫要把它置空，而不是按次数相减）
+        with patch.object(cli, "_federation_needs_worker", return_value=False), \
+                patch.object(FederatedStore, "open", wraps=FederatedStore.open) as fed_open, \
+                patch.object(summary, "open_federation", wraps=summary.open_federation) as projected:
+            self.assertEqual(self.run_on("vm", "pause", task_id, caller=FED_USER)[0], 0)
+            self.assertEqual(self.run_on("vm", "resume", task_id, caller=FED_USER)[0], 0)
+        self.assertTrue(projected.call_count)
+        self.assertEqual(fed_open.call_count, projected.call_count)
         steps = [("pause", task_id), ("resume", task_id), ("cancel", task_id), ("retry", task_id),
                  ("accept", task_id, "--force"), ("close", task_id)]
         with patch.object(cli, "_federation_needs_worker", return_value=False), \
+                patch.object(cli, "_refresh_summary", return_value=None), \
                 patch.object(fed_commands, "try_runtime", wraps=fed_commands.try_runtime) as probe, \
                 patch.object(fed_commands, "open_runtime", wraps=fed_commands.open_runtime) as opened, \
-                patch.object(fed_commands, "find_task", wraps=fed_commands.find_task) as resolved:
+                patch.object(fed_commands, "find_task", wraps=fed_commands.find_task) as resolved, \
+                patch.object(FederatedStore, "open", wraps=FederatedStore.open) as fed_open, \
+                patch.object(FederatedStore, "open_readonly", wraps=FederatedStore.open_readonly) as fed_readonly:
             for step in steps:
                 for extra in ((), ("--json",)) if step[0] == "pause" else ((),):
                     with self.subTest(step=step, extra=extra):
@@ -680,7 +710,9 @@ class LocalHitDecisionTests(FedCliCase):
                 if step[0] == "pause":
                     self.assertEqual(self.run_on("vm", "resume", task_id, caller=FED_USER)[0], 0)
                     self.assertEqual(self.run_on("vm", "pause", task_id, caller=FED_USER)[0], 0)
-        self.assertEqual((probe.call_count, opened.call_count, resolved.call_count), (0, 0, 0))
+        # 命令本身开联邦库的全部入口严格 0 次（r1 两方 P3-1：不能用「等于摘要刷新次数」，命令内经摘要入口开库会被抵消）
+        self.assertEqual((probe.call_count, opened.call_count, resolved.call_count, fed_open.call_count,
+                          fed_readonly.call_count), (0, 0, 0, 0, 0))
 
 
 class WindowsTaskFilterTests(unittest.TestCase):
@@ -735,6 +767,100 @@ class WindowsTaskFilterTests(unittest.TestCase):
                     with self.subTest(argv=argv), redirect_stdout(StringIO()), redirect_stderr(err):
                         self.assertEqual(cli.main(argv), cli.EXIT_TARGET)
                     self.assertEqual("目标未发送" in err.getvalue(), hinted, err.getvalue())
+
+
+def _windows_cli(*argv: str) -> tuple[int, str, str]:
+    """在调用方已设好的假 Windows 平台上跑真实 cli.main；worker 一律不真起（不派生进程、不连 daemon）。"""
+    out, err = StringIO(), StringIO()
+    with patch("os.getpid", return_value=100), patch.object(cli, "_start_worker", return_value=False), \
+            patch.object(cli, "_ensure_worker", return_value=False), patch.object(cli, "_worker_up", return_value=False), \
+            redirect_stdout(out), redirect_stderr(err):
+        code = cli.main(list(argv))
+    return code, out.getvalue(), err.getvalue()
+
+
+def _create(store: Store, title: str, *, target: EndpointRef, origin: EndpointRef | None = None,
+            reviewer: EndpointRef | None = None) -> str:
+    task, _ = store.create_task(title=title, flow=Flow.REVIEW if reviewer else Flow.HANDOFF, origin=origin,
+                                origin_class=None, reviewer=reviewer, target=target, body="fixture", refs=[], now=1000.0)
+    return task.id
+
+
+class WindowsCodexCallerFilterTests(unittest.TestCase):
+    """§94.3 第 1 条：Windows 上认得出的 Codex 调用方跑 tasks --mine；名字形 --to 经 Windows 发现解析成功与失败。
+
+    夹具借用 Windows 发现与调用方用例（假 Win32 内核 + 合成 daemon 与 SQL），不派生进程、不连真实 daemon。
+    """
+
+    setUp = windows_discovery.DiscoveryTests.setUp
+    rebuild = windows_discovery.DiscoveryTests.rebuild
+    scope = windows_discovery.DiscoveryTests.scope
+    sql = windows_discovery.DiscoveryTests.sql
+    chain = windows_callers.CallerTests.chain
+
+    def ledger(self) -> dict[str, str]:
+        """三条任务：本会话发起、本会话是执行目标、与本会话无关（别的 Codex 会话发给 Claude）。"""
+        me = EndpointRef(Provider.CODEX, uuid(1), 200, "win-filetime:134362090000012230")
+        peer = EndpointRef(Provider.CODEX, uuid(2), 200, "win-filetime:134362090000012230")
+        claude = EndpointRef(Provider.CLAUDE, REVIEW_ID, 300, "win-filetime:1")
+        with self.scope(), Store.open(self.state) as store:
+            return {"origin": _create(store, "本会话发起", origin=me, target=peer),
+                    "target": _create(store, "交给本会话", target=me),
+                    "other": _create(store, "无关", origin=peer, target=claude)}
+
+    def run_cli(self, *argv: str, environ: dict[str, str] | None = None) -> tuple[int, str, str]:
+        with self.scope(), patch.dict(os.environ, environ or {}):
+            return _windows_cli(*argv)
+
+    def test_recognized_codex_caller_mine_lists_only_its_own_tasks(self) -> None:
+        tasks = self.ledger()
+        code, out, err = self.run_cli("tasks", "--mine", "--json", environ=self.chain())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(item["id"] for item in json.loads(out)["tasks"]), sorted([tasks["origin"], tasks["target"]]))
+        # 同一条进程链但没有 Codex 会话变量：认不出会话，--mine 拒绝而不是返回全部或空列表
+        code, out, err = self.run_cli("tasks", "--mine")
+        self.assertEqual((code, out), (cli.EXIT_REJECTED, ""))
+        self.assertIn("[mine_requires_session]", err)
+
+    def test_name_form_to_resolves_through_windows_discovery(self) -> None:
+        tasks = self.ledger()
+        path = self.sql([(uuid(1), "cli")])
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("UPDATE threads SET name=? WHERE id=?", ("impl", uuid(1)))
+        code, out, err = self.run_cli("tasks", "--to", "codex@impl", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([item["id"] for item in json.loads(out)["tasks"]], [tasks["target"]])
+        # 解析失败照 send 报错与退出码，不能当成「没有符合条件的任务」
+        code, out, err = self.run_cli("tasks", "--to", "codex@nobody")
+        self.assertEqual((code, out), (cli.EXIT_TARGET, ""))
+        self.assertIn("[target_not_found]", err)
+
+
+class WindowsClaudeCallerFilterTests(unittest.TestCase):
+    """§94.3 第 1 条：Windows 上认得出的 Claude 调用方跑 tasks --mine（假 Win32 内核 + 私有注册表，不读 key、不连管道）。"""
+
+    setUp = windows_claude.NativeTests.setUp
+    write = windows_claude.NativeTests.write
+
+    def test_recognized_claude_caller_mine_lists_only_its_own_tasks(self) -> None:
+        me = EndpointRef(Provider.CLAUDE, windows_claude.UUID, 200, "win-filetime:" + windows_claude.BIRTH)
+        codex = EndpointRef(Provider.CODEX, uuid(1), 400, "win-filetime:1")
+        other = EndpointRef(Provider.CODEX, uuid(2), 400, "win-filetime:1")
+        state = self.root / "state"
+        with patch.dict(os.environ, {"AB_STATE_DIR": str(state)}), \
+                patch.object(windows_commands, "sample", return_value=windows_commands.Discovery()):
+            with Store.open(state) as store:
+                tasks = {"origin": _create(store, "本会话发起", origin=me, target=codex),
+                         "review": _create(store, "本会话复核", origin=codex, reviewer=me, target=other),
+                         "target": _create(store, "交给本会话", origin=codex, target=me),
+                         "other": _create(store, "无关", origin=codex, target=other)}
+            code, out, err = _windows_cli("tasks", "--mine", "--json")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(sorted(item["id"] for item in json.loads(out)["tasks"]),
+                             sorted([tasks["origin"], tasks["review"], tasks["target"]]))
+            code, out, err = _windows_cli("tasks", "--to", "claude@fixture-peer", "--json")  # 注册表原生名
+            self.assertEqual(code, 0, err)
+            self.assertEqual([item["id"] for item in json.loads(out)["tasks"]], [tasks["target"]])
 
 
 if __name__ == "__main__":
