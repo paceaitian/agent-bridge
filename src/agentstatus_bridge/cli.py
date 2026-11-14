@@ -278,7 +278,8 @@ def _observations() -> tuple[list[Endpoint], ObserverView]:
 
 
 def cmd_peers(args: argparse.Namespace) -> int:
-    if args.device or (args.all_devices and get_platform().name == "windows"):
+    # Windows 的不带参数与 --all-devices 都在 _run_command 的 Windows 分支里处理（§94.6），到不了这里
+    if args.device:
         return _fed_peers(args)
     endpoints = discover()
     caller = identify_caller(endpoints)
@@ -332,6 +333,52 @@ def cmd_peers(args: argparse.Namespace) -> int:
         print(f"{book.text(item.ref)}{target}  {RUNTIME_LABELS[item.runtime]}{mode}{extra}{mark}")
     if args.all_devices:
         _fed_all_devices_text()
+    return EXIT_OK
+
+
+def _windows_local_peers(*, as_json: bool) -> dict[str, object] | None:
+    """Windows 本机 peers（§94.6）：Codex 候选与 Claude 原生 peer 两部分，不带参数的 peers 与 --all-devices 共用。
+
+    as_json 为真时只返回文档（与 `ab peers --json` 同形，调用方决定是否再加 devices 后打印）；否则直接打印文字行。
+    只读：不开本机账本、不走通用补查。
+    """
+    from .platforms.windows import codex_discovery  # layout: allow Windows只读候选，Linux路径与构造不加载
+    from .platforms.windows.local_transport import WindowsPlatform  # layout: allow 已选择后端的窄能力
+    from .platforms.windows.commands import claude_evidence  # layout: allow W3 read-only registry candidates
+    backend = get_platform().transport
+    result = codex_discovery.discover(backend) if isinstance(backend, WindowsPlatform) else codex_discovery.Discovery()
+    peers = claude_evidence()
+    if as_json:
+        document = result.document()
+        existing = document.get('peers')
+        document['peers'] = (existing if isinstance(existing, list) else []) + peers.document()
+        document['claudeDiscovery'] = {'complete': peers.complete, 'reason': peers.reason}
+        return document
+    codex_discovery.print_peers(result)
+    print('Windows Claude 原生 peer：' + ('发现完整' if peers.complete else reason_text(peers.reason)))
+    names = NameBook.of((*peers.endpoints, *peers.duplicates))
+    for endpoint in (*peers.endpoints, *peers.duplicates):
+        # 人读名字走本轮 NameView（未核实只作「名称=…（仅展示）」，转义由投影负责）；target 一律完整 ID
+        issues = '；'.join(reason_text('target_' + issue) for issue in endpoint.issues)
+        print(names.text(endpoint.ref) + '  target=claude@id:' + endpoint.ref.native_id
+              + '  [root] 状态未知' + ('  ' + issues if issues else ''))
+    return None
+
+
+def _windows_peers(args: argparse.Namespace) -> int:
+    """Windows `ab peers` 与 `--all-devices`（§94.6）：--all-devices 先列本机一节再列远端，JSON 与 Linux 同构。"""
+    if args.json:
+        document = _windows_local_peers(as_json=True) or {}
+        if args.all_devices:
+            document['devices'] = _fed_all_devices()
+        _print_json(document)
+    else:
+        if args.all_devices:
+            print(f"设备 {device_name()}（本机）：")
+        _windows_local_peers(as_json=False)
+        if args.all_devices:
+            _fed_all_devices_text()
+    _revive_for_federation()  # 这个入口不开本机账本、不走通用补查：只按联邦待办补拉（Codex r3-P2-02）
     return EXIT_OK
 
 
@@ -2248,30 +2295,8 @@ def _run_command(args: argparse.Namespace) -> int:
             return error.exit_code
     if get_platform().name == 'windows':
         # main's Windows scope has already checked capability and attribution.
-        if args.command == 'peers' and not (args.device or args.all_devices):
-            from .platforms.windows import codex_discovery  # layout: allow Windows只读候选，Linux路径与构造不加载
-            from .platforms.windows.local_transport import WindowsPlatform  # layout: allow 已选择后端的窄能力
-            backend = get_platform().transport
-            result = codex_discovery.discover(backend) if isinstance(backend, WindowsPlatform) else codex_discovery.Discovery()
-            from .platforms.windows.commands import claude_evidence  # layout: allow W3 read-only registry candidates
-            peers = claude_evidence()
-            if args.json:
-                document = result.document()
-                existing = document.get('peers')
-                document['peers'] = (existing if isinstance(existing, list) else []) + peers.document()
-                document['claudeDiscovery'] = {'complete': peers.complete, 'reason': peers.reason}
-                _print_json(document)
-            else:
-                codex_discovery.print_peers(result)
-                print('Windows Claude 原生 peer：' + ('发现完整' if peers.complete else reason_text(peers.reason)))
-                names = NameBook.of((*peers.endpoints, *peers.duplicates))
-                for endpoint in (*peers.endpoints, *peers.duplicates):
-                    # 人读名字走本轮 NameView（未核实只作「名称=…（仅展示）」，转义由投影负责）；target 一律完整 ID
-                    issues = '；'.join(reason_text('target_' + issue) for issue in endpoint.issues)
-                    print(names.text(endpoint.ref) + '  target=claude@id:' + endpoint.ref.native_id
-                          + '  [root] 状态未知' + ('  ' + issues if issues else ''))
-            _revive_for_federation()  # 这个入口不开本机账本、不走通用补查：只按联邦待办补拉（Codex r3-P2-02）
-            return EXIT_OK
+        if args.command == 'peers' and not args.device:
+            return _windows_peers(args)  # 不带参数与 --all-devices：本机列表共用一个函数（§94.6）
     # 任一调用前后补查摘要：提交后未发布（进程被杀、锁超时）的窗口由下一次调用收敛；worker 与 summary 自行处理。
     # federation status/relay 前后都不补（DESIGN §90.6）：status 是维护判停的只读查询，不连主账本、不写摘要、不拉 worker；
     # relay 启动取锁与退出清理不被主账本争用拖住

@@ -13,7 +13,7 @@
     "src/agentstatus_bridge/__main__.py": "83da1011be1d566881bd959ac43e7f8385c0c0889618706cece275c120acd6e4",
     "src/agentstatus_bridge/caller_diagnostic.py": "684f40547dd0f45c94fe2aafa0ba1f2fa357719f4923b17b1c51fb5a0cca0028",
     "src/agentstatus_bridge/caller_values.py": "0cff7e950c938abd96ab80b0129fb0e360d1f4cafa241b44a031f22a2b85d199",
-    "src/agentstatus_bridge/cli.py": "856c70854047313d026b4e4a155440d8dc690e141da9d1b06fb5232da66cc6da",
+    "src/agentstatus_bridge/cli.py": "e1e374b04eb127a97d3212871435c10e72d539d19e14e4aed0ce3094ce656943",
     "src/agentstatus_bridge/closure.py": "d60f69e2140037bb59c59d1067b9b9c1d706a16ef274aa5e1617bf9d45d3ea63",
     "src/agentstatus_bridge/codex_argv.py": "1ad12422eb2d564fb621bebe86a65e25592f69d77179657db9f81060e0bb396b",
     "src/agentstatus_bridge/codex_metadata.py": "15edfc2872533fb3ec275983d0a2cf6ba5209767daa31143a95c1014a491d6f9",
@@ -153,7 +153,7 @@
     "tests/test_bridge_endpoints.py": "0e6eecf6330cc281216e4ae366c6918da58c6bebb6980892c3c5f891b905d3d2",
     "tests/test_bridge_federation_attachments.py": "0862f919556ab8d28e63e47850a903b4a5bccf956fd6b13f05958dcef07090fb",
     "tests/test_bridge_federation_budget.py": "18a87587164a6328fadb66460997e51c08cc8b22260c57d3d70648cd15f19a75",
-    "tests/test_bridge_federation_cli.py": "62b06563b746faee4fa6663346328dbea88aeb88dc06881635fbd7b521afb79b",
+    "tests/test_bridge_federation_cli.py": "75533c85387359a38ef2ea27d70e7b1e77e8c1b122e00e056225bbfdab7baec5",
     "tests/test_bridge_federation_codec.py": "3923b45813fb8ff86035d1b22fb354c6c0e614486b550a0ae2fb753be9cc635e",
     "tests/test_bridge_federation_crash.py": "509967d7f2883c4bc206104d0d0ca391de8dcd04dcee36474711b970be5b7d81",
     "tests/test_bridge_federation_delivery.py": "c213b3f525e31cbf454228c9bb141ccbe82d4bcde8831cc2315089f55c3d2796",
@@ -202,7 +202,7 @@
     "tests/test_bridge_windows_claude_rework.py": "ef60672122bb1a6004c2f161d2b2e6fae2da664f1f9d32699e3eb699fc2a1ac4",
     "tests/test_bridge_windows_codex.py": "5b3f07a7afbdbc5d6ef90333e49e6f10b0e55a9ee8f868ffb2968156221bf6e6",
     "tests/test_bridge_windows_delivery.py": "4f63a1a6fe66d48e8b86ae4605e86f12438ec3e8da22efbefcefa48be3cb4f4f",
-    "tests/test_bridge_windows_discovery.py": "fdf09da07c93239e6421282d147ded2d566f4c9536c9e34fea5eea136bee567f",
+    "tests/test_bridge_windows_discovery.py": "d37361ebb025826446c51f7c2d5f1114f1bfb22dcbfb57c09ac79a02063ff8c0",
     "tests/test_bridge_windows_light.py": "bc856fc52b57b77f3739bdcbc8c2097315c97fa3df6d2a16094dadaddd437609",
     "tests/test_bridge_windows_native.py": "84cbbefec1e50308d8f73f54e716b785afaf5c2d3e168843cbaf703ba4a74d97",
     "tests/test_bridge_windows_process_role.py": "1c3da9715805c5d2bc25efc4c5836d702ba4bd728d1e2f07b72532b73a34ccea",
@@ -216,7 +216,7 @@
     "tests/test_bridge_worker.py": "bb2dfa8ed234c0e9043adce329dc5b0f5ef73906426e2127f1cc90d41a448eee"
   },
   "source": {
-    "commit": "2e49d4e16a6b09ee4c0a829946958c9b08a1f3b7",
+    "commit": "9a2ac629bce1c3210a696d8c5a4b984d2e09f751",
     "repository": "agentstatus"
   }
 }

@@ -1,5 +1,5 @@
 """W2-2 real WS+SQLite on SDK Fake Win32. No real provider or private home."""
-from contextlib import closing, contextmanager, redirect_stdout, redirect_stderr
+from contextlib import ExitStack, closing, contextmanager, redirect_stdout, redirect_stderr
 from dataclasses import replace
 import io
 import json
@@ -568,6 +568,112 @@ class DiscoveryTests(unittest.TestCase):
                 with redirect_stderr(io.StringIO()):
                     self.assertEqual(cli.main(['send','--to',uuid(1),'--file','does-not-exist','--title','fixture','--no-wait']),3)
                 self.assertFalse(self.state.exists())
+
+
+class AllDevicesPeersTests(unittest.TestCase):
+    """§94.6：Windows `ab peers --all-devices` 先列本机一节（与不带参数的 peers 同一份列表）再列远端，JSON 与 Linux 同构。
+
+    假 Win32 内核 + 合成 daemon/SQL 的真实 Codex 发现；Claude 原生 peer 用合成的发现结果；远端部分替换成固定输出，
+    未启用联邦的情形走真实 _fed_all_devices(_text)。argv 经真实解析器。
+    """
+    setUp = DiscoveryTests.setUp
+    rebuild = DiscoveryTests.rebuild
+    scope = DiscoveryTests.scope
+    sql = DiscoveryTests.sql
+    CLAUDE = '0000000c-cccc-4ccc-8ccc-00000000000c'
+    REMOTE_LINE = '设备 win2〔bbbbbbbb〕：在线，目录完整'
+
+    def claude(self):
+        from agentstatus_bridge.model import Endpoint, EndpointRef, NameView
+        from agentstatus_bridge.native_names import name_source
+        from agentstatus_bridge.platforms.windows import claude_discovery
+        lead = Endpoint(EndpointRef(Provider.CLAUDE, self.CLAUDE, 300, 'win-filetime:1', label='lead', data_root='c'*64),
+                        name='lead', name_source=name_source('lead'),
+                        name_view=NameView(Provider.CLAUDE, self.CLAUDE, 'lead', 'lead', True, self.CLAUDE[:8]))
+        return claude_discovery.Discovery((lead,), True, 'complete')
+
+    def run_peers(self, *argv, remote=True):
+        from agentstatus_bridge.platforms.windows import commands
+        out = io.StringIO()
+        patches = [patch.object(commands, 'claude_evidence', return_value=self.claude()),
+                   patch.object(cli, '_refresh_summary', side_effect=AssertionError('no state writes')),
+                   patch.object(cli, '_revive_for_federation')]
+        if remote:
+            patches += [patch.object(cli, '_fed_all_devices_text', side_effect=lambda: print(self.REMOTE_LINE)),
+                        patch.object(cli, '_fed_all_devices', return_value=[{'device': 'win2', 'peers': []}])]
+        with self.scope(), patch.dict(os.environ, {'AB_DEVICE': 'winbox'}), ExitStack() as stack, redirect_stdout(out):
+            mocks = [stack.enter_context(item) for item in patches]
+            self.assertEqual(cli.main(['peers', *argv]), 0)
+        self.assertEqual(mocks[2].call_count, 1)  # 本机列表之后照旧按联邦待办补拉
+        self.assertFalse(self.state.exists())  # 只读：不建本机账本
+        return out.getvalue()
+
+    def legacy_text(self):
+        """§94.6 之前 Windows peers 分支的文字输出，逐行照抄作对照：不带参数的输出必须与它逐字节相同。"""
+        from agentstatus_bridge.native_names import NameBook
+        from agentstatus_bridge.labels import reason_text
+        out = io.StringIO()
+        with self.scope(), redirect_stdout(out):
+            result, peers = D.discover(self.p.transport), self.claude()
+            D.print_peers(result)
+            print('Windows Claude 原生 peer：' + ('发现完整' if peers.complete else reason_text(peers.reason)))
+            names = NameBook.of((*peers.endpoints, *peers.duplicates))
+            for endpoint in (*peers.endpoints, *peers.duplicates):
+                issues = '；'.join(reason_text('target_' + issue) for issue in endpoint.issues)
+                print(names.text(endpoint.ref) + '  target=claude@id:' + endpoint.ref.native_id
+                      + '  [root] 状态未知' + ('  ' + issues if issues else ''))
+        return out.getvalue()
+
+    def legacy_document(self):
+        with self.scope():
+            document = D.discover(self.p.transport).document()
+        peers = self.claude()
+        document['peers'] = list(document['peers']) + peers.document()
+        document['claudeDiscovery'] = {'complete': peers.complete, 'reason': peers.reason}
+        return json.loads(json.dumps(document))
+
+    def test_plain_peers_output_is_byte_for_byte_unchanged(self):
+        self.assertEqual(self.run_peers(), self.legacy_text())
+        # JSON 也比原始字节：旧分支经 _print_json 打印（排序、两格缩进、不转义中文、结尾换行），不只比结构
+        self.assertEqual(self.run_peers('--json'),
+                         json.dumps(self.legacy_document(), ensure_ascii=False, indent=2, sort_keys=True) + '\n')
+
+    def test_all_devices_text_lists_the_local_section_before_remote_devices(self):
+        local = self.run_peers()
+        text = self.run_peers('--all-devices')
+        self.assertEqual(text, '设备 winbox（本机）：\n' + local + self.REMOTE_LINE + '\n')
+        self.assertIn('target=codex@id:' + uuid(1), local)  # 本机 Codex 候选
+        self.assertIn('claude@lead〔' + self.CLAUDE[:8] + '〕  target=claude@id:' + self.CLAUDE, local)  # 本机 Claude peer
+        self.assertLess(text.index('（本机）'), text.index('claude@id:' + self.CLAUDE))
+        self.assertLess(text.index('claude@id:' + self.CLAUDE), text.index(self.REMOTE_LINE))
+
+    def test_all_devices_json_is_the_local_document_plus_devices(self):
+        document = json.loads(self.run_peers('--all-devices', '--json'))
+        self.assertEqual(document, {**json.loads(self.run_peers('--json')), 'devices': [{'device': 'win2', 'peers': []}]})
+        self.assertEqual({row['provider'] for row in document['peers']}, {'codex', 'claude'})
+
+    def test_device_flag_still_lists_only_that_remote_device(self):
+        # §94.6「--device B 不变（只看 B）」：Windows 上照旧经 _fed_peers，不出本机标题与本机行（Fable 946 P2-1）
+        from agentstatus_bridge.platforms.windows import commands
+        out = io.StringIO()
+        with self.scope(), patch.dict(os.environ, {'AB_DEVICE': 'winbox'}), \
+                patch.object(commands, 'claude_evidence', return_value=self.claude()), \
+                patch.object(cli, '_refresh_summary', return_value=None), \
+                patch.object(cli, '_fed_peers', side_effect=lambda _args: print(self.REMOTE_LINE) or 0) as remote, \
+                redirect_stdout(out):
+            self.assertEqual(cli.main(['peers', '--device', 'win2']), 0)
+        self.assertEqual(remote.call_count, 1)
+        self.assertEqual(remote.call_args.args[0].device, 'win2')
+        self.assertEqual(out.getvalue(), self.REMOTE_LINE + '\n')
+        self.assertNotIn('（本机）', out.getvalue())
+        self.assertNotIn(uuid(1), out.getvalue())
+        self.assertNotIn(self.CLAUDE, out.getvalue())
+
+    def test_without_federation_only_the_local_section_is_listed(self):
+        local = self.run_peers(remote=False)
+        self.assertEqual(self.run_peers('--all-devices', remote=False), '设备 winbox（本机）：\n' + local)
+        document = json.loads(self.run_peers('--all-devices', '--json', remote=False))
+        self.assertEqual(document, {**json.loads(self.run_peers('--json', remote=False)), 'devices': []})
 
 
 if __name__=='__main__': unittest.main()

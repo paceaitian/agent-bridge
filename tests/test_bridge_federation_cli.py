@@ -981,6 +981,21 @@ class ListingTests(FedCliCase):
         self.assertIn("（本机）", out)
         self.assertIn("设备 win", out)
 
+    def test_linux_all_devices_is_the_local_list_then_remote_lines(self) -> None:
+        # §94.6 回归：Linux 输出不变——本机标题、与不带参数 peers 逐字节相同的本机列表、远端设备行；
+        # JSON 是不带参数 peers --json 的文档再加 devices（Windows 按这个形状补齐）
+        with patch.dict(os.environ, {"AB_DEVICE": "vmbox"}):
+            plain = self.run_on("vm", "peers")[1]
+            text = self.run_on("vm", "peers", "--all-devices")[1]
+            plain_document = json.loads(self.run_on("vm", "peers", "--json")[1])
+            document = json.loads(self.run_on("vm", "peers", "--all-devices", "--json")[1])
+        with self.store("vm") as store:
+            remote = directory.peer_lines(store, None, now=now_ms())
+            devices = directory.peer_devices(store, None, now=now_ms())
+        self.assertTrue(plain_document["peers"] and remote)
+        self.assertEqual(text, "设备 vmbox（本机）：\n" + plain + "".join(line + "\n" for line in remote))
+        self.assertEqual(document, {**plain_document, "devices": json.loads(json.dumps(devices))})
+
     def test_tasks_merges_federation_and_survives_unreadable_federation_store(self) -> None:
         task_id = self.send()
         code, out, err = self.run_on("vm", "tasks")
