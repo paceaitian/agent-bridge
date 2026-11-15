@@ -303,6 +303,17 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(outcome.detail['senderClass'], 'unknown')
         boundary.assert_called_once()
 
+    def test_a_status_change_after_discovery_does_not_block_delivery(self):
+        # §96.3：忙闲只用于显示。发现时注册信息是 idle，投递前复核时已变成 busy：端点 runtime 不同，消息照常写出
+        self.write('200.json', {**self.record, 'status': 'idle'})
+        with self.sending() as (transport, endpoint, context, writes, boundary):
+            self.assertEqual(endpoint.runtime.value, 'idle')
+            self.write('200.json', {**self.record, 'status': 'busy'})
+            outcome = transport.deliver(endpoint, 'fixture', context)
+        self.assertIs(outcome.delivery, Delivery.WRITTEN)
+        self.assertEqual(len(writes), 2)
+        boundary.assert_called_once()
+
     def test_partial_or_failed_message_is_unknown_and_never_resent(self):
         for options in ({'failure': True}, {'short': True}):
             with self.sending(**options) as (transport, endpoint, context, writes, boundary):

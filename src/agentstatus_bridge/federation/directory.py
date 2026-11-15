@@ -2,7 +2,8 @@
 
 endpointId 由所属设备按 (provider, nativeId, 本机根绑定) 持久分配：同根恢复更新 revision 不换 ID，换根换新 ID。
 根摘要只留本机，不发网络。目录只公开 provider/完整 ID/绑定标识/名字/收件能力/eligible/namesVerified 与 provider
-完整性，不发 cwd、PID、进程路径、pipe/key、transcript；超预算标 complete=false，不截断后谎称完整。
+完整性，以及可选的工作目录末段 workdir（§95.3，与名字共用 publish_names）；不发完整 cwd、PID、进程路径、pipe/key、
+transcript；超预算标 complete=false，不截断后谎称完整（workdir 是附加信息，超预算时先静默去掉，不改完整性）。
 
 名字（§91.4.1）：每行最多一个原生主名，只取端点携带的本轮 NameView（name 是可复制主名、displayName 是转义展示名、
 namesVerified 是主名已核实）；不回退 Endpoint.name、tmux 会话名、pane 或 Windows alias。快照带 namePolicy。
@@ -19,7 +20,8 @@ from typing import Any
 
 from ..endpoints import ADAPTERS, Endpoint
 from ..model import EndpointRef, Provider
-from ..native_names import TARGET_ID_UNVERIFIED, TARGET_PROVIDER_REQUIRED, SelectorError, id_prefixes, parse_selector
+from ..native_names import (TARGET_ID_UNVERIFIED, TARGET_PROVIDER_REQUIRED, SelectorError, id_prefixes, parse_selector,
+                            remote_workdir, workdir_suffix, workdir_text)
 from ..paths import claude_sessions_dirs, codex_home, grok_home
 from ..platforms.factory import get_platform
 from .codec import canonical_bytes
@@ -34,6 +36,8 @@ FRESH_MS = 90_000
 # last_seen 是 hub 的时刻、now 是本机时刻：hub 钟略快会算出小的负年龄。owner 2026-11-12 定容忍 5 秒（§91.9 D-B）
 CLOCK_SKEW_MS = 5_000
 NAME_POLICY = "agent-native-v1"
+# 本版对端能处理的可选能力，随目录快照发布（可选键 features）；发起方据此决定能不能发跨设备告知（§95.5.7）
+FEATURES: tuple[str, ...] = ("fyi",)
 
 
 class DirectoryError(Exception):
@@ -109,6 +113,9 @@ def snapshot(store: FederatedStore, device_id: str, endpoints: Iterable[Endpoint
 
     名字的证明与否证已在发现时对全集算好（NameView），这里只投影：先对全集定名，再按预算降级，不先裁冲突证据。
     单行超限时先丢名字（降为纯 ID、namesVerified=false）保住身份，并标快照不完整；名字本身超过 120 字符也只丢名字。
+    工作目录末段 workdir（§95.3）与名字共用 publish_names；单行或整份超限时都先静默去掉 workdir（不改 reason、
+    complete），仍超才走原有降级。顶层能力表 features（§95.5.7）最后才丢：整份超限的顺序是 workdir → 端点行
+    （标 snapshot_too_large）→ features；它只有几十字节，丢了跨设备告知就发不出去，所以排在掉行之后。
 
     完整性分两层（§94.1）：provider_complete 是各 provider 本轮来源是否看全，ids_complete 是身份全集里有没有
     认不出、又不能排除是根会话的端点（缺省或缺键视为完整）。providers[p] 取两者之与，只拒该 provider 的名字与
@@ -133,6 +140,11 @@ def snapshot(store: FederatedStore, device_id: str, endpoints: Iterable[Endpoint
             row.update(name=view.name, namesVerified=view.verified)
         if view is not None and view.display_name:
             row["displayName"] = view.display_name  # display_text 已转义并限 120 字符
+        workdir = workdir_text(endpoint.workdir) if publish_names else None
+        if workdir is not None:
+            row["workdir"] = workdir  # 与 displayName 同样转义、限 120 字符
+            if len(canonical_bytes(row)) > MAX_ENDPOINT_BYTES:
+                del row["workdir"]  # 附加信息：先静默去掉，不改 reason/complete
         if len(canonical_bytes(row)) > MAX_ENDPOINT_BYTES:
             for key in ("name", "displayName"):
                 row.pop(key, None)
@@ -149,13 +161,30 @@ def snapshot(store: FederatedStore, device_id: str, endpoints: Iterable[Endpoint
     providers = {key: value and bool(identities.get(key, True)) for key, value in sources.items()}
     complete = reason is None and all(sources.values())
     document: dict[str, Any] = {"endpoints": rows, "complete": complete, "providers": providers,
-                                "namePolicy": NAME_POLICY}
+                                "namePolicy": NAME_POLICY, "features": list(FEATURES)}
     if reason is not None:
         document["reason"] = reason
+    if len(canonical_bytes(document)) > MAX_SNAPSHOT_BYTES:
+        for row in rows:
+            row.pop("workdir", None)  # 整份超限也先去掉全部 workdir 再量，不因附加信息掉行或改完整性
     while len(canonical_bytes(document)) > MAX_SNAPSHOT_BYTES and rows:
         rows.pop()
         document.update(complete=False, reason="snapshot_too_large")
+    if len(canonical_bytes(document)) > MAX_SNAPSHOT_BYTES:
+        document.pop("features", None)  # 行已掉光仍超限：最后才丢能力表（对端按不支持处理，只是拒发告知）
     return document
+
+
+def device_features(store: FederatedStore, device_id: str) -> frozenset[str]:
+    """缓存目录里该设备声明的能力（可选键 features）；旧版本不发这个键，按空集（DESIGN §95.5.7）。"""
+    for row in store.device_states():
+        if row["device_id"] != device_id:
+            continue
+        snapshot_data = row["snapshot"] if isinstance(row.get("snapshot"), dict) else {}
+        raw = snapshot_data.get("features")
+        if isinstance(raw, list):
+            return frozenset(item for item in raw if isinstance(item, str))  # pyright: ignore[reportUnknownVariableType]
+    return frozenset()
 
 
 # ---- 远端解析 ----
@@ -277,6 +306,8 @@ def peer_devices(store: FederatedStore, device_reference: str | None, *, now: in
                 "remoteRef": {"deviceId": row["device_id"], "provider": provider, "nativeId": native,
                               "endpointId": item.get("endpointId"), "endpointRevision": item.get("endpointRevision")},
                 "name": item.get("name"), "displayName": item.get("displayName"),
+                # §95.3 新键：只认字符串，去掉控制/格式字符并限长后才输出（旧字段维持 §94.5 登记，不在这里改）
+                "workdir": remote_workdir(item.get("workdir")),
                 "inbox": item.get("inbox", True) is not False,
                 "eligible": item.get("eligible", True) is not False, "namesVerified": item.get("namesVerified") is True,
                 "target": f"--device {reference} --to {provider}@id:{native}",
@@ -345,12 +376,15 @@ def peer_lines(store: FederatedStore, device_reference: str | None, *, now: int)
             short_id = shown_ids.get((str(ref["provider"]), str(ref["nativeId"])), str(ref["nativeId"]))
             if peer["namesVerified"] and isinstance(peer["name"], str):
                 shown = f"{ref['provider']}@{peer['name']}〔{short_id}〕"
+                name = peer["name"]
             else:
                 display = peer["displayName"] or peer["name"]
                 shown = f"{ref['provider']}@id:{short_id}" + (f" 名称={display}（仅展示）" if display else "")
+                name = display
             flags = [] if peer["inbox"] else ["只读"]
             if not peer["eligible"]:
                 flags.append("暂不可投")
             suffix = f"  （{'、'.join(flags)}）" if flags else ""
-            lines.append(f"  {shown} device={where} target={peer['target']}{suffix}")
+            workdir = workdir_suffix(peer["workdir"], name if isinstance(name, str) else None)
+            lines.append(f"  {shown} device={where} target={peer['target']}{suffix}{workdir}")
     return lines

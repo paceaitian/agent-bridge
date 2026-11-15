@@ -35,6 +35,9 @@ class DeliveryContext:
     # 通道不认识的取值一律回落到通道自己的默认，不让上层写错把消息打成中断。
     priority: str | None = None
     before_send: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    # 只有任务内补充消息（note）置 True：Codex 通道在对方有进行中的一轮时先 turn/steer，否则照常排队（DESIGN §95.5.4）。
+    # 不从 priority 推断：结果通知、提醒、结束回执同样是 next，但本轮不走 steer
+    steer: bool = False
 
 
 class Transport(Protocol):

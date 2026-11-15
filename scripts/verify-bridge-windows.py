@@ -8,6 +8,9 @@ model and protocol codec run here; tests needing POSIX permission bits, FIFOs,
 symlinks or Linux link-based landing SKIP with a reason starting "POSIX-only:".
 Task filters/follows (DESIGN 93, 94.3): pure and Fake-kernel Windows cases run;
 the Linux-fixture and federation-store classes SKIP with the same "POSIX-only:" prefix.
+ab note (DESIGN 95.5/95.6): pure footer/capacity/reminder cases run; Linux CLI and ledger
+fixture classes SKIP with the same "POSIX-only:" prefix. Codex turn/steer: the classification
+table and Fake-kernel Windows client run; the Linux UDS fake daemon class SKIPs likewise.
 """
 from pathlib import Path
 import sys
@@ -29,7 +32,9 @@ MODULES = ('test_bridge_windows', 'test_bridge_windows_streams',
            'test_bridge_federation_codec', 'test_bridge_federation_attachments',
            'test_bridge_federation_windows', 'test_bridge_federation_packaging',
            'test_bridge_federation_transport_close',
-           'test_bridge_task_filters', 'test_bridge_task_follows')
+           'test_bridge_task_filters', 'test_bridge_task_follows',
+           'test_bridge_note', 'test_bridge_codex_steer', 'test_bridge_fyi',
+           'test_bridge_worker_lock')
 # Only these skips may appear; any other skip means a module silently did not qualify.
 NATIVE_PREFIX = 'test_bridge_windows_native.'
 POSIX_ONLY = "POSIX-only:"

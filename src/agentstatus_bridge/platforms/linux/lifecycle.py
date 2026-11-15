@@ -8,11 +8,9 @@ import signal
 import stat
 import subprocess
 import sys
-import time
 from types import FrameType
 
-LOCK_RETRY_ATTEMPTS = 5
-LOCK_RETRY_SECONDS = 0.02
+from ..lock_retry import retry_lock
 # 拉起 worker 的可能是某个 agent 会话里的命令；这些变量属于那个会话，不能带进常驻 worker
 # （worker 再调用 codex queue 时也不应带着发起会话的 thread/权限变量）。
 # 每加一个 provider，这里要覆盖它在 ADAPTERS 里声明的 env markers——有用例按注册表逐个核对（DESIGN §45.34）
@@ -51,18 +49,12 @@ def worker_environment(base: Mapping[str, str]) -> dict[str, str]:
 
 
 def _acquire_worker_lock(fd: int) -> bool:
-    """取单实例排他锁；被占用时短暂重试，只有一直拿不到（另一个 worker 在持有）才放弃。
+    """取单实例排他锁；被占用时按时间预算重试，只有一直拿不到（另一个 worker 在持有）才放弃。
 
     旧实现一次失败就退出：探测恰好瞬时持锁的那一刻，新拉起的 worker 会以为已有实例而退出，结果一个 worker 都没有。
+    固定 5×20 ms 在 CPU 受限时也会耗尽（取证见 DESIGN §95.2），改为共用的单调时钟预算。
     """
-    for attempt in range(LOCK_RETRY_ATTEMPTS):
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except BlockingIOError:
-            if attempt + 1 < LOCK_RETRY_ATTEMPTS:
-                time.sleep(LOCK_RETRY_SECONDS)
-    return False
+    return retry_lock(lambda: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB))
 
 
 class LinuxLifecycle:

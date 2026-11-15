@@ -67,6 +67,20 @@ def render(task: Task, attempt: Attempt, *, sender: str, device: str, command: s
         lines.append("")
         lines.append(f"（AgentStatus 协作桥结束回执：不需要 {command} report；详情 {command} status {task.id[:8]}{route}）")
         return "\n".join(lines)
+    if attempt.is_fyi:
+        # 一句话告知（DESIGN §95.5.7）：单向，只需读到，不附汇报或查看命令
+        lines.append("")
+        lines.append(f"（AgentStatus 协作桥告知消息：只需读到，不需要 {command} report，也不用回复发起方。）")
+        return "\n".join(lines)
+    for_seq = attempt.note_for_seq
+    if for_seq is not None:
+        # 任务内补充消息（DESIGN §95.5.2）：不汇报这条，继续当前尝试，汇报命令仍指向所补的那次工作尝试
+        lines.append("")
+        lines.append(
+            f"（AgentStatus 协作桥补充消息：这是任务 {task.id} 第 {for_seq} 次尝试的补充，不需要 {command} report"
+            f" 这条消息；继续当前尝试，完成后仍按 `{command} report {task.id}{route} --attempt {for_seq} …` 汇报。）"
+        )
+        return "\n".join(lines)
     if attempt.role is Role.NOTICE:
         lines.append("")
         lines.append(f"（AgentStatus 协作桥通知；查看详情：{command} status {task.id[:8]}{route}）")

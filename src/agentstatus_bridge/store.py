@@ -29,7 +29,11 @@ from .platforms import process as procfs
 from .ids import is_id_prefix, new_id
 from .model import (
     CLOSURE_KIND,
+    FYI_KIND,
+    FYI_OPTION,
+    QUIET_NOTICE_KINDS,
     HANDED_OVER,
+    NOTE_KIND,
     NOTICE_KIND_OPTION,
     REMINDER_OPTION,
     Attempt,
@@ -75,8 +79,11 @@ WINDOWS_SENDING_RECOVERY_SECONDS = 600 + 120  # W2 add总预算＋余量；只�
 
 
 def attempt_limit(role: Role, options: dict[str, Any] | None = None) -> int:
-    """§83：按全部尝试的序号限额，不能只数工作条数；提醒留出终态通知＋两个结束回执。"""
-    if role is not Role.NOTICE:
+    """§83：按全部尝试的序号限额，不能只数工作条数；提醒留出终态通知＋两个结束回执。
+
+    任务内补充消息（§95.5.2）按工作类算：与 retry 同为 60，不占留给提醒、结果通知与结束回执的 61–64。
+    """
+    if role is not Role.NOTICE or (options is not None and options.get(NOTICE_KIND_OPTION) == NOTE_KIND):
         return MAX_ATTEMPTS_PER_TASK - NOTICE_RESERVE
     if options is not None and REMINDER_OPTION in options:
         return MAX_ATTEMPTS_PER_TASK - (NOTICE_RESERVE - 1)
@@ -561,6 +568,59 @@ class Store:
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return _task_from_row(row), attempt
 
+    def create_fyi(
+        self,
+        *,
+        title: str,
+        origin: EndpointRef | None,
+        origin_class: str | None,
+        target: EndpointRef,
+        body: str,
+        refs: list[dict[str, Any]],
+        now: float,
+        task_options: dict[str, Any] | None = None,
+        attempt_options: dict[str, Any] | None = None,
+    ) -> tuple[Task, Attempt]:
+        """一句话告知（DESIGN §95.5.7）：同一写事务里建任务并立即关闭，唯一一条 seq 1 的 notice（noticeKind=fyi）。
+
+        已关闭的任务不占进行中任务容量；全局 PENDING 上限照常计入。没有工作尝试，所以没有提醒、结束回执与验收。
+        """
+        check_body(body)
+        with self._transaction() as conn:
+            self._check_pending_capacity(conn)
+            task_id = new_id()
+            conn.execute(
+                "INSERT INTO tasks (id, created_at, updated_at, title, flow, origin, reviewer, options,"
+                " closed_at, close_reason) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                (
+                    task_id,
+                    now,
+                    now,
+                    title[:MAX_TITLE_CHARS],
+                    Flow.HANDOFF.value,
+                    origin.to_json() if origin else None,
+                    _dump({**(task_options or {}), FYI_OPTION: True}),
+                    now,
+                    FYI_KIND,
+                ),
+            )
+            attempt = self._insert_attempt(
+                conn,
+                task_id=task_id,
+                seq=1,
+                role=Role.NOTICE,
+                target=target,
+                body=body,
+                refs=refs,
+                now=now,
+                sender=origin,
+                sender_class=origin_class,
+                options={**(attempt_options or {}), NOTICE_KIND_OPTION: FYI_KIND},
+            )
+            self._event(conn, task_id, "fyi_created", now, attempt_seq=1)
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return _task_from_row(row), attempt
+
     def add_attempt(
         self,
         task_id: str,
@@ -769,9 +829,11 @@ class Store:
                 "pane": pane,
                 "provider": ref.provider.value,
             }
-            # 结束回执单独标出：扩展据此静默它触发的那一轮，普通结果回执照常通知（DESIGN §45.31.7）
-            if item["role"] == Role.NOTICE.value and _load_dict(row["options"]).get(NOTICE_KIND_OPTION) == CLOSURE_KIND:
-                item["kind"] = CLOSURE_KIND
+            # 结束回执与补充消息单独标出 kind：扩展据此静默它们触发的那一轮，普通结果回执与提醒照常通知
+            # （DESIGN §45.31.7、§95.5.3；kind 是可选开放字符串，键集与 summary v1 合同不变）
+            kind = _load_dict(row["options"]).get(NOTICE_KIND_OPTION)
+            if item["role"] == Role.NOTICE.value and kind in QUIET_NOTICE_KINDS:
+                item["kind"] = kind
             deliveries.append((float(row["delivery_at"]), item))
         return deliveries
 
@@ -871,9 +933,10 @@ class Store:
             ).fetchone()
             if row is None:
                 return False
-            # 结束回执本来就是任务结束后才生成的，暂停也不挡它（DESIGN §45.31.5）
-            closure = row["role"] == Role.NOTICE.value and _load_dict(row["options"]).get(NOTICE_KIND_OPTION) == CLOSURE_KIND
-            if not closure and (
+            # 结束回执本来就是任务结束后才生成的、告知的任务建立即关闭，暂停也不挡它们（DESIGN §45.31.5、§95.5.7）
+            after_finish = row["role"] == Role.NOTICE.value and _load_dict(row["options"]).get(NOTICE_KIND_OPTION) in (
+                CLOSURE_KIND, FYI_KIND)
+            if not after_finish and (
                 row["control"] != "active" or row["closed_at"] is not None or row["accepted_at"] is not None
             ):
                 return False

@@ -180,6 +180,7 @@ def record_linux():
                 raise AssertionError(outputs)
             return out.getvalue()
 
+        # §95.3 起 peers --json 每行多一个 workdir（夹具的状态库没有 cwd 列 → null），按原样定点改进 golden（outputs[1]）
         command('peers'); command('peers', '--json')
         # §91 移除 Linux tmux/%pane 输入；完整 ID 选择器在录制用的旧 src 上同样可用
         sent = json.loads(command('send', '--to', 'codex@id:' + THREAD, '--no-wait', '--json', '-m', 'synthetic'))

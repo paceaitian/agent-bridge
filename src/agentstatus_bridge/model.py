@@ -31,6 +31,22 @@ class Runtime(StrEnum):
     UNKNOWN = "unknown"
 
 
+# Claude Code 会话注册信息 `sessions/<pid>.json` 的 `status` → 忙闲（Claude 2.1.x：waiting 为对话框打开，shell 为正在
+# 执行 shell 命令）。Linux 与 Windows 发现共用这一张表（DESIGN §96.2），放在两平台都 import 的模型模块里，Windows 不因此
+# 加载 Linux 发现。Linux 另借 observer 把「只剩后台」放宽成「后台」；Windows 没有 observer，照表显示。
+CLAUDE_REGISTRY_STATUS: dict[str, Runtime] = {
+    "idle": Runtime.IDLE,
+    "busy": Runtime.BUSY,
+    "shell": Runtime.BUSY,
+    "waiting": Runtime.WAITING,
+}
+
+
+def claude_registry_runtime(status: object) -> Runtime:
+    """注册信息 `status` 的忙闲：表里的取值照表，缺字段、非字符串或未知取值一律 UNKNOWN。"""
+    return CLAUDE_REGISTRY_STATUS.get(status, Runtime.UNKNOWN) if isinstance(status, str) else Runtime.UNKNOWN
+
+
 class Delivery(StrEnum):
     PENDING = "pending"  # 桥内排队，确定尚未外调
     SENDING = "sending"  # 已持久化发送意图，外调进行中
@@ -66,6 +82,15 @@ NOTICE_KIND_OPTION = "noticeKind"
 REMINDER_OPTION = "reminderToken"
 CLOSURE_KIND = "closure"
 CLOSURE_STATE_OPTION = "closure"
+# 任务内补充消息（DESIGN §95.5）：notice 尝试的 options 里 noticeKind=note，forSeq 是发出时的当前工作尝试序号
+NOTE_KIND = "note"
+FOR_SEQ_OPTION = "forSeq"
+# 一句话告知（DESIGN §95.5.7）：建立即关闭的任务，任务 options 里 fyi=true，唯一一条 notice 尝试的 noticeKind=fyi
+FYI_KIND = "fyi"
+FYI_OPTION = "fyi"
+# 摘要投递项要标出的 notice 类别：扩展据此静默它们触发的那一轮（结束回执 §45.31.7，补充消息与告知 §95.5.3）；
+# 与 extension/collabModel.js 的 COLLAB_QUIET_NOTICE_KINDS 是同一份（test_contract_collab 核对）
+QUIET_NOTICE_KINDS = frozenset({CLOSURE_KIND, NOTE_KIND, FYI_KIND})
 DELIVERY_NEEDS_ATTENTION = frozenset(
     {
         Delivery.HELD,
@@ -100,7 +125,7 @@ class Work(StrEnum):
 class Role(StrEnum):
     HANDOFF = "handoff"  # 交给对方完成的工作
     REVIEW = "review"  # 固定复核流程中的复核
-    NOTICE = "notice"  # 回告发起方的结果通知，不需要回执
+    NOTICE = "notice"  # 通知类消息（结果通知、提醒、结束回执、任务内补充），不需要回执
 
 
 class Flow(StrEnum):
@@ -316,6 +341,9 @@ class Endpoint:
     # 本轮发现没看全的 provider（DiscoverySources.incomplete 的快照，§91.2.2）。随每个端点带出、解析时取并集：
     # 某家一个端点都没露出时，别家的端点也能把它带到。派生值，不参与相等比较、不落账本
     round_incomplete: frozenset[str] = field(default=frozenset(), compare=False)
+    # 工作目录末段原文（§95.3，未转义）：只作人读旁注与快照的可选键；完整路径发现时即丢弃，不进 EndpointRef、
+    # 不落账本，不参与相等比较
+    workdir: str | None = field(default=None, compare=False)
 
     @property
     def blocking_issues(self) -> tuple[str, ...]:
@@ -372,6 +400,11 @@ class Task:
     def finished(self) -> bool:
         return self.closed_at is not None or self.accepted_at is not None
 
+    @property
+    def is_fyi(self) -> bool:
+        """一句话告知（DESIGN §95.5.7）：建立时即关闭，没有工作尝试、提醒、结束回执与验收。"""
+        return self.options.get(FYI_OPTION) is True
+
 
 @dataclass(frozen=True)
 class Attempt:
@@ -408,6 +441,37 @@ class Attempt:
         """验收或关闭后发给参与方的结束回执：任务结束或暂停时仍可发送（DESIGN §45.31.5）。"""
         return self.role is Role.NOTICE and self.options.get(NOTICE_KIND_OPTION) == CLOSURE_KIND
 
+    @property
+    def is_note(self) -> bool:
+        """发给执行方的任务内补充消息（DESIGN §95.5）：不是工作尝试、不可汇报，也不是给发起方的回执。"""
+        return self.role is Role.NOTICE and self.options.get(NOTICE_KIND_OPTION) == NOTE_KIND
+
+    @property
+    def is_fyi(self) -> bool:
+        """一句话告知的那条 notice（DESIGN §95.5.7）：只需对方读到，不汇报、不回复。"""
+        return self.role is Role.NOTICE and self.options.get(NOTICE_KIND_OPTION) == FYI_KIND
+
+    @property
+    def delivers_after_finish(self) -> bool:
+        """任务结束（或暂停）后仍要投递：结束回执本来就在结束后才生成，告知的任务建立即关闭（§45.31.5、§95.5.7）。
+
+        只放宽投递；is_closure 的其他含义（closure_not_needed 过滤、coversWorkMessageIds）不作用到告知。
+        """
+        return self.is_closure or self.is_fyi
+
+    @property
+    def steers(self) -> bool:
+        """Codex 有活跃轮时走 turn/steer 的消息：补充消息与告知（§95.5.4、§95.5.7）；其余照旧走队列。"""
+        return self.is_note or self.is_fyi
+
+    @property
+    def note_for_seq(self) -> int | None:
+        """补充消息所补的工作尝试序号；不是 note 或记录不全时为 None。"""
+        value = self.options.get(FOR_SEQ_OPTION)
+        if not self.is_note or not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            return None
+        return value
+
 
 @dataclass(frozen=True)
 class TaskView:
@@ -416,6 +480,21 @@ class TaskView:
     phase: Phase
     reason: str
     current: Attempt | None
+
+
+# 工作尝试已终态汇报：对方交了结果、受阻或失败（复核结论也记为 RESULT）
+TERMINAL_WORK = frozenset({Work.BLOCKED, Work.RESULT, Work.FAILED})
+# 所补的工作尝试已被执行方取走：对方已确认开始，或之后的任何汇报（§95.5.4，G4 审计 r1 P3-1）
+WORK_STARTED = frozenset({Work.ACKNOWLEDGED, Work.IN_PROGRESS, Work.BLOCKED, Work.RESULT, Work.FAILED})
+
+
+def note_may_steer(work: Attempt | None) -> bool:
+    """补充消息能不能插进对方当前一轮（turn/steer）：所补的工作尝试已离开 Codex 队列或对方已确认开始才行。
+
+    交接还排在 Codex 原生队列里时，对方正在跑的是别的轮：steer 会让那一轮先读到「继续当前尝试」的补充、
+    之后才读到任务本身；走队列则按先进先出排在交接后面。查不到工作尝试时按不能 steer 处理。
+    """
+    return work is not None and (work.consumption is Consumption.LEFT_QUEUE or work.work in WORK_STARTED)
 
 
 def work_attempts(attempts: list[Attempt]) -> list[Attempt]:

@@ -28,7 +28,8 @@ class LightTests(unittest.TestCase):
 
     def test_all_six_commands_authenticate_without_application_bytes(self):
         env=self.chain()
-        self.assertEqual(B.LIGHT, {'report','accept','close','pause','cancel','resume'})
+        # §95.5.2：note 只需调用方归属（消息头 from=），目标由任务决定，同样走轻量证明
+        self.assertEqual(B.LIGHT, {'report','accept','close','pause','cancel','resume','note'})
         with self.scope(),patch.dict(os.environ,env),patch('agentstatus_bridge.platforms.windows.caller.os.getpid',return_value=100):
             for action in sorted(B.LIGHT):
                 before=sum(n=='connect' for n,_ in self.k.calls)

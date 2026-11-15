@@ -14,7 +14,7 @@
         "--json"
       ],
       0,
-      "{\n  \"peers\": [\n    {\n      \"device\": \"fixture-device\",\n      \"displayName\": null,\n      \"issues\": [],\n      \"name\": null,\n      \"nameVerified\": false,\n      \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n      \"pane\": \"%1\",\n      \"permissionClass\": \"prompting\",\n      \"provider\": \"codex\",\n      \"runtime\": \"idle\",\n      \"self\": false,\n      \"session\": \"fixture\\tlabel\",\n      \"target\": \"codex@id:019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n      \"threads\": [\n        \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\"\n      ]\n    }\n  ]\n}\n",
+      "{\n  \"peers\": [\n    {\n      \"device\": \"fixture-device\",\n      \"displayName\": null,\n      \"issues\": [],\n      \"name\": null,\n      \"nameVerified\": false,\n      \"nativeId\": \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n      \"pane\": \"%1\",\n      \"permissionClass\": \"prompting\",\n      \"provider\": \"codex\",\n      \"runtime\": \"idle\",\n      \"self\": false,\n      \"session\": \"fixture\\tlabel\",\n      \"target\": \"codex@id:019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\",\n      \"threads\": [\n        \"019a0000-aaaa-7aaa-8aaa-aaaaaaaaaaaa\"\n      ],\n      \"workdir\": null\n    }\n  ]\n}\n",
       ""
     ],
     [

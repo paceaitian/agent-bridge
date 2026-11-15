@@ -19,7 +19,7 @@ from ..reports import REPORT_LABELS
 from ..store import CAPACITY_CODES, MAX_ACTIVE_TASKS, MAX_PENDING_ATTEMPTS, StoreError, attempt_limit
 from . import envelopes
 from .codec import SENDER_CLASSES
-from .fedstore import FederatedStore, FedAttempt, FedTask, dump
+from .fedstore import LOCAL_NOTICE_KIND, FederatedStore, FedAttempt, FedTask, dump, notice_options
 from .refs import AttemptDefinition, Checkpoint, RemoteEndpointRef, TargetRef, WireActor
 from .views import model_attempt, model_attempts, model_task
 
@@ -97,7 +97,9 @@ def build_checkpoint(task: FedTask, attempts: list[FedAttempt]) -> Checkpoint:
             msg_id=item.msg_id,
             role=item.role,
             target=item.target.remote,
-            notice_kind=item.options.get("noticeKind") if item.role == "notice" else None,
+            # note 与 fyi 不进 checkpoint 定义（旧读方的闭合枚举会整封拒收）；类别与 forSeq 只经信封 data.options 传（§95.5.5）
+            notice_kind=(item.options.get("noticeKind")
+                         if item.role == "notice" and not (item.is_note or item.is_fyi) else None),
             cancel_requested=item.cancel_requested,
             superseded=item.superseded,
             report_high=int(item.authority_state.get("reportHigh", 0)),
@@ -158,7 +160,10 @@ def _queue(store: FederatedStore, ident: Identity, task: FedTask, attempt: FedAt
     checkpoint = build_checkpoint(task, store.attempts(task.authority_device, task.task_id))
     data = envelopes.checkpoint_data(checkpoint, **(extra_data or {}))
     data["options"] = {key: value for key, value in attempt.options.items()
-                       if key in ("noticeKind", "closure", "allowShared", "reminderToken", "coversWorkMessageIds")}
+                       if key in ("noticeKind", "closure", "allowShared", "reminderToken", "coversWorkMessageIds",
+                                  "forSeq")}
+    if isinstance(attempt.options.get(LOCAL_NOTICE_KIND), str):
+        data["options"]["noticeKind"] = attempt.options[LOCAL_NOTICE_KIND]  # 本机键映射回线上键（§95.5.5）
     envelope, digest = envelopes.build(
         kind=attempt.role, target_device=attempt.target_device, authority_device=task.authority_device,
         task_id=task.task_id, revision=task.revision, now=now, attempt=attempt.seq, actor=attempt.sender,
@@ -266,6 +271,57 @@ def create_task(
     return task, attempt
 
 
+def create_fyi(
+    store: FederatedStore,
+    ident: Identity,
+    *,
+    title: str,
+    body: str,
+    refs: list[dict[str, Any]],
+    origin: TargetRef | None,
+    origin_actor: WireActor | None,
+    origin_class: str,
+    target: TargetRef,
+    allow_shared: bool = False,
+    now: int,
+    follows: str | None = None,
+) -> tuple[FedTask, FedAttempt]:
+    """A 上建「已关闭」的联邦告知（DESIGN §95.5.7）：任务、唯一一条 seq 1 的 notice、路由与 outbox 同一事务。
+
+    没有工作尝试（currentWorkSeq 为空），不进进行中容量；镜像收到的第一封就是 notice、任务已关闭，
+    按 delivers_after_finish 投递。能力门（目标设备目录 features 含 fyi）由调用方在写前核对。
+    """
+    if not can_notify(target):
+        raise StoreError("target_no_inbox")
+    with store.transaction():
+        _check_capacity(store)
+        task = FedTask(
+            authority_device=ident.device_id, task_id=new_id(), is_authority=True, revision=1,
+            current_work_seq=None, max_seq=1, last_sync_at=now,
+            state={
+                "title": title[:120], "flow": "handoff", "control": "active", "verdict": None,
+                "acceptedAt": None, "closedAt": now, "closeReason": "fyi", "fyi": True,
+                "origin": origin.to_dict() if origin else None,
+                "originActor": origin_actor.to_dict() if origin_actor else None,
+                "reviewer": None, "reviewerToken": None,
+                "notifyOrigin": False, "allowShared": allow_shared,
+                "createdAt": now, "updatedAt": now, "hubId": ident.hub_id,
+                **({"follows": follows} if follows is not None else {}),
+            },
+        )
+        store.insert_task(task)
+        attempt = _new_attempt(task, seq=1, role="notice", target=target, body=body, refs=refs,
+                               sender=origin_actor, sender_class=origin_class,
+                               options={LOCAL_NOTICE_KIND: "fyi", "allowShared": allow_shared}, now=now)
+        store.insert_attempt(attempt)
+        store.add_route(task_id=task.task_id, authority_device=ident.device_id, hub_id=ident.hub_id,
+                        local_role="origin", local_endpoint_id=origin.remote.endpoint_id if origin else "",
+                        first_msg_id=attempt.msg_id)
+        store.add_event(task.authority_device, task.task_id, "fyi_created", now=now, attempt_seq=1)
+        _queue(store, ident, task, attempt, now=now)
+    return task, attempt
+
+
 def add_attempt(
     store: FederatedStore,
     ident: Identity,
@@ -288,7 +344,8 @@ def add_attempt(
         if current is None or not current.is_authority:
             raise StoreError("task_not_found")
         seq = current.max_seq + 1
-        if seq > attempt_limit(Role(role), opts):
+        # 容量按共用口径判定：本机键记的 note 仍按工作类 60，不占 61–64 预留（G4 审计 r1 复核）
+        if seq > attempt_limit(Role(role), notice_options(opts)):
             raise StoreError("capacity_attempts")
         _check_capacity(store)
         attempt = _new_attempt(current, seq=seq, role=role, target=target, body=body, refs=refs, sender=sender,
@@ -300,6 +357,36 @@ def add_attempt(
         store.add_event(task.authority_device, task.task_id, event or f"{role}_created", now=now, attempt_seq=seq)
         _queue(store, ident, updated, attempt, now=now)
     return updated, attempt
+
+
+# ---- 任务内补充消息（DESIGN §95.5） ----
+
+# A 视角：当前工作尝试已发出（有投递设备的证据或本机事实，可能已到对方）且尚未终态汇报，才有可补充的对象
+_NOTE_SENT = frozenset(MAY_HAVE_ARRIVED | {Delivery.SENDING})
+_NOTE_OPEN_WORK = frozenset({Work.AWAITING_ACK, Work.ACKNOWLEDGED, Work.IN_PROGRESS})
+
+
+def add_note(store: FederatedStore, ident: Identity, task: FedTask, *, body: str, sender: WireActor | None,
+             sender_class: str, now: int) -> tuple[FedTask, FedAttempt]:
+    """A 上给当前工作尝试补一条 note：资格与写入同一事务；目标与当前工作尝试相同，不改 current_work_seq。"""
+    with store.transaction():
+        current = store.get_task(task.authority_device, task.task_id)
+        if current is None or not current.is_authority:
+            raise StoreError("task_not_found")
+        if current.finished:
+            raise StoreError("note_no_active_attempt")
+        if current.paused:
+            raise StoreError("note_task_paused")
+        work = next((item for item in store.attempts(current.authority_device, current.task_id)
+                     if item.role != "notice" and item.seq == current.current_work_seq), None)
+        view = model_attempt(work) if work is not None else None
+        if work is None or view is None or view.delivery not in _NOTE_SENT or view.work not in _NOTE_OPEN_WORK:
+            raise StoreError("note_no_active_attempt")
+        return add_attempt(store, ident, current, role="notice", target=work.target, body=body, refs=[],
+                           sender=sender, sender_class=sender_class,
+                           options={LOCAL_NOTICE_KIND: "note", "forSeq": work.seq,
+                                    "allowShared": work.options.get("allowShared") is True},
+                           now=now, event="note_created")
 
 
 # ---- 报告裁决 ----
@@ -595,6 +682,11 @@ def proven_undelivered(attempt: FedAttempt, ident: Identity) -> bool:
     return state in REMOTE_PROVEN_UNDELIVERED
 
 
+def _awaiting_remote_evidence(attempt: FedAttempt) -> bool:
+    """远端 attempt 还没有投递设备的任何证据（A 视角仍是 pending）：只有这种还值得发抑制请求。"""
+    return attempt.delivery.get("state", "pending") == "pending" and attempt.delivery.get("receiverReported") is not True
+
+
 def request_cancel(store: FederatedStore, ident: Identity, task: FedTask, *, now: int) -> tuple[FedTask, bool]:
     """cancel：远端只写取消请求并通知成员，本机未领取的作业直接抑制；返回 (任务, 是否有远端待确认)。
 
@@ -604,12 +696,16 @@ def request_cancel(store: FederatedStore, ident: Identity, task: FedTask, *, now
         current = store.get_task(task.authority_device, task.task_id) or task
         remote_pending = False
         for attempt in store.attempts(task.authority_device, task.task_id):
-            if attempt.role == "notice" or attempt.delivery.get("receiverReported") is True:
+            # 补充消息与工作尝试一样取消（§95.5.2）；其余 notice（结果通知、提醒、结束回执）不受 cancel 影响
+            if (attempt.role == "notice" and not attempt.is_note) or attempt.delivery.get("receiverReported") is True:
                 continue
             if attempt.target_device == ident.device_id:
                 _suppress_local(store, current, attempt, reason="cancelled", now=now)
                 continue
             if proven_undelivered(attempt, ident) or attempt.cancel_requested:
+                continue
+            if attempt.is_note and not _awaiting_remote_evidence(attempt):
+                # B 已回报交出（queued/delivered 等）的补充消息撤不回：不标取消请求，免得报「对方设备尚未确认」（P3-7）
                 continue
             authority_state = dict(attempt.authority_state)
             authority_state["cancelRequested"] = True
@@ -697,6 +793,11 @@ def retry_task(store: FederatedStore, ident: Identity, task: FedTask, *, force: 
         for stale in attempts:
             if stale.role == "notice" and stale.target_device == ident.device_id and not stale.is_closure:
                 _suppress_local(store, current_task, stale, reason="notice_outdated", now=now)
+            elif stale.is_note and _awaiting_remote_evidence(stale) and not stale.superseded:
+                # 远端的补充消息补的是旧尝试：只给 B 还没回报任何投递结果的标 superseded，随新 checkpoint 到对方后
+                # 按 stale_attempt 抑制（旧读方也认这个标志）；B 已回报交出（queued/delivered 等）或已证明未投的不再标
+                # （§95.5.2，G4 审计 r1 P3-7）
+                store.update_attempt_columns(stale.msg_id, authority_state=dict(stale.authority_state, superseded=True))
         allow_shared = (allow_shared or current.options.get("allowShared") is True
                         or current_task.state.get("allowShared") is True)
         reset = _bump(store, current_task, now=now, control="active", verdict=None)
@@ -788,7 +889,7 @@ def finish(store: FederatedStore, ident: Identity, task: FedTask, *, state: str,
                                 detail={"capacity": error.code.removeprefix("capacity_")})
         # 本机未领取的旧工作直接抑制；远端由 checkpoint 的终态在 B 上抑制
         for item in attempts:
-            if item.role != "notice" and item.target_device == ident.device_id:
+            if (item.role != "notice" or item.is_note) and item.target_device == ident.device_id:
                 _suppress_local(store, current, item, reason="task_finished", now=now)
         outcome.task = current
         send_task_state(store, ident, current, now=now)

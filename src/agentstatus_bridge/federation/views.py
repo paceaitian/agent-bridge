@@ -18,7 +18,7 @@ from ..model import (
     Verdict,
     Work,
 )
-from .fedstore import FedAttempt, FedTask
+from .fedstore import FedAttempt, FedTask, notice_options
 from .refs import TargetRef
 
 # 显示用远端引用的固定标记：真实进程 PID 恒为正，-1 不可能撞上本机进程
@@ -141,7 +141,8 @@ def model_attempt(attempt: FedAttempt) -> Attempt:
         result=result if isinstance(result, dict) else None,  # pyright: ignore[reportUnknownArgumentType]
         sender=sender,
         sender_class=attempt.sender_class if attempt.sender_class != "unknown" else None,
-        options=dict(attempt.options),
+        # 权威端本机键 localNoticeKind 映射回 noticeKind：页脚、steer 与显示按同一口径认类别
+        options=notice_options(attempt.options),
     )
 
 

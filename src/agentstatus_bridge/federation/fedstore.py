@@ -17,6 +17,7 @@ import time
 from typing import Any
 
 from ..ids import new_id
+from ..model import QUIET_NOTICE_KINDS
 from ..paths import ensure_private_dir, state_dir
 from ..platforms.factory import get_platform
 from ..store import StoreError
@@ -140,6 +141,20 @@ def load_list(raw: object) -> list[Any]:
     return value if isinstance(value, list) else []  # pyright: ignore[reportUnknownVariableType]
 
 
+# 权威端本机账本里 note/fyi 的类别键（G4 审计 r1 P3-2 回滚加固）：旧代码的 build_checkpoint 只读 noticeKind，
+# 所以 A 回滚到旧代码后写出的 checkpoint 定义与新代码逐字相同（都不带新类别），旧读方不拒收、新读方不报
+# idempotency_conflict；_queue 写信封时再映射成 data.options.noticeKind，线上形状不变。
+LOCAL_NOTICE_KIND = "localNoticeKind"
+
+
+def notice_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    """按共用口径看的 options：本机键 localNoticeKind 映射回 noticeKind（容量判定与本机视图共用，§95.5.2）。"""
+    view = dict(options)
+    kind = view.pop(LOCAL_NOTICE_KIND, None)
+    if isinstance(kind, str):
+        view["noticeKind"] = kind
+    return view
+
 @dataclass(frozen=True)
 class FedTask:
     """fed_tasks 一行：A 上是权威任务，B 上是镜像。"""
@@ -158,6 +173,16 @@ class FedTask:
     @property
     def finished(self) -> bool:
         return self.state.get("acceptedAt") is not None or self.state.get("closedAt") is not None
+
+    @property
+    def is_fyi(self) -> bool:
+        """一句话告知（DESIGN §95.5.7）：权威端本机 state 记 fyi=true；镜像只有 checkpoint，认 closeReason=fyi 且没有工作尝试。
+
+        `ab close --reason` 是自由文本，普通任务也可能以 fyi 为关闭原因；它们一定有工作尝试（currentWorkSeq 非空）。
+        """
+        if self.state.get("fyi") is True:
+            return True
+        return self.state.get("closeReason") == "fyi" and self.current_work_seq is None
 
     @property
     def paused(self) -> bool:
@@ -212,6 +237,27 @@ class FedAttempt:
     @property
     def is_closure(self) -> bool:
         return self.role == "notice" and self.options.get("noticeKind") == "closure"
+
+    @property
+    def notice_kind(self) -> str | None:
+        """notice 的类别：权威端本机记在 localNoticeKind（note/fyi），镜像与其他类别记在 noticeKind。"""
+        value = self.options.get(LOCAL_NOTICE_KIND, self.options.get("noticeKind"))
+        return value if isinstance(value, str) else None
+
+    @property
+    def is_note(self) -> bool:
+        """任务内补充消息（DESIGN §95.5）：发给执行方的 notice，不是工作尝试。"""
+        return self.role == "notice" and self.notice_kind == "note"
+
+    @property
+    def is_fyi(self) -> bool:
+        """一句话告知的那条 notice（DESIGN §95.5.7）。"""
+        return self.role == "notice" and self.notice_kind == "fyi"
+
+    @property
+    def delivers_after_finish(self) -> bool:
+        """任务结束或暂停后仍投递：结束回执与告知（与本机 Attempt.delivers_after_finish 同口径）。"""
+        return self.is_closure or self.is_fyi
 
     @property
     def cancel_requested(self) -> bool:
@@ -1050,8 +1096,11 @@ class FederatedStore:
             if not isinstance(pane, str) or not _PANE.fullmatch(pane) or not isinstance(provider, str):
                 continue
             item: dict[str, Any] = {"messageId": row["msg_id"], "role": row["role"], "pane": pane, "provider": provider}
-            if row["role"] == "notice" and load_dict(row["options_json"]).get("noticeKind") == "closure":
-                item["kind"] = "closure"
+            # 结束回执与补充消息标出 kind，与本机 Store.recent_delivery_rows 同口径（DESIGN §45.31.7、§95.5.3）
+            options = load_dict(row["options_json"])
+            kind = options.get(LOCAL_NOTICE_KIND, options.get("noticeKind"))
+            if row["role"] == "notice" and kind in QUIET_NOTICE_KINDS:
+                item["kind"] = kind
             at = load_dict(row["delivery_json"]).get("at")
             found.append((at if isinstance(at, int) else int(row["intent_at"] or 0), item))
         return found

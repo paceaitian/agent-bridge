@@ -50,6 +50,10 @@ CHANNEL_KEY = "queueChannel"
 FALLBACK_KEY = "rpcFallback"
 CHANNEL_RPC = "rpc"
 CHANNEL_CLI = "cli"
+# 补充消息的通道选择（DESIGN §95.5.4）：路径闭集与被确定拒绝时的原因码。steered/steer_unknown 的明细不写
+# queueChannel/queueOutput，doctor 的队列样本统计不把它们算进去
+STEER_PATH_KEY = "steerPath"
+STEER_REJECTED_KEY = "steerRejected"
 FALLBACK_VERSION_UNAVAILABLE = "version_unavailable"
 UNKNOWN_VERSION = "unknown"
 OUTPUT_RECOGNIZED = "recognized"
@@ -118,6 +122,12 @@ READABLE_REASONS: dict[str, str] = {
     "codex_server_overloaded": "Codex 服务繁忙，未入队，可以直接重发",
     "codex_thread_unreadable": "Codex 读不到这个会话，未入队",
     "codex_rpc_protocol_error": "协作桥发给 Codex 的请求形状或顺序有误，未入队",
+    # 补充消息的 turn/steer（DESIGN §95.5.4）：steer 帧已发出后的不明结局，以及只读步骤失步（写前）
+    "codex_steer_timeout": "插入 Codex 当前一轮（turn/steer）超时，是否已送达不明",
+    "codex_steer_failed": "Codex 插入当前一轮时出错，是否已送达不明",
+    "codex_steer_unrecognized_error": "Codex 对插入当前一轮返回未识别的错误，是否已送达不明",
+    "codex_steer_unparsed_output": "Codex 对插入当前一轮的应答无法识别，是否已送达不明",
+    "codex_steer_read_desync": "读取 Codex 当前一轮时连接中断，未发送",
 }
 
 
@@ -169,7 +179,7 @@ class CodexQueueTransport:
 
     def deliver(self, endpoint: Endpoint, text: str, context: DeliveryContext) -> DeliveryOutcome:
         before = self._data_root()
-        attempt = self._deliver_rpc(endpoint.ref.native_id, text, context.message_uuid)
+        attempt = self._deliver_rpc(endpoint.ref.native_id, text, context.message_uuid, steer=context.steer)
         if isinstance(attempt, DeliveryOutcome):
             outcome = attempt
         else:
@@ -185,7 +195,7 @@ class CodexQueueTransport:
         except Exception:
             return None  # 附属证据失败不改变已取得的投递结局
 
-    def _deliver_rpc(self, thread: str, text: str, client_message_id: str) -> DeliveryOutcome | str:
+    def _deliver_rpc(self, thread: str, text: str, client_message_id: str, *, steer: bool = False) -> DeliveryOutcome | str:
         """RPC 通道；返回最终结果，或 add 帧发出之前的回退原因（这时可证明未入队）。
 
         initialize 用本机 CLI 的版本（身份与 `codex queue` 相同）；取不到就不连 socket，不拿假版本去覆盖
@@ -200,13 +210,21 @@ class CodexQueueTransport:
             link = codex_rpc.control_socket_path(codex_home())
         except Exception:
             return FALLBACK_VERSION_UNAVAILABLE
+        # 只有补充消息带 steer 参数：普通投递的调用形状与 §61 完全相同
+        extra: dict[str, bool] = {"steer": True} if steer else {}
         result = self._rpc(link, thread_id=thread, text=text, client_message_id=client_message_id,
-                           client_version=version)
+                           client_version=version, **extra)
         if isinstance(result, codex_rpc.RpcFallback):
             return result.reason
-        detail: dict[str, object] = {CHANNEL_KEY: CHANNEL_RPC, VERSION_KEY: result.server_version}
+        detail: dict[str, object] = {VERSION_KEY: result.server_version}
+        if result.steer_path not in (codex_rpc.STEER_PATH_STEERED, codex_rpc.STEER_PATH_UNKNOWN):
+            detail[CHANNEL_KEY] = CHANNEL_RPC  # 走了队列（或从没尝试 steer）：照旧是 RPC 队列样本
         if result.output is not None:
             detail[OUTPUT_KEY] = result.output
+        if result.steer_path is not None:
+            detail[STEER_PATH_KEY] = result.steer_path
+        if result.steer_rejected is not None:
+            detail[STEER_REJECTED_KEY] = result.steer_rejected
         return DeliveryOutcome(result.delivery, result.reason, provider_ref=result.provider_ref, detail=detail)
 
     def _deliver_cli(self, endpoint: Endpoint, text: str) -> DeliveryOutcome:

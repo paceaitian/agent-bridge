@@ -7,7 +7,6 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -22,7 +21,8 @@ from dataclasses import replace
 from agentstatus_bridge.model import Delivery, Flow, Provider
 from agentstatus_bridge.store import DB_NAME, Store, StoreError
 from agentstatus_bridge.endpoints import ADAPTERS
-from agentstatus_bridge.platforms.linux.lifecycle import LOCK_RETRY_ATTEMPTS, worker_environment, worker_path
+from agentstatus_bridge.platforms.linux.lifecycle import worker_environment, worker_path
+from agentstatus_bridge.platforms.lock_retry import LOCK_RETRY_BUDGET_SECONDS
 from agentstatus_bridge.worker import (
     LOCK_NAME,
     ensure_worker,
@@ -310,26 +310,32 @@ class WorkerTests(unittest.TestCase):
             self._release_lock(holder)
 
     def test_new_worker_survives_a_probe_holding_the_lock_at_start(self) -> None:
-        # 新 worker 取锁的那一刻另一个进程正在探测（瞬时持共享锁）：重试后照常启动，不能以为已有实例而退出
+        # 新 worker 取锁的那一刻另一个进程持共享锁约 200 ms（长于旧的 5×20 ms，短于时间预算，§95.2）：
+        # 照常启动，不能以为已有实例而退出
         probe = self._hold_lock(fcntl.LOCK_SH)
-        releaser = threading.Timer(0.02, self._release_lock, args=(probe,))
-        with patch("agentstatus_bridge.platforms.linux.lifecycle.LOCK_RETRY_SECONDS", 0.1):  # 重试预算 0.4 秒，远长于探测持锁的 0.02 秒
-            releaser.start()
-            try:
-                self.assertEqual(self._run_once(RecordingTransport(Provider.CODEX)), 0)
-            finally:
-                releaser.join()
+        releaser = threading.Timer(0.2, self._release_lock, args=(probe,))
+        releaser.start()
+        try:
+            self.assertEqual(self._run_once(RecordingTransport(Provider.CODEX)), 0)
+        finally:
+            releaser.join()
         self.assertEqual(self._events().count("start"), 1)
-        # 一直拿不到（另一个 worker 真在持有）：重试用完才退出，不碰账本
-        shutil.rmtree(self.root)
+
+    def test_worker_gives_up_within_the_budget_while_another_worker_holds_the_lock(self) -> None:
+        # 一直拿不到（另一个 worker 真在持有）：预算用完才退出、返回 0，不碰账本也不留收件箱
         holder = self._hold_lock(fcntl.LOCK_EX)
         try:
-            with patch("agentstatus_bridge.worker.time.sleep") as sleep:
-                self.assertEqual(self._run_once(RecordingTransport(Provider.CODEX)), 0)
-            self.assertEqual(sleep.call_count, LOCK_RETRY_ATTEMPTS - 1)
-            self.assertFalse((self.root / DB_NAME).exists())
+            began = time.monotonic()
+            self.assertEqual(self._run_once(RecordingTransport(Provider.CODEX)), 0)
+            elapsed = time.monotonic() - began
         finally:
             self._release_lock(holder)
+        self.assertGreaterEqual(elapsed, LOCK_RETRY_BUDGET_SECONDS)
+        # 截止语义由 test_bridge_worker_lock 的虚拟时钟钉死；这里只防无限等，余量放宽到秒级，不让慢 runner 的停顿造出新偶发
+        self.assertLess(elapsed, LOCK_RETRY_BUDGET_SECONDS + 10.0)
+        self.assertFalse((self.root / DB_NAME).exists())
+        self.assertFalse(self.inbox_dir.exists())
+        self.assertNotIn("start", self._events())
 
     def test_repeated_starts_under_polling_probes_always_leave_a_worker(self) -> None:
         # 压力对照：另一线程不停探测，同时连续启动 worker，每次都必须真正启动。

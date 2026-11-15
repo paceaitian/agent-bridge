@@ -43,6 +43,11 @@ CONSUMPTION_LABELS: dict[Consumption, str] = {
 }
 ROLE_LABELS: dict[Role, str] = {Role.HANDOFF: "交接", Role.REVIEW: "复核", Role.NOTICE: "通知发起方"}
 CLOSURE_LABEL = "结束回执"
+# 任务内补充消息（DESIGN §95.5.6）：role 仍是 notice，但发给执行方
+NOTE_LABEL = "补充"
+# 一句话告知（DESIGN §95.5.7）：role 是 notice，任务建立即关闭；状态行写「已告知（关闭）」
+FYI_LABEL = "告知"
+FYI_STATUS_LABEL = "已告知（关闭）"
 RUNTIME_LABELS: dict[Runtime, str] = {
     Runtime.IDLE: "空闲",
     Runtime.BACKGROUND: "后台",
@@ -186,6 +191,15 @@ REASON_TEXTS: dict[str, str] = {
     "accept_not_allowed": "只有用户或发起任务的会话可以验收",
     "no_result_to_accept": "还没有可验收的结果；确需验收加 --force",
     "not_paused": "任务未暂停",
+    # ab note（DESIGN §95.5.2）
+    "note_no_active_attempt": "这项任务没有可以补充的进行中尝试（尚未发出、已汇报或任务已结束）；"
+                              "对方已汇报请用 {command} retry，任务已结束请用 {command} send 新任务",
+    "note_task_paused": "任务已暂停，补充消息不会发出；先 {command} resume 再补充",
+    "note_not_authority": "跨设备任务只能在发起设备上补充（本机是镜像）",
+    # ab send --fyi（DESIGN §95.5.7）
+    "fyi": "一句话告知，建立即关闭；只需对方读到，不汇报、不验收",
+    "fyi_conflict": "--fyi 只发一句话告知，不能与 --review-by、--review-device、--no-notify 同用",
+    "fyi_remote_unsupported": "对方设备的协作桥版本还不支持跨设备告知（--fyi）；请对方升级后再发，或改用普通任务",
     # tasks 筛选（DESIGN §93.1）
     "mine_requires_session": "--mine 按会话 ID 匹配，需要在认得出的 agent 会话里运行；用户终端或 /clear 后的新会话请用不带 --mine 的 {command} tasks",
     "since_invalid": "--since 格式不对：写 <正整数>m/h/d（如 30m、2h、7d）或 YYYY-MM-DD",
@@ -204,6 +218,7 @@ REASON_TEXTS: dict[str, str] = {
     "receiver_reported": "对方已汇报",
     "receiver_replied": "对方已回复",
     "codex_queued": "已进入 Codex 队列",
+    "codex_steered": "已插入 Codex 进行中的一轮（turn/steer），在它下一次请求模型前读入",
     "claude_written": "已写入对方会话；未收到拒收或 hold 回执即视为已接收",
     "claude_discovery_incomplete": "Claude 会话发现不完整，请用已核实的完整会话 ID 或稍后再试",
     "discovery_incomplete": "Codex 会话发现不完整，请用已核实的完整会话 ID 或稍后再试",
@@ -232,6 +247,7 @@ REASON_TEXTS: dict[str, str] = {
     "claude_socket_unavailable": "对方会话没有可用的消息 socket",
     "reminder_outdated": "提醒排队期间任务已有变化或回执被拒，这条提醒不再发送",
     "notice_outdated": "发起方已返工，这条还没发出的通知不再发送",
+    "note_outdated": "所补的那次尝试已交结果、受阻或失败，这条还没发出的补充不再发送",
     # 跨设备协作（DESIGN §88）；不含入口名占位，联邦文案与本机文案互不影响
     "federation_not_configured": "本机未启用跨设备协作（没有 federation.json）",
     "federation_disabled": "跨设备协作已停用；重新启用后才能写入联邦任务",
@@ -304,6 +320,8 @@ EVENT_LABELS: dict[str, str] = {
     "handoff_created": "排队新的交接",
     "review_created": "排队发给复核方",
     "notice_created": "排队通知发起方",
+    "note_created": "排队补充消息",
+    "fyi_created": "排队告知（任务建立即关闭）",
     "peer_reply": "对方回复",
     "paused": "暂停发送",
     "resumed": "继续发送",
@@ -353,8 +371,12 @@ def reason_text(code: str | None, *, command: str | None = None) -> str:
 
 
 def role_label(attempt: Attempt) -> str:
-    """尝试的角色名；结束回执虽是 notice，但不是发给发起方的（DESIGN §45.31.6）。"""
-    return CLOSURE_LABEL if attempt.is_closure else ROLE_LABELS[attempt.role]
+    """尝试的角色名；结束回执、补充消息与告知虽是 notice，但不是发给发起方的（DESIGN §45.31.6、§95.5.6、§95.5.7）。"""
+    if attempt.is_closure:
+        return CLOSURE_LABEL
+    if attempt.is_fyi:
+        return FYI_LABEL
+    return NOTE_LABEL if attempt.is_note else ROLE_LABELS[attempt.role]
 
 
 @dataclass(frozen=True)

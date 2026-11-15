@@ -28,7 +28,11 @@ CONTROLS = frozenset({"active", "paused"})
 VERDICTS = frozenset({"approved", "changes_requested"})
 FLOWS = frozenset({"handoff", "review"})
 ROLES = frozenset({"handoff", "review", "notice"})
-NOTICE_KINDS = frozenset({"result", "reminder", "closure"})
+# 读方宽于写方：认得 note 与 fyi（§95.5.5、§95.5.7）。写方从不把这两种写进 checkpoint 定义——9a2ac62 及更早的读方
+# 是闭合枚举，见到会整封拒收，连带该任务此后每一份 checkpoint 都被拒（实测，/var/tmp/as-95/g4/xver）。
+# A 本机账本把这两种类别记在 localNoticeKind（fedstore.LOCAL_NOTICE_KIND），回滚后的旧 build_checkpoint 也读不到，
+# 写出的定义与新代码逐字相同；新读方仍认得它们，只作宽容读方（G4 审计 r1 P3-2）
+NOTICE_KINDS = frozenset({"result", "reminder", "closure", "note", "fyi"})
 
 
 def _native_id(value: object) -> str:

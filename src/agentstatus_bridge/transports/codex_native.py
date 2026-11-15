@@ -185,7 +185,8 @@ class BoundedConnection(WebSocket):
         self.unchanged()
         self._send_json({"method": "initialized"}, deadline)
 
-    def response(self, expected: int, deadline: float) -> dict[str, object]:
+    def response(self, expected: int, deadline: float, *, stale: Collection[int] = ()) -> dict[str, object]:
+        """等这个 id 的响应；`stale` 是已放弃等待的只读请求 id，它们迟到的应答丢弃（§95.5.4），其余 id 不符照旧报错。"""
         while True:
             self._remaining(deadline)
             opcode, payload = self._read_message(deadline)
@@ -197,6 +198,8 @@ class BoundedConnection(WebSocket):
             if "method" in message:
                 if "id" in message:
                     raise NativeFailure("server_request_seen")
+                continue
+            if type(message.get("id")) is int and message.get("id") in stale and message.get("id") != expected:
                 continue
             if (type(message.get("id")) is not int or message.get("id") != expected
                     or ("result" in message) == ("error" in message)):

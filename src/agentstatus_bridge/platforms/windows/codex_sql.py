@@ -8,10 +8,11 @@ from pathlib import Path
 import sqlite3
 
 from ...model import NameSource
+from ...native_names import cwd_tail
 from ...transports.codex_native import native_id, project_thread, ThreadMetadata
 from .files import WindowsPaths
 from .private_file import pinned_file
-from .thread_names import names, fields_valid, native_source
+from .thread_names import names, fields_valid, name_from_cwd, native_source
 
 STATE_NAME = 'state_5.sqlite'  # rust-v0.162.1 state/src/sqlite.rs:38
 SQL_TIMEOUT = 0.05
@@ -65,7 +66,9 @@ def read_classes(files: WindowsPaths, root: Path, threads: Sequence[str],
                  deadline: float, clock: Callable[[], float], *,
                  labels: dict[str, tuple[str, str]] | None = None,
                  sources: dict[str, str] | None = None,
-                 name_sources: dict[str, NameSource] | None = None) -> dict[str, ThreadMetadata]:
+                 name_sources: dict[str, NameSource] | None = None,
+                 workdirs: dict[str, str] | None = None,
+                 cwd_named: set[str] | None = None) -> dict[str, ThreadMetadata]:
     if not threads:
         return {}
     records: dict[str, ThreadMetadata] = {}
@@ -104,6 +107,11 @@ def read_classes(files: WindowsPaths, root: Path, threads: Sequence[str],
                             fact = native_source({'name': name, 'cwd': cwd})
                             if name_sources is not None and fact is not None:
                                 name_sources[key] = fact  # 与 labels 同行同库，原文另存（§91.3）
+                            tail = cwd_tail(cwd, windows=True)
+                            if workdirs is not None and tail is not None:
+                                workdirs[key] = tail  # 目录末段原文（§95.3），完整 cwd 不保留
+                            if cwd_named is not None and name_from_cwd({'name': name, 'cwd': cwd}):
+                                cwd_named.add(key)  # 主名取自 cwd 末段：本机显示不再重复目录
                 for thread, source, parent in rows:
                     key = native_id(thread)
                     if key is None or key not in wanted:
@@ -121,5 +129,9 @@ def read_classes(files: WindowsPaths, root: Path, threads: Sequence[str],
             sources.clear()
         if name_sources is not None:
             name_sources.clear()
+        if workdirs is not None:
+            workdirs.clear()
+        if cwd_named is not None:
+            cwd_named.clear()
         return {}  # Native may supply evidence; SQL failure cannot establish a root.
     return records

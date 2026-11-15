@@ -40,6 +40,13 @@ class WebSocket:
         self.receive_budget: int | None = None
         self.strict_size = False
         self.on_write_start: Callable[[], None] | None = None
+        # 当前这条消息已读走的字节数：读在消息中途中断时不为 0，流已失步（§95.5.4 读步骤超时后的复用判断）
+        self._inflight = 0
+
+    @property
+    def desynced(self) -> bool:
+        """上一次读在一条消息中途中断（超时或断开）：流已失步，这条连接不能再用。"""
+        return self._inflight > 0
 
     def _now(self) -> float:
         return self._clock()
@@ -152,6 +159,7 @@ class WebSocket:
                 raise _Closed("receive budget")
         if not chunk:
             raise _Closed("connection closed")
+        self._inflight += len(chunk)
         return chunk
 
     def _recv_exact(self, length: int, deadline: float) -> bytes:
@@ -160,6 +168,7 @@ class WebSocket:
             count = min(length, len(self._buffer))
             value.extend(self._buffer[:count])
             del self._buffer[:count]
+            self._inflight += count
         while len(value) < length:
             value.extend(self._recv(length - len(value), deadline))
         return bytes(value)
@@ -169,6 +178,7 @@ class WebSocket:
         if self._buffer:
             count = min(length, len(self._buffer))
             del self._buffer[:count]
+            self._inflight += count
             length -= count
         while length > 0:
             length -= len(self._recv(min(length, 65_536), deadline))
@@ -178,6 +188,7 @@ class WebSocket:
         opcode: int | None = None
         parts = bytearray()
         oversize = False
+        self._inflight = 0
         while True:
             first, second = self._recv_exact(2, deadline)
             final = bool(first & 0x80)
@@ -200,6 +211,8 @@ class WebSocket:
                     raise _Closed("server closed")
                 if frame_opcode == 0x9:
                     self._send_frame(0xA, payload, deadline)
+                if opcode is None:
+                    self._inflight = 0  # 控制帧读完、又不在一条数据消息中间：流仍在消息边界上
                 continue
             if frame_opcode == 0x0:
                 if opcode is None:
@@ -222,7 +235,9 @@ class WebSocket:
             if final:
                 if oversize:
                     opcode, oversize = None, False
+                    self._inflight = 0  # 超限消息已整条读完丢弃，回到消息边界
                     continue
+                self._inflight = 0
                 return opcode, bytes(parts)
 
     def _await_response(self, request_id: int, deadline: float) -> dict[str, object]:

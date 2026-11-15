@@ -59,8 +59,10 @@ def attention_declined(task: Task, attempts: list[Attempt], view: TaskView) -> b
     创建提醒前与发送排队中的提醒前共用：拒绝晚于提醒排队到达时，提醒同样作废（Codex 复审 S01）。
     """
     attention = attention_at(task, view)
+    # 任务内补充消息发给执行方：执行方拒收它不是发起方拒绝这次关注（DESIGN §95.5.3）
     return any(
-        attempt.role is Role.NOTICE and attempt.created_at >= attention and attempt.delivery in _DECLINED
+        attempt.role is Role.NOTICE and not attempt.is_note and attempt.created_at >= attention
+        and attempt.delivery in _DECLINED
         for attempt in attempts
     )
 
@@ -89,7 +91,8 @@ def pending_reminder(task: Task, attempts: list[Attempt]) -> PendingReminder | N
     attention = attention_at(task, view)
     since = attention
     for attempt in attempts:
-        if attempt.role is not Role.NOTICE:
+        # 补充消息不是给发起方的回执：既不挡住、也不重置发起方提醒（DESIGN §95.5.3）
+        if attempt.role is not Role.NOTICE or attempt.is_note:
             continue
         if attempt.options.get(REMINDER_OPTION) == token or attempt.delivery in _NOT_YET_ARRIVED:
             return None

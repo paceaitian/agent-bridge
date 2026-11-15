@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 import re
 import time
@@ -12,15 +12,17 @@ from ...transports.codex_native import (
     BoundedConnection, MAX_IDS, NativeFailure, WINDOWS_READ_SECONDS, ThreadMetadata,
     native_id, project_thread,
 )
+from ...transports.codex_rpc import thread_runtime
 from ...transports.websocket import _Closed, _Timeout
 from .codex_sql import read_classes, source_class
 from .local_transport import WindowsPlatform
 from .target_aliases import AliasFile, AliasSet, ALIAS
-from .thread_names import names, fields_valid, native_source
-from ...model import Endpoint, EndpointRef, NameSource, Provider
+from .thread_names import names, fields_valid, name_from_cwd, native_source
+from ...labels import RUNTIME_LABELS
+from ...model import Endpoint, EndpointRef, NameSource, Provider, Runtime
 from ...native_names import (
-    NO_NAME, TARGET_ID_UNVERIFIED, UNKNOWN_NAME, NameFacts, NameView, Selector, SelectorError, endpoint_text,
-    id_prefixes, parse_selector, project,
+    NO_NAME, TARGET_ID_UNVERIFIED, UNKNOWN_NAME, NameFacts, NameView, Selector, SelectorError, cwd_tail, endpoint_text,
+    id_prefixes, parse_selector, project, shown_name, workdir_suffix, workdir_text,
 )
 
 PAGE_SIZE, MAX_LOADED = 256, 4096
@@ -52,6 +54,12 @@ class Candidate:
     stable: bool = True
     # §91 原生主名事实（原文、未转义、保留截断标志）；name/cwd_label 是旧的本机名字分支用的转义值
     name_source: NameSource | None = field(default=None, repr=False, compare=False)
+    # 工作目录末段原文（§95.3，未转义；cwd_label 是旧名字分支用的转义值，不拿来展示目录）
+    workdir: str | None = field(default=None, repr=False, compare=False)
+    # 原生主名取自 cwd 末段（无名线程）：主名就是目录名，本机文字不再重复「目录」（审计 r1 Opus P3-7）
+    name_from_cwd: bool = field(default=False, repr=False, compare=False)
+    # 忙闲（§96.2）：只有 peers 请求时（discover(with_status=True)）才给可投递根线程取 thread.status，其余行 UNKNOWN
+    runtime: Runtime = field(default=Runtime.UNKNOWN, repr=False, compare=False)
 
     @property
     def eligible(self) -> bool:
@@ -64,6 +72,12 @@ class Candidate:
         if self.metadata_verified and self.kind in ('subagent', 'internal'):
             return NO_NAME
         return self.name_source if self.name_source is not None else UNKNOWN_NAME
+
+    @property
+    def name_is_workdir(self) -> bool:
+        """显示的主名本身取自 cwd 末段（无名线程）：本机文字不再写「目录」，发布的快照行也不带 workdir，远端因此
+        不会重复显示（审计 r1 Opus P3-7）。按名字来源判断，不比较字符串：名字按 96 字符截断，目录按 120。"""
+        return self.name_from_cwd and self.native_name.state == 'named'
 
 
 def _selector(reference: str | Selector | None) -> Selector:
@@ -190,7 +204,10 @@ class Discovery:
         label = self.target_name(row).removeprefix('codex@')
         return Endpoint(EndpointRef(Provider.CODEX, row.thread, self.daemon[0],
                                    'win-filetime:'+self.daemon[1], label=label, data_root=self.root_identity), consumers=0,
-                        name_source=row.native_name, name_view=self.name_views[row.thread])
+                        name_source=row.native_name, name_view=self.name_views[row.thread],
+                        workdir=None if row.name_is_workdir else row.workdir,  # 名字就是目录名时快照不再带目录
+                        runtime=row.runtime,
+                        runtime_source='none' if row.runtime is Runtime.UNKNOWN else 'codex_thread_status')
 
     def document(self) -> dict[str, object]:
         views = self.name_views
@@ -203,14 +220,14 @@ class Discovery:
                                         'message': '别名目标当前不可用'} for a in self.aliases.unavailable],
                 # peers 的 target 一律完整 ID（§91.4.2）；alias 与 label 只是本机诊断字段
                 'peers': [{'target': views[r.thread].target if r.eligible else None, 'nativeId': r.thread, 'provider': 'codex',
-                           'pane': None, 'runtime': 'unknown', 'kind': r.kind, 'eligible': r.eligible, 'stable': r.stable,
+                           'pane': None, 'runtime': r.runtime.value, 'kind': r.kind, 'eligible': r.eligible, 'stable': r.stable,
                            'label': r.label, 'aliases': list(self._aliases_by_thread.get(r.thread, ())),
                            'name': views[r.thread].name, 'displayName': views[r.thread].display_name,
                            'nameVerified': views[r.thread].verified,
                            'metadataSource': r.metadata_source, 'sourceClass': r.source_class,
                            'sqlPresent': r.sql_present, 'parentPresent': r.parent is not None,
                            'metadata': r.kind if r.metadata_verified else '元数据未核实',
-                           'warning': NO_PANE_WARNING} for r in self.rows]}
+                           'warning': NO_PANE_WARNING, 'workdir': workdir_text(r.workdir)} for r in self.rows]}
 
     def target_name(self, row: Candidate) -> str:
         """本机私有 label（§91.6：endpoint() 仍用它生成 EndpointRef.label）：能往返选回本行的 alias、旧名字或
@@ -267,7 +284,29 @@ class Reader:
             cursor = next_cursor
 
 
-def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = None) -> Discovery:
+def _statuses(reader: Reader, rows: tuple[Candidate, ...], known: dict[str, Runtime], budget: int) -> dict[str, Runtime]:
+    """可投递根线程的忙闲（§96.2）：发现过程已读过 thread/read 的直接复用，其余在剩下的 MAX_IDS 与读超时预算内补读；
+    超预算或补读出错（超时、断连、对方异常、应答对不上请求的线程）就停，没读到的行保持 UNKNOWN。不改变发现的完整性
+    与 eligible。
+
+    补读与分类补证同样新线程优先（rows 按线程 ID 升序，上游 ThreadId 是 UUID v7，升序即创建时间升序）：额度不够时，
+    拿不到忙闲的是最旧的线程。"""
+    result = {row.thread: known[row.thread] for row in rows if row.eligible and row.thread in known}
+    for row in [row for row in reversed(rows) if row.eligible and row.thread not in known][:max(0, budget)]:
+        try:
+            response = reader.request('thread/read', {'threadId': row.thread, 'includeTurns': False})
+        except (NativeFailure, OSError, _Closed, _Timeout, ValueError):
+            break  # 连接状态已不可信：剩下的行不再补读
+        value = response.get('thread') if isinstance(response, dict) else None
+        if isinstance(value, dict) and native_id(value.get('id')) != row.thread:
+            break  # 应答的线程不是所请求的：与协议失步同口径，这一行与剩下的行都不补读
+        result[row.thread] = thread_runtime(response)  # 错误应答（result 为 None）只让这一行 UNKNOWN
+    return result
+
+
+def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = None,
+             with_status: bool = False) -> Discovery:
+    """一次只读发现：loaded 集合、分类与名字证据；with_status 为真（只有 peers 显示用）时另取可投递根线程的忙闲。"""
     clock = clock or time.monotonic
     try:
         backend.files.codex_home().lstat()
@@ -293,10 +332,15 @@ def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = No
             loaded = reader.loaded()
             labels: dict[str, tuple[str, str]] = {}
             name_sources: dict[str, NameSource] = {}
+            workdirs: dict[str, str] = {}
+            cwd_named: set[str] = set()
             sources: dict[str, str] = {}
             records: dict[str, ThreadMetadata] = {}
             sql_present: set[str] = set()
             metadata_sources: dict[str, str] = {}
+            # 发现过程里读到的 thread.status，只在 peers 取忙闲（with_status）时记录并复用；worker、send、status、caller
+            # 的发现不执行 thread_runtime，忙闲映射将来出错也拖不垮投递路径的发现（审计 r1）
+            statuses: dict[str, Runtime] = {}
             hidden: set[str] = set()
             native_reads = 0
             missing: list[str] = []
@@ -305,9 +349,14 @@ def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = No
                 batch_labels: dict[str, tuple[str, str]] = {}
                 batch_names: dict[str, NameSource] = {}
                 batch_sources: dict[str, str] = {}
+                batch_workdirs: dict[str, str] = {}
+                batch_cwd_named: set[str] = set()
                 sql = read_classes(files, sql_root or home, ids, deadline, clock,
-                                   labels=batch_labels, sources=batch_sources, name_sources=batch_names)
+                                   labels=batch_labels, sources=batch_sources, name_sources=batch_names,
+                                   workdirs=batch_workdirs, cwd_named=batch_cwd_named)
                 labels.update(batch_labels)
+                workdirs.update(batch_workdirs)
+                cwd_named.update(batch_cwd_named)
                 name_sources.update(batch_names)
                 sources.update(batch_sources)
                 records.update(sql)
@@ -323,6 +372,8 @@ def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = No
                     result = reader.request('thread/read', {'threadId': thread, 'includeTurns': False})
                     if not isinstance(result, dict) or not isinstance(result.get('thread'), dict):
                         continue
+                    if with_status:
+                        statuses[thread] = thread_runtime(result)
                     value = result['thread']
                     fact = project_thread(value, thread)
                     if value.get('ephemeral') is True:
@@ -339,9 +390,16 @@ def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = No
                     records[thread] = fact
                     if fields_valid(value):
                         labels[thread] = names(value)
+                        tail = cwd_tail(value.get('cwd'), windows=True)
+                        if tail is not None:
+                            workdirs[thread] = tail
                     native = native_source(value)
                     if native is not None:
                         name_sources[thread] = native
+                        if name_from_cwd(value):  # 与 name_sources 同一份响应定名字来源
+                            cwd_named.add(thread)
+                        else:
+                            cwd_named.discard(thread)
             classify(loaded)
             after = reader.loaded()
             first_set = set(loaded)
@@ -366,9 +424,12 @@ def discover(backend: WindowsPlatform, *, clock: Callable[[], float] | None = No
                                    fact.kind != 'unknown' and not (fact.kind == 'subagent' and fact.parent is None),
                                    *labels.get(t, ('', '')), t in labels,
                                    metadata_sources.get(t, 'none'), sources.get(t, 'other'), t in sql_present, t in stable,
-                                   name_sources.get(t))
+                                   name_sources.get(t), workdirs.get(t), t in cwd_named)
                          for t in loaded if t not in hidden for fact in (records.get(t, ThreadMetadata('unknown')),))
             aliases = aliases.bind(home_identity, daemon, {r.thread for r in rows if r.eligible})
+            if with_status:  # 完整性已定：补读只填忙闲，失败也不影响上面的结论
+                found = _statuses(reader, rows, statuses, MAX_IDS - native_reads)
+                rows = tuple(replace(r, runtime=found[r.thread]) if r.thread in found else r for r in rows)
             return Discovery(rows, True, 'metadata_unverified' if any(not r.metadata_verified for r in rows)
                              else 'complete', root_identity, daemon, aliases, home_identity,
                              len(hidden), len(loaded), native_reads, len(missing) > MAX_IDS)
@@ -392,7 +453,9 @@ def print_peers(result: Discovery) -> None:
         # 现役 alias 只作本机旁注（§91.3 本机例外），不是规范 target，也不进 JSON 以外的网络输出
         aliases = result._aliases_by_thread.get(row.thread, ())
         note = f"  本机别名={'、'.join(aliases)}（仅本机可用）" if aliases else ''
-        print(f'{endpoint_text(view)}  target={target}  [{suffix}] 状态未知{note}')
+        # 显示的主名本身取自 cwd 末段时不再写「目录」（Candidate.name_is_workdir）
+        workdir = '' if row.name_is_workdir else workdir_suffix(workdir_text(row.workdir), shown_name(view))
+        print(f'{endpoint_text(view)}  target={target}  [{suffix}] {RUNTIME_LABELS[row.runtime]}{note}{workdir}')
     for name in result.aliases.unavailable:
         print(f'别名 {name}  别名目标当前不可用')
     if result.aliases.reason != 'ok':

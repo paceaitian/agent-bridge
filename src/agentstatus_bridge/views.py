@@ -19,6 +19,7 @@ from .labels import (
     CONSUMPTION_LABELS,
     DELIVERY_LABELS,
     EVENT_LABELS,
+    FYI_STATUS_LABEL,
     WORK_LABELS,
     next_step,
     reason_text,
@@ -29,6 +30,10 @@ from .labels import (
 from .model import (
     CLOSURE_KIND,
     CLOSURE_STATE_OPTION,
+    FOR_SEQ_OPTION,
+    FYI_KIND,
+    NOTE_KIND,
+    NOTICE_KIND_OPTION,
     PHASE_LABELS,
     Attempt,
     Consumption,
@@ -138,6 +143,12 @@ def _attempt_document(attempt: Attempt, *, include_body: bool, names: NameBook =
         # 结束回执（DESIGN §45.31）：role 仍是 notice，另标类别与终态
         document["kind"] = CLOSURE_KIND
         document["closure"] = attempt.options.get(CLOSURE_STATE_OPTION)
+    elif attempt.is_note:
+        # 任务内补充消息（DESIGN §95.5.6）：类别与所补的工作尝试序号
+        document[NOTICE_KIND_OPTION] = NOTE_KIND
+        document[FOR_SEQ_OPTION] = attempt.note_for_seq
+    elif attempt.is_fyi:
+        document[NOTICE_KIND_OPTION] = FYI_KIND  # 一句话告知（DESIGN §95.5.7）
     if include_body:
         document["body"] = attempt.body
     return document
@@ -212,6 +223,8 @@ def _task_document(
     follows = task.options.get("follows")
     if isinstance(follows, str):
         document["follows"] = follows  # send --follows 记下的旧任务（§93.3）；无关联时不出现该键
+    if task.is_fyi:
+        document["fyi"] = True  # 一句话告知（§95.5.7）；普通任务不出现该键
     return document
 
 
@@ -250,8 +263,14 @@ def _print_task(
         hint = _NO_HINT
     cmd = command_name()
     title = f"「{task.title}」" if task.title else ""
-    print(f"任务 {short(task.id)} {title} {PHASE_LABELS[view.phase]}：{reason_text(view.reason)}")
-    flow = "交接" if task.flow is Flow.HANDOFF else f"实现 → 复核（{names.text(task.reviewer) if task.reviewer else '?'}）"
+    if task.is_fyi:
+        # 一句话告知（DESIGN §95.5.7）：状态行写「已告知（关闭）」加那条告知的投递状态
+        state = DELIVERY_LABELS[attempts[0].delivery] if attempts else "-"
+        print(f"任务 {short(task.id)} {title} {FYI_STATUS_LABEL}：{state}")
+        flow = "告知（只需读到，不汇报、不验收）"
+    else:
+        print(f"任务 {short(task.id)} {title} {PHASE_LABELS[view.phase]}：{reason_text(view.reason)}")
+        flow = "交接" if task.flow is Flow.HANDOFF else f"实现 → 复核（{names.text(task.reviewer) if task.reviewer else '?'}）"
     origin = names.text(task.origin) if task.origin else "用户"
     print(f"流程：{flow}；发起：{origin}；创建于 {_age(task.created_at, now)}")
     for line in relations:  # 承接/后续任务（§93.3），由 cli 跨本机账本与联邦库查好
@@ -272,8 +291,12 @@ def _print_task(
             consumption = "本桥已移除该队列项；不证明未执行，不能停止已开始的工作"
         if consumption:
             delivery = f"{delivery}，{consumption}"
-        work = "" if attempt.role is Role.NOTICE else f"；工作：{WORK_LABELS[attempt.work]}"
-        print(f"  #{attempt.seq} {role_label(attempt)} → {names.text(attempt.target)}：{delivery}{work}")
+        if attempt.is_note or attempt.is_fyi:
+            # 补充消息与告知不跟踪工作，单列一种写法（DESIGN §95.5.6、§95.5.7）
+            print(f"  {role_label(attempt)} #{attempt.seq} → {names.text(attempt.target)}（{delivery}）")
+        else:
+            work = "" if attempt.role is Role.NOTICE else f"；工作：{WORK_LABELS[attempt.work]}"
+            print(f"  #{attempt.seq} {role_label(attempt)} → {names.text(attempt.target)}：{delivery}{work}")
         for line in _describe_result(attempt.result):
             print(f"      {line}")
         if show_body:

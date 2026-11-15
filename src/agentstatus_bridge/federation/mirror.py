@@ -103,7 +103,7 @@ def suppress_reason(task: FedTask, attempt: FedAttempt) -> str | None:
     """B 上未进入 intent 的作业是否应被 A 的最新控制抑制：返回抑制原因或 None（收件、worker 领取与 relay 唤醒共用）。"""
     if task.local_archived:
         return "mirror_archived"
-    if attempt.is_closure:
+    if attempt.delivers_after_finish:  # 结束回执与告知：任务结束后才发或建立即关闭（§45.31.5、§95.5.7）
         return None
     if task.finished:
         return "task_finished"
@@ -158,7 +158,7 @@ def blocked(store: FederatedStore, ident: authority.Identity, task: FedTask, att
     hubs = store.task_hubs(task.authority_device, task.task_id)
     if hubs and ident.hub_id not in hubs:
         return True  # 旧 hub 路由上的任务：灾难换 hub 后冻结，不自动接到新 hub（§88.11）
-    return task.paused and not attempt.is_closure
+    return task.paused and not attempt.delivers_after_finish
 
 
 def reminder_candidates(store: FederatedStore, now: int) -> Iterator[tuple[FedTask, PendingReminder, bool]]:

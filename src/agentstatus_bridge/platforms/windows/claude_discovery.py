@@ -8,10 +8,10 @@ import re
 import time
 from typing import Any, cast
 
-from ...model import Endpoint, EndpointRef, Provider, Runtime
+from ...model import Endpoint, EndpointRef, Provider, claude_registry_runtime
 from ...native_names import (
-    TARGET_ID_UNVERIFIED, UNKNOWN_NAME, NameFacts, NameView, Selector, SelectorError, canonical, name_source,
-    parse_selector, project as project_names,
+    TARGET_ID_UNVERIFIED, UNKNOWN_NAME, NameFacts, NameView, Selector, SelectorError, canonical, cwd_tail, name_source,
+    parse_selector, project as project_names, workdir_text,
 )
 from ...transports.codex_native import NativeFailure, native_id
 from .claude_auth import PeerFiles, PIPE, generation
@@ -60,8 +60,11 @@ def project(data: dict[str, Any], pid: int, birth: str, root: str) -> Endpoint:
     raw = data.get('name')
     name = raw[:80] if isinstance(raw, str) and raw.strip() else None
     return Endpoint(EndpointRef(Provider.CLAUDE, session, pid, 'win-filetime:' + birth, data_root=root),
-                    runtime=Runtime.UNKNOWN, runtime_source='none', name=name, socket_path=pipe,
-                    issues=tuple(issues), name_source=name_source(raw, limit=80))  # 截断前保存事实（§91.3）
+                    # 忙闲取注册信息的 status，与 Linux 同一张表；只读这一个键（§96.2、96.4）
+                    runtime=claude_registry_runtime(data.get('status')), runtime_source='claude_registry',
+                    name=name, socket_path=pipe,
+                    issues=tuple(issues), name_source=name_source(raw, limit=80),  # 截断前保存事实（§91.3）
+                    workdir=cwd_tail(data.get('cwd'), windows=True))  # 注册信息的 cwd 只留末段（§95.3）
 
 
 def inspect(backend: WindowsPlatform, pid: int, *, connect: bool = True,
@@ -170,10 +173,10 @@ class Discovery:
     def document(self) -> list[dict[str, object]]:
         views = self.name_views()
         return [{'provider': 'claude', 'target': 'claude@id:' + e.ref.native_id, 'nativeId': e.ref.native_id,
-                 'pane': None, 'runtime': 'unknown', 'kind': 'root',
+                 'pane': None, 'runtime': e.runtime.value, 'kind': 'root',
                  'eligible': not e.blocking_issues, 'name': views[_binding(e)].name,
                  'displayName': views[_binding(e)].display_name, 'nameVerified': views[_binding(e)].verified,
-                 'issues': list(e.issues)}
+                 'issues': list(e.issues), 'workdir': workdir_text(e.workdir)}
                 for e in (*self.endpoints, *self.duplicates)]
 
 

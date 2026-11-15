@@ -519,6 +519,25 @@ class WakeTests(RelayTestCase):
         self.b.cycle()
         self.assertEqual(int(self.b.store.meta("directoryRevision") or "0"), first + 2)
 
+    def test_directory_features_survive_the_hub_round_trip(self) -> None:
+        # §95.5.7：告知的能力门读对端目录快照的可选键 features；真实 directory.snapshot() → directory_put →
+        # hub → directory_get → relay 落 fed_device_state，这条链要原样保住顶层新键（hub/relay 只校验 endpoints/complete）
+        from agentstatus_bridge.federation import directory
+        self.b.relay._directory = lambda: directory.snapshot(  # pyright: ignore[reportPrivateUsage]
+            self.b.store, self.b.device_id, [], provider_complete={"codex": True})
+        self.b.cycle()
+        self.tick(31_000)
+        self.a.cycle()
+        self.assertEqual(directory.device_features(self.a.store, self.b.device_id), frozenset({"fyi"}))
+        # 旧版本对端的快照没有这个键：按空集，发起方据此拒发告知
+        self.b.relay._directory = lambda: {  # pyright: ignore[reportPrivateUsage]
+            "endpoints": [], "complete": True, "providers": {"codex": True}, "namePolicy": "agent-native-v1"}
+        self.tick(31_000)
+        self.b.cycle()
+        self.tick(31_000)
+        self.a.cycle()
+        self.assertEqual(directory.device_features(self.a.store, self.b.device_id), frozenset())
+
     def test_work_paused_after_wake_is_rewoken_on_resume(self) -> None:
         # 拉起之后才暂停：作业离开候选、记录随之清掉；恢复后算新作业，立即拉起（Opus r2-P3-2 N02）
         task, _ = self.create()

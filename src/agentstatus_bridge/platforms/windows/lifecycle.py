@@ -9,6 +9,7 @@ import signal
 from types import FrameType
 from typing import Any
 
+from ..lock_retry import retry_lock
 from .files import WindowsPaths
 
 
@@ -40,14 +41,8 @@ class WindowsLifecycle:
         self.api.lock(fd, shared=shared)
 
     def acquire_worker_lock(self, fd: int) -> bool:
-        for attempt in range(5):
-            try:
-                self.try_lock(fd)
-                return True
-            except BlockingIOError:
-                if attempt < 4:
-                    time.sleep(0.02)
-        return False
+        """取单实例排他锁；被占用时按与 Linux 共用的时间预算重试（DESIGN §95.2）。"""
+        return retry_lock(lambda: self.try_lock(fd))
 
     def unlock(self, fd: int) -> None:
         self.api.unlock(fd)

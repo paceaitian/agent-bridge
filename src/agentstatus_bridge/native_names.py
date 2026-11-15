@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
+import ntpath
+import posixpath
 import re
 from typing import Literal
 import unicodedata
@@ -158,6 +160,44 @@ def display_text(source: NameSource) -> str | None:
     if source.truncated:
         text += '…'
     return text if len(text) <= DISPLAY_LIMIT else text[:DISPLAY_LIMIT - 1] + '…'
+
+
+def cwd_tail(cwd: object, *, windows: bool = False) -> str | None:
+    """工作目录末段（§95.3）：POSIX 只认 `/`，Windows 同时认 `\\` 与 `/`；非字符串、空值或根目录视为无。
+    只返回末段原文（未转义），完整路径不保留。"""
+    if not isinstance(cwd, str):
+        return None
+    tail = ntpath.basename(cwd.rstrip('/\\')) if windows else posixpath.basename(cwd.rstrip('/'))
+    return tail or None
+
+
+def workdir_text(tail: str | None) -> str | None:
+    """目录末段的展示文本：与 displayName 同一套转义与 120 字符限长；无或只有空白为 None。"""
+    return display_text(NameSource('named', tail)) if tail else None
+
+
+def remote_workdir(value: object) -> str | None:
+    """对端快照里的 workdir（§95.3）：只认字符串；去掉会被消费者改动的字符（控制、格式、行/段分隔符，含 RLO 与
+    零宽字符，同 copyable 的拒绝集合），再按 120 字符限长；去完为空或只剩空白为 None。正常写方已转义，这里只防
+    对端异常帧把换行或倒排字符拼进本机输出。"""
+    if not isinstance(value, str):
+        return None
+    text = ''.join(char for char in value if not _altered_char(char))
+    if not text.strip():
+        return None
+    return text if len(text) <= DISPLAY_LIMIT else text[:DISPLAY_LIMIT - 1] + '…'
+
+
+def workdir_suffix(workdir: str | None, shown: str | None) -> str:
+    """人读行的「  目录 <末段>」：workdir 是已转义的展示文本；与该行显示的名字相同（区分大小写）时不加。"""
+    if not workdir or workdir == shown:
+        return ''
+    return f'  目录 {workdir}'
+
+
+def shown_name(view: NameView) -> str | None:
+    """endpoint_text 在这一行实际显示的名字：已核实取主名，否则取展示名；用于判断目录末段是否与名字重复。"""
+    return view.name if view.verified and view.name is not None else view.display_name
 
 
 def id_prefix(native_id: str, ids: Iterable[str], *, complete: bool) -> str:

@@ -19,7 +19,10 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import bridge_support
+import test_bridge_codex_steer as steer_tests
 import test_bridge_federation_cli as federation_cli
+import test_bridge_fyi as fyi_tests
+import test_bridge_note as note_tests
 import test_bridge_task_filters as task_filters
 
 from agentstatus_bridge.federation import attachments, directory
@@ -39,6 +42,10 @@ FEDERATION_MODULES = ("test_bridge_federation_codec", "test_bridge_federation_at
                       "test_bridge_federation_transport_close")
 # §94.3：§93 的 tasks 筛选与 --follows 也进选择集（Windows 上认得出的调用方 --mine、名字形 --to 的假内核用例在其中）
 TASK_MODULES = ("test_bridge_task_filters", "test_bridge_task_follows")
+# §95.6：ab note 与 send --fyi 的新模块同样进选择集
+NOTE_MODULES = ("test_bridge_note", "test_bridge_codex_steer", "test_bridge_fyi")
+# §95.2：worker 取锁按时间预算重试的用例（含 Windows 假内核取锁）
+WORKER_MODULES = ("test_bridge_worker_lock",)
 
 
 class WindowsDeliveryTests(unittest.TestCase):
@@ -147,7 +154,7 @@ class SelectionTests(unittest.TestCase):
 
     def test_windows_ci_selection_includes_federation(self) -> None:
         modules = tuple(str(item) for item in self.selector_constant("MODULES"))
-        for name in FEDERATION_MODULES + TASK_MODULES:
+        for name in FEDERATION_MODULES + TASK_MODULES + NOTE_MODULES + WORKER_MODULES:
             self.assertIn(name, modules)
         for name in modules:
             self.assertTrue((ROOT / "tests" / f"{name}.py").is_file(), name)
@@ -157,7 +164,8 @@ class SelectionTests(unittest.TestCase):
         source = (ROOT / "tests" / "test_bridge_federation_attachments.py").read_text(encoding="utf-8")
         self.assertIn(f'"{prefix}', source)  # 附件测试的 posix_only 跳过原因必须是选择器放行的前缀
         # tasks 两个模块的跳过都来自两个夹具基类与 tzset 那条（§94.3）：三个原因常量都以放行前缀开头
-        for reason in (task_filters.LINUX_FIXTURE_REASON, task_filters.TZSET_REASON, federation_cli.FED_FIXTURE_REASON):
+        for reason in (task_filters.LINUX_FIXTURE_REASON, task_filters.TZSET_REASON, federation_cli.FED_FIXTURE_REASON,
+                       note_tests.LINUX_FIXTURE_REASON, steer_tests.LINUX_FIXTURE_REASON, fyi_tests.LINUX_FIXTURE_REASON):
             with self.subTest(reason=reason):
                 self.assertTrue(reason.startswith(prefix), reason)
 

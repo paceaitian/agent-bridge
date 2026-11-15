@@ -20,7 +20,7 @@ from ..closure import ACCEPTED
 from ..endpoints import ADAPTERS, Caller, DiscoverySources, Endpoint, discover
 from ..endpoints import _ids_complete  # pyright: ignore[reportPrivateUsage]  与本机解析/名字投影同一身份判据（§94.1）
 from ..ids import short
-from ..labels import reason_text
+from ..labels import FYI_LABEL, FYI_STATUS_LABEL, NOTE_LABEL, reason_text
 from ..model import PHASE_LABELS, Attempt, EndpointRef, Phase, Provider, ReportKind, Task, TaskView, describe
 from ..naming import command_name
 from ..native_names import full_id_token
@@ -215,7 +215,7 @@ def freeze_refs(rt: Runtime, paths: list[str], cwd: Path) -> list[Frozen]:
 
 def send(rt: Runtime, *, target: TargetRef, body: str, title: str, ref_paths: list[str], cwd: Path,
          origin: EndpointRef | None, origin_class: str | None, reviewer: TargetRef | None, allow_shared: bool,
-         no_notify: bool, follows: str | None = None) -> SendOutcome:
+         no_notify: bool, follows: str | None = None, fyi: bool = False) -> SendOutcome:
     """A 上建联邦任务（L0）。至少一方在别的设备（本机目标 + 远端复核也算）；参与设备超过两台写前拒绝（§88.14/T16）。
 
     follows 是 `--follows` 解析出的旧任务完整 ID，只写进本机 state（§93.3），不进 checkpoint 与信封。
@@ -225,6 +225,9 @@ def send(rt: Runtime, *, target: TargetRef, body: str, title: str, ref_paths: li
     local_target_only = target.remote.device_id == rt.ident.device_id
     if local_target_only and (reviewer is None or reviewer.remote.device_id == rt.ident.device_id):
         raise FedCliError("target_is_local_device", 2)  # 全在本机：用本机 send
+    if fyi and "fyi" not in directory.device_features(rt.store, target.remote.device_id):
+        # 告知保留能力门（§95.5.7）：旧镜像会按「任务已结束」抑制，不落账、不发
+        raise FedCliError("fyi_remote_unsupported", 3)
     if reviewer is not None:
         if len({rt.ident.device_id, target.remote.device_id, reviewer.remote.device_id}) > 2:
             raise FedCliError("federation_review_device_unsupported")
@@ -237,6 +240,13 @@ def send(rt: Runtime, *, target: TargetRef, body: str, title: str, ref_paths: li
     blobs, blob_bytes, references = attachments.transfer_summary(frozen)
     reviewer_token = full_id_token(reviewer.local) if reviewer is not None and reviewer.local is not None else None
     try:
+        if fyi:
+            task, attempt = authority.create_fyi(
+                rt.store, rt.ident, title=title, body=body, refs=[item.manifest for item in frozen],
+                origin=origin_target, origin_actor=origin_actor, origin_class=origin_class or "unknown",
+                target=target, allow_shared=allow_shared, now=now_ms(), follows=follows)
+            return SendOutcome(task, attempt, target, blobs, blob_bytes, references,
+                               device_name(rt, target.remote.device_id))
         task, attempt = authority.create_task(
             rt.store, rt.ident, title=title, flow="review" if reviewer else "handoff", body=body,
             refs=[item.manifest for item in frozen], origin=origin_target, origin_actor=origin_actor,
@@ -297,8 +307,10 @@ def report(rt: Runtime, *, task: FedTask, kind: ReportKind, attempt_seq: int | N
     """目标设备上的联邦报告：核本机真实接收方与当前 attempt，冻结附件，事务分配 reportNo；A 本机参与方立即裁决。"""
     if task.finished:
         raise FedCliError("task_finished")
-    mine = [item for item in rt.store.attempts(task.authority_device, task.task_id)
-            if item.role != "notice" and item.target_device == rt.ident.device_id]
+    attempts = rt.store.attempts(task.authority_device, task.task_id)
+    if attempt_seq is not None and any(item.seq == attempt_seq and item.role == "notice" for item in attempts):
+        raise FedCliError("attempt_not_reportable")  # 补充消息等 notice 不需要汇报，与本机同一原因码（§95.5.3）
+    mine = [item for item in attempts if item.role != "notice" and item.target_device == rt.ident.device_id]
     current = next((item for item in mine if item.seq == task.current_work_seq), None)
     attempt = current if attempt_seq is None else next((item for item in mine if item.seq == attempt_seq), None)
     if attempt is None:
@@ -409,6 +421,26 @@ def finish(rt: Runtime, task: FedTask, state: str, *, caller: Caller, caller_cla
         raise FedCliError(error.code) from error
 
 
+def note(rt: Runtime, task: FedTask, *, caller: Caller, caller_class: str | None, body: str) -> FedAttempt:
+    """跨设备任务的 `ab note`（DESIGN §95.5.5）：只在权威设备建尝试，经现有 notice 信封送到目标设备投递。
+
+    不做权限校验（寻址由任务决定）；发送者按调用方会话的结构化身份记（与 send 同口径）。
+    """
+    if not task.is_authority:
+        raise FedCliError("note_not_authority")
+    if len(body.encode("utf-8")) > MAX_BODY_BYTES:
+        raise FedCliError("message_too_large")
+    if not body.strip():
+        raise FedCliError("empty_message")
+    sender = _actor(rt, caller.endpoint.ref) if caller.endpoint is not None else None
+    try:
+        _, attempt = authority.add_note(rt.store, rt.ident, task, body=body, sender=sender,
+                                        sender_class=caller_class or "unknown", now=now_ms())
+    except StoreError as error:
+        raise FedCliError(error.code) from error
+    return attempt
+
+
 def retry(rt: Runtime, task: FedTask, *, caller: Caller, message: str | None, force: bool,
           new_target: TargetRef | None, allow_shared: bool,
           rework_body: Callable[[Attempt, Attempt, Task, str | None], str]) -> authority.RetryOutcome:
@@ -484,7 +516,11 @@ def _attempt_rows(rt: Runtime, task: FedTask) -> list[dict[str, Any]]:
                 entry["reason"] = item["reason"]
             files.append(entry)
         local = attempt.target_device == rt.ident.device_id
+        # 补充消息另标类别与所补序号（§95.5.6），告知标类别（§95.5.7）
+        kind: dict[str, Any] = ({"noticeKind": "note", "forSeq": attempt.options.get("forSeq")} if attempt.is_note
+                                else {"noticeKind": "fyi"} if attempt.is_fyi else {})
         rows.append({
+            **kind,
             "seq": attempt.seq, "role": attempt.role, "msgId": attempt.msg_id,
             "targetDevice": attempt.target_device, "targetDeviceName": device_name(rt, attempt.target_device),
             "target": f"{attempt.target.remote.provider.value}@id:{attempt.target.remote.native_id}",
@@ -522,10 +558,18 @@ def task_document(rt: Runtime, task: FedTask, *, now: int, include_body: bool = 
     follows = task.state.get("follows")
     if isinstance(follows, str):
         document["follows"] = follows  # 只在发起设备本机有（§93.3）；无关联时不出现该键
+    if task.is_fyi:
+        document["fyi"] = True  # 一句话告知（§95.5.7）；普通任务不出现该键
     if include_body:
         first = next((item for item in attempts if item.role != "notice"), None)
         document["body"] = first.body if first is not None else ""
     return document
+
+
+def _fyi_delivery(document: dict[str, Any]) -> str:
+    """告知任务唯一那条 notice 的投递状态（联邦 L3 原值）。"""
+    rows = document.get("attempts") or []
+    return str(rows[0].get("delivery", "pending")) if rows else "-"
 
 
 _NETWORK_LABELS = {"ready": "待传", "submitting": "提交中", "accepted": "hub 已收", "received": "对端已落账",
@@ -540,14 +584,18 @@ def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False)
     role = "本机发起（权威）" if task.is_authority else f"镜像（发起设备 {document['authorityDeviceName']}）"
     age = max(0, (now - task.last_sync_at) // 1000)
     flags = ("；需同步" if task.sync_required else "") + ("；仅本机已归档" if task.local_archived else "")
+    state = (f"{FYI_STATUS_LABEL}（{_fyi_delivery(document)}）" if task.is_fyi
+             else f"{PHASE_LABELS[view.phase]}（{reason_text(view.reason)}）")
     lines = [f"跨设备任务 {short(task.task_id)}  {task.title}",
-             f"  {role}；{PHASE_LABELS[view.phase]}（{reason_text(view.reason)}）；最近同步 {age} 秒前{flags}"]
+             f"  {role}；{state}；最近同步 {age} 秒前{flags}"]
     if document["stalled"]:
         lines.append("  需处理：远端离线/传输未恢复（待传超过 30 分钟；不改变任务状态）")
     for row in document["attempts"]:
         network = _NETWORK_LABELS.get(str(row["network"]), "-")
         reported = "，对方已汇报" if row["receiverReported"] else ""
-        lines.append(f"  #{row['seq']} {row['role']} → {row['targetDeviceName']} {row['target']}"
+        label = (f"{NOTE_LABEL} #{row['seq']}" if row.get("noticeKind") == "note"
+                 else f"{FYI_LABEL} #{row['seq']}" if row.get("noticeKind") == "fyi" else f"#{row['seq']} {row['role']}")
+        lines.append(f"  {label} → {row['targetDeviceName']} {row['target']}"
                      f"  网络 {network}  投递 {row['delivery']}{reported}")
         for item in row["attachments"]:
             where = f" {item['path']}" if "path" in item else ""

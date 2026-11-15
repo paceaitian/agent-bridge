@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 from . import __version__, summary
 from .platforms import process as procfs
 from .codex_metadata import command_scope
-from .native_names import NO_NAMES, NameBook, SelectorError, parse_selector
+from .native_names import NO_NAMES, NameBook, SelectorError, parse_selector, shown_name, workdir_suffix, workdir_text
 from .endpoints import (
     Caller,
     DiscoverySources,
@@ -36,6 +36,7 @@ from .labels import (  # 标签表移至 labels 供摘要与 worker 共用；此
     CONSUMPTION_LABELS,
     DELIVERY_LABELS,
     EVENT_LABELS,
+    FYI_LABEL,
     ISSUE_LABELS,
     ROLE_LABELS,
     RUNTIME_LABELS,
@@ -47,7 +48,11 @@ from .labels import (  # 标签表移至 labels 供摘要与 worker 共用；此
     notification_capacity_hint,
 )
 from .model import (
+    FOR_SEQ_OPTION,
     HANDED_OVER,
+    MAY_HAVE_ARRIVED,
+    NOTE_KIND,
+    NOTICE_KIND_OPTION,
     PHASE_LABELS,
     PROVEN_UNDELIVERED,
     UNRESOLVED_NATIVE_ID,
@@ -74,7 +79,7 @@ from .paths import codex_home, codex_sqlite_home, device_name, state_dir
 from .reports import ReportError, ReportInput, apply_report, file_reference
 from .store import ATTEMPT_WARNING_THRESHOLD, DB_NAME, MAX_BODY_BYTES, Store, StoreError
 from .task_filter import TASK_LIST_LIMIT, FilterError, SessionMatch, TaskFilter, accepts_local, parse_since
-from .closure import ACCEPTED, CLOSED, ClosureOutcome, queue_closures
+from .closure import ACCEPTED, CLOSED, ClosureOutcome, delivered_endpoint, queue_closures
 from .dispatch import needs_worker, select_generation
 from .doctor import collect_checks, federation_text, print_checks, relay_diagnostics_text
 from .views import (
@@ -308,6 +313,8 @@ def cmd_peers(args: argparse.Namespace) -> int:
                 "threads": list(item.threads),
                 # 按身份比较而不是对象相等：R3 可能生成解析后的副本（DESIGN §45.48）
                 "self": caller.endpoint is not None and caller.endpoint.ref == item.ref,
+                # 工作目录末段（§95.3）：与 displayName 同样转义、限 120 字符；不知道为 null
+                "workdir": workdir_text(item.workdir),
             }
         )
     if args.json:
@@ -330,7 +337,9 @@ def cmd_peers(args: argparse.Namespace) -> int:
         extra = f"  [{issues}]" if issues else ""
         mode = f"  {row['permissionClass']}" if row["permissionClass"] else ""
         target = f"  target={row['target']}" if row["target"] is not None else ""
-        print(f"{book.text(item.ref)}{target}  {RUNTIME_LABELS[item.runtime]}{mode}{extra}{mark}")
+        # 目录放在「← 当前会话」之前：箭头标记一直是行的最后一项（§95.3 的「行尾」按此理解）
+        workdir = workdir_suffix(workdir_text(item.workdir), shown_name(book.view(item.ref)))
+        print(f"{book.text(item.ref)}{target}  {RUNTIME_LABELS[item.runtime]}{mode}{extra}{workdir}{mark}")
     if args.all_devices:
         _fed_all_devices_text()
     return EXIT_OK
@@ -346,7 +355,9 @@ def _windows_local_peers(*, as_json: bool) -> dict[str, object] | None:
     from .platforms.windows.local_transport import WindowsPlatform  # layout: allow 已选择后端的窄能力
     from .platforms.windows.commands import claude_evidence  # layout: allow W3 read-only registry candidates
     backend = get_platform().transport
-    result = codex_discovery.discover(backend) if isinstance(backend, WindowsPlatform) else codex_discovery.Discovery()
+    # 只有 peers 显示要忙闲：with_status 让可投递根线程多一次有界的 metadata-only thread/read（§96.2）
+    result = (codex_discovery.discover(backend, with_status=True) if isinstance(backend, WindowsPlatform)
+              else codex_discovery.Discovery())
     peers = claude_evidence()
     if as_json:
         document = result.document()
@@ -360,8 +371,9 @@ def _windows_local_peers(*, as_json: bool) -> dict[str, object] | None:
     for endpoint in (*peers.endpoints, *peers.duplicates):
         # 人读名字走本轮 NameView（未核实只作「名称=…（仅展示）」，转义由投影负责）；target 一律完整 ID
         issues = '；'.join(reason_text('target_' + issue) for issue in endpoint.issues)
+        workdir = workdir_suffix(workdir_text(endpoint.workdir), shown_name(names.view(endpoint.ref)))
         print(names.text(endpoint.ref) + '  target=claude@id:' + endpoint.ref.native_id
-              + '  [root] 状态未知' + ('  ' + issues if issues else ''))
+              + '  [root] ' + RUNTIME_LABELS[endpoint.runtime] + ('  ' + issues if issues else '') + workdir)
     return None
 
 
@@ -562,6 +574,9 @@ def _delivery_exit(delivery: Delivery) -> int:
 
 
 def cmd_send(args: argparse.Namespace) -> int:
+    # 一句话告知只建立即关闭的单向消息：只对工作有意义的参数一律互斥，任何写入之前拒绝（§95.5.7）
+    if getattr(args, "fyi", False) and (args.review_by or args.review_device or args.no_notify):
+        raise CliError("fyi_conflict", EXIT_TARGET)
     # 关联只是元数据：写任何东西之前先解析，解析不了就不落账（§93.3）
     follows = _resolve_follows(args.follows) if args.follows is not None else None
     if args.device or args.review_device:
@@ -626,13 +641,16 @@ def _local_send(args: argparse.Namespace, *, body: str | None = None, follows: s
         if reviewer.ref.same_session(target.ref):
             raise CliError("reviewer_is_target")
     origin = caller.endpoint.ref if caller.endpoint is not None else None
+    origin_class = permission_class(caller)
+    first_line = body.strip().splitlines()[0] if body.strip() else ""
+    title = (args.title or first_line)[:60]
+    if getattr(args, "fyi", False):
+        return _local_fyi(args, body=body, refs=refs, origin=origin, origin_class=origin_class, target=target,
+                          title=title, follows=follows, endpoints=endpoints)
     try:
         receipts = receipt_options(origin, no_notify=args.no_notify)
     except ValueError as error:
         raise CliError(str(error)) from error
-    origin_class = permission_class(caller)
-    first_line = body.strip().splitlines()[0] if body.strip() else ""
-    title = (args.title or first_line)[:60]
     now = time.time()
     with _open_store() as store:
         try:
@@ -692,6 +710,40 @@ def _local_send(args: argparse.Namespace, *, body: str | None = None, follows: s
         if not worker_up:
             return EXIT_UNAVAILABLE
         return _delivery_exit(current.delivery)
+
+
+def _local_fyi(args: argparse.Namespace, *, body: str, refs: list[dict[str, Any]], origin: EndpointRef | None,
+               origin_class: str | None, target: Endpoint, title: str, follows: str | None,
+               endpoints: list[Endpoint]) -> int:
+    """`ab send --fyi` 本机部分（DESIGN §95.5.7）：同一写事务建任务并立即关闭，排队后即返回，不等投递结果。
+
+    投递结果用 status 查；投递失败不叫醒发起方（单向消息，与结束回执同口径）。
+    """
+    with _open_store() as store:
+        try:
+            task, attempt = store.create_fyi(
+                title=title, origin=origin, origin_class=origin_class, target=target.ref, body=body, refs=refs,
+                now=time.time(),
+                task_options={"allowShared": bool(args.allow_shared),
+                              **({"follows": follows} if follows is not None else {})},
+                attempt_options={"allowShared": bool(args.allow_shared)},
+            )
+        except StoreError as error:
+            raise CliError(error.code, _exit_for_store_error(error.code)) from error
+        started = _start_worker()
+        names = NameBook.of(endpoints)
+        document: dict[str, object] | None = None
+        if args.json:
+            document = _task_document(store, task, names=names)
+        else:
+            cmd = command_name()
+            print(f"告知 {short(task.id)} 已排队，发给 {names.text(attempt.target)}；对方只需读到，不汇报、不验收")
+            print(f"查看投递：{cmd} status {short(task.id)}")
+    unavailable = _queued_without_worker(started)
+    if document is not None:
+        document["notes"] = ["worker_not_running"] if unavailable else []
+        _print_json(document)
+    return EXIT_UNAVAILABLE if unavailable else EXIT_OK
 
 
 def _session_selector(raw: str, endpoints: Callable[[], list[Endpoint]]) -> SessionMatch:
@@ -775,6 +827,13 @@ def cmd_tasks(args: argparse.Namespace) -> int:
         for task in tasks:
             attempts = store.attempts(task.id)
             view = describe(task, attempts)
+            if task.is_fyi:
+                # 一句话告知（§95.5.7）只在 --all 里出现：阶段列写「告知」，目标取那条告知，原因写投递状态
+                notice = attempts[0] if attempts else None
+                target = NO_NAMES.text(notice.target) if notice else "-"
+                state = DELIVERY_LABELS[notice.delivery] if notice else "-"
+                print(f"{short(task.id)}  {FYI_LABEL:<4} {target:<28} {task.title[:40]}  （{state}，{_age(task.updated_at, now)}）")
+                continue
             # 已结束的行与 status 一致：不借本轮发现的名字，完整 ID（§91.4.2）
             target = (NO_NAMES if task.finished else names).text(view.current.target) if view.current else "-"
             hint = hints.get(task.id, _NO_HINT)
@@ -1455,6 +1514,81 @@ def _retry_in_transaction(
     return attempt, undelivered, rework
 
 
+# ab note（DESIGN §95.5.2）：当前工作尝试已发出（可能已到对方）且尚未终态汇报，才有可补充的对象
+_NOTE_SENT = frozenset(MAY_HAVE_ARRIVED | {Delivery.SENDING})
+_NOTE_OPEN_WORK = frozenset({Work.AWAITING_ACK, Work.ACKNOWLEDGED, Work.IN_PROGRESS})
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    """`ab note`：给进行中的执行方补一句话（DESIGN §95.5）。
+
+    新增一条 noticeKind=note 的 notice 尝试，目标是当前工作尝试实际投递的端点；不改变当前工作尝试，
+    接收方不汇报这条。不做权限校验（寻址由任务决定）；调用方归属沿用 send 的规则，免得 agent 冒充用户。
+    跨设备任务只在发起设备上建尝试（§95.5.5）。
+    """
+    found = _fed_lookup(args, write=True)
+    if found is not None:
+        return _fed_note(args, *found)
+    body = _read_body(args)
+    endpoints = discover()
+    caller = identify_caller(endpoints)
+    _check_sender(caller)
+    now = time.time()
+    with _open_store() as store:
+        try:
+            with store.transaction():
+                note = _note_in_transaction(store, args, body, caller, now)
+        except StoreError as error:
+            raise CliError(error.code, _exit_for_store_error(error.code)) from error
+        started = _start_worker()
+        names = NameBook.of(endpoints)
+        for_seq = note.note_for_seq
+        notes = ["attempts_near_limit"] if note.seq >= ATTEMPT_WARNING_THRESHOLD else []
+        document: dict[str, object] | None = None
+        if getattr(args, "json", False):
+            current = store.get_task(note.task_id)
+            if current is None:
+                raise CliError("task_not_found", EXIT_TARGET)
+            document = _task_document(store, current, names=names)
+            document.update(ok=True, scope="local", command="note", noted={"seq": note.seq, "forSeq": for_seq})
+        else:
+            print(f"已排队补充 #{note.seq} → {names.text(note.target)}（任务 {short(note.task_id)} 第 {for_seq} 次尝试；"
+                  f"对方不需要汇报这条）")
+            if notes:
+                print(f"提示：{reason_text('attempts_near_limit')}")
+    unavailable = _queued_without_worker(started)
+    if document is not None:
+        document["notes"] = notes + (["worker_not_running"] if unavailable else [])
+        _print_json(document)
+    return EXIT_UNAVAILABLE if unavailable else EXIT_OK
+
+
+def _note_in_transaction(store: Store, args: argparse.Namespace, body: str, caller: Caller, now: float) -> Attempt:
+    """在调用方开启的事务内：重新校验可补充的工作尝试并追加 note，校验与写入之间不留窗口（同 retry）。"""
+    task = _task(store, args.task)
+    if task.finished:
+        raise CliError("note_no_active_attempt")
+    if task.paused:
+        raise CliError("note_task_paused")
+    working = work_attempts(store.attempts(task.id))
+    current = working[-1] if working else None
+    if current is None or current.delivery not in _NOTE_SENT or current.work not in _NOTE_OPEN_WORK:
+        raise CliError("note_no_active_attempt")
+    return store.add_attempt(
+        task.id,
+        role=Role.NOTICE,
+        # 投给对方实际收到工作尝试的那个端点（与结束回执同口径）；选定代际退出时由 worker 接续同会话
+        target=delivered_endpoint(current),
+        body=body,
+        refs=[],
+        now=now,
+        sender=caller.endpoint.ref if caller.endpoint is not None else None,
+        sender_class=permission_class(caller),
+        options={NOTICE_KIND_OPTION: NOTE_KIND, FOR_SEQ_OPTION: current.seq, "allowShared": current.allow_shared},
+        event="note_created",
+    )
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     try:
         return run_worker(once=args.once)
@@ -1706,15 +1840,20 @@ def _fed_send(args: argparse.Namespace, *, follows: str | None = None) -> int:
         elif args.review_device:
             raise CliError("review_device_requires_reviewer")
         first_line = body.strip().splitlines()[0] if body.strip() else ""
+        fyi = bool(getattr(args, "fyi", False))
         outcome = fed.send(
             rt, target=target, body=body, title=(args.title or first_line)[:60], ref_paths=list(args.ref),
             cwd=Path.cwd(), origin=caller.endpoint.ref if caller.endpoint is not None else None,
             origin_class=permission_class(caller), reviewer=reviewer, allow_shared=bool(args.allow_shared),
-            no_notify=bool(args.no_notify), follows=follows)
+            no_notify=bool(args.no_notify), follows=follows, fyi=fyi)
         missing = _fed_relay_missing(rt)
         task_id = outcome.task.task_id
         if args.json:
             _print_json(fed.task_document(rt, outcome.task, now=int(time.time() * 1000)))
+        elif fyi:
+            print(f"跨设备告知 {short(task_id)} 已排队，发给 {_fed_target_text(rt, outcome.target)}：等待 relay 发出；"
+                  "对方只需读到，不汇报、不验收")
+            print(f"查看投递：{command_name()} status {short(task_id)}")
         else:
             print(f"跨设备任务 {short(task_id)} 已记录，交给 {_fed_target_text(rt, outcome.target)}：等待 relay 发出")
             if outcome.blobs or outcome.references:
@@ -1752,8 +1891,15 @@ def _fed_task_list(include_finished: bool, now: float,
                 target = where + NO_NAMES.text(view.current.target)  # 跨设备：设备名 + 完整 ID，不用对端名字（§91.4.2）
             role = "本机发起" if task.is_authority else f"发起设备 {document['authorityDeviceName']}"
             flag = "，需处理：远端离线/传输未恢复" if document["stalled"] else ""
-            lines.append(f"{short(task.task_id)}  {PHASE_LABELS[view.phase]:<4} {target:<28} {task.title[:40]}"
-                         f"  （跨设备·{role}，{reason_text(view.reason)}{flag}，{_age(task.last_sync_at / 1000, now)}）")
+            phase, reason = PHASE_LABELS[view.phase], reason_text(view.reason)
+            rows = document["attempts"]
+            if task.is_fyi and isinstance(rows, list) and rows:
+                # 一句话告知（§95.5.7）：阶段列写「告知」，目标取那条告知，原因写投递状态
+                first = rows[0]
+                target = f"{first['targetDeviceName']}:{first['target']}"
+                phase, reason = FYI_LABEL, f"投递 {first['delivery']}"
+            lines.append(f"{short(task.task_id)}  {phase:<4} {target:<28} {task.title[:40]}"
+                         f"  （跨设备·{role}，{reason}{flag}，{_age(task.last_sync_at / 1000, now)}）")
         return documents, lines
     finally:
         rt.close()
@@ -1909,6 +2055,40 @@ def _fed_finish(args: argparse.Namespace, state: str, rt: FedRuntime, task: FedT
     return EXIT_UNAVAILABLE if missing else EXIT_OK
 
 
+def _fed_note(args: argparse.Namespace, rt: FedRuntime, task: FedTask) -> int:
+    """跨设备 `ab note`：发起设备上追加 note；本机目标拉起 worker，远端目标经 relay 送达。"""
+    from .federation import commands as fed  # layout: allow 联邦按需加载
+    try:
+        body = _read_body(args)
+        endpoints = discover()
+        caller = identify_caller(endpoints)
+        _check_sender(caller)
+        note = fed.note(rt, task, caller=caller, caller_class=permission_class(caller), body=body)
+        local = note.target_device == rt.ident.device_id
+        started = _start_worker() if local else True
+        missing = False if local else _fed_relay_missing(rt)
+        for_seq = note.options.get(FOR_SEQ_OPTION)
+        notes = ["attempts_near_limit"] if note.seq >= ATTEMPT_WARNING_THRESHOLD else []
+        document: dict[str, Any] | None = None
+        if getattr(args, "json", False):
+            current = rt.store.get_task(task.authority_device, task.task_id) or task
+            document = fed.task_document(rt, current, now=int(time.time() * 1000))
+            document.update(ok=True, command="note", noted={"seq": note.seq, "forSeq": for_seq})
+        else:
+            print(f"已排队补充 #{note.seq} → {_fed_target_text(rt, note.target)}（跨设备任务 {short(task.task_id)}"
+                  f" 第 {for_seq} 次尝试；对方不需要汇报这条）")
+            if notes:
+                print(f"提示：{reason_text('attempts_near_limit')}")
+    finally:
+        rt.close()
+    worker_down = _queued_without_worker(started)
+    if document is not None:
+        document["notes"] = notes + (["worker_not_running"] if worker_down else []) + (
+            ["relay_not_running"] if missing else [])
+        _print_json(document)
+    return EXIT_UNAVAILABLE if worker_down or missing else EXIT_OK
+
+
 def _fed_retry(args: argparse.Namespace, rt: FedRuntime, task: FedTask) -> int:
     """重发/返工：发起设备上追加新尝试；改派可指向本机会话或 --device 指定设备上的会话。"""
     from .federation import commands as fed  # layout: allow 联邦按需加载
@@ -2052,6 +2232,8 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     send.add_argument("--no-notify", action="store_true", help="对方交结果后不回推通知发起会话")
     send.add_argument("--follows", metavar="TASK",
                       help="承接的旧任务（任务 ID 或唯一前缀）；只在本机记关联，不进消息，接收方需要时请写在正文里")
+    send.add_argument("--fyi", action="store_true",
+                      help="一句话告知：只需对方读到，不汇报、不验收（任务建立即关闭）；不能与 --review-by/--review-device/--no-notify 同用")
     send.add_argument("--json", action="store_true")
     send.set_defaults(handler=cmd_send)
 
@@ -2149,6 +2331,18 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     retry.add_argument("--allow-shared", action="store_true")
     retry.add_argument("--json", action="store_true", help="成功与失败都输出结构化结果")
     retry.set_defaults(handler=cmd_retry, json_errors=True)
+
+    note = commands.add_parser(
+        "note",
+        help="给进行中的执行方补一句话（不新开任务、不作废当前尝试）",
+        description="给任务当前进行中的那次交接/复核补一句话：对方不需要汇报这条，继续当前尝试并照常汇报。",
+    )
+    note.add_argument("task")
+    note.add_argument("--origin-device", help="跨设备任务的发起设备（只能在发起设备上补充）")
+    note.add_argument("-m", "--message", help="补充内容；- 表示从标准输入读取")
+    note.add_argument("--file", help="从文件读取补充内容")
+    note.add_argument("--json", action="store_true", help="成功与失败都输出结构化结果")
+    note.set_defaults(handler=cmd_note, json_errors=True)
 
     worker = commands.add_parser("worker", help=f"运行后台 worker（通常由 {prog} 自动拉起）")
     worker.add_argument("--once", action="store_true")

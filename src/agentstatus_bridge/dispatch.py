@@ -34,7 +34,9 @@ from .model import (
     UNRESOLVED_NATIVE_ID,
     Provider,
     Role,
+    TERMINAL_WORK,
     Task,
+    note_may_steer,
 )
 from .reminders import (
     REMINDER_OPTION,
@@ -65,16 +67,23 @@ _ROLE_PRIORITY: dict[Role, str] = {
 }
 
 
-def native_priority(attempt: Attempt) -> str:
+def native_priority(attempt: Attempt, *, note_work: Attempt | None = None) -> str:
     """这条消息希望对方什么时候读它。
 
     结束回执与提醒都是 `Role.NOTICE`（`is_closure` 按定义就要求 role 是 NOTICE），
     所以不需要单独分支——单独写一条只会是永远改变不了结果的死代码。
 
+    补充消息（note）与 Codex 的 steer 同一判据 `note_may_steer`（G4 审计 r1 复核）：所补的工作尝试
+    `note_work` 还没确认开始时用交接那一档 `later`，靠原生队列先进先出排在交接后面，不被对方当前那一轮
+    先吸收；已确认开始再用 `next`。Claude 投递不进 Codex 队列、不会有「已离开队列」，对它就是只按 ack 判。
+    查不到工作尝试按未确认处理。告知（fyi）不受影响，仍是 `next`。
+
     直接下标而不是 `.get(默认值)`：`Role` 是闭合枚举，漏配就该是 KeyError，
     由 `test_every_role_has_a_native_priority` 在测试期变红，而不是被静默打成某个默认值
     （与 `labels.py` 的 RUNTIME_LABELS 同一口径）。
     """
+    if attempt.is_note and not note_may_steer(note_work):
+        return _ROLE_PRIORITY[Role.HANDOFF]
     return _ROLE_PRIORITY[attempt.role]
 
 
@@ -195,8 +204,8 @@ def _needs_worker(
         if attempt.delivery is Delivery.SENDING:
             return True
         task = store.get_task(attempt.task_id)
-        # 结束回执在任务结束（或结束前已暂停）后才排队，照样要发（DESIGN §45.31.5）
-        if task is not None and (attempt.is_closure or (not task.finished and not task.paused)):
+        # 结束回执在任务结束（或结束前已暂停）后才排队、告知的任务建立即关闭，照样要发（DESIGN §45.31.5、§95.5.7）
+        if task is not None and (attempt.delivers_after_finish or (not task.finished and not task.paused)):
             if pending_required is None or pending_required(attempt):
                 return True
     # 观察窗口判断在 SQL 里做：没人汇报的 Claude 回执会一直停在 WRITTEN，不能每秒把这些历史行连正文读一遍（DESIGN §45.29）
@@ -437,6 +446,36 @@ class Dispatcher:
             self.log("reminder_cancelled", {"task": short(task.id), "attempt": attempt.seq})
         return True
 
+    def _note_work(self, attempt: Attempt) -> Attempt | None:
+        """补充消息所补的那次工作尝试（forSeq）；不是 note 或查不到时为 None。"""
+        for_seq = attempt.note_for_seq
+        if for_seq is None:
+            return None
+        return next((item for item in self.store.attempts(attempt.task_id) if item.seq == for_seq), None)
+
+    def _note_outdated(self, attempt: Attempt, now: float) -> bool:
+        """补充消息在发送前核对所补的那次尝试：已终态汇报（结果、受阻、失败）就取消这条尚未外调的补充。
+
+        否则对方会读到「继续当前尝试、完成后照常汇报」的页脚（G4 审计 r1 P3-4/F-3）。已交给原生通道的不追回。
+        """
+        if not attempt.is_note:
+            return False
+        work = self._note_work(attempt)
+        if work is None or work.work not in TERMINAL_WORK:
+            return False
+        if self.store.transition_delivery(
+            attempt.id, expected=(Delivery.PENDING,), new=Delivery.CANCELLED, reason="note_outdated", now=now
+        ):
+            self.log("note_cancelled", {"task": short(attempt.task_id), "attempt": attempt.seq})
+        return True
+
+    @staticmethod
+    def _may_steer(attempt: Attempt, note_work: Attempt | None) -> bool:
+        """这条消息给不给 steer 信号：告知照给；补充消息要等所补的工作尝试离开队列或已确认（G4 审计 r1 P3-1）。"""
+        if not attempt.steers:
+            return False
+        return not attempt.is_note or note_may_steer(note_work)
+
     def _flush_unrecorded(self) -> None:
         for attempt_id, (outcome, detail) in list(self._unrecorded.items()):
             try:
@@ -513,13 +552,13 @@ class Dispatcher:
         """尝试发送一条排队消息，返回 sent / waiting / failed / skipped。"""
         task = self.store.get_task(attempt.task_id)
         # 只有结束回执不受任务结束/暂停限制；其余发送条件（目标消失、权限）完全照旧（DESIGN §45.31.5）
-        if task is None or ((task.finished or task.paused) and not attempt.is_closure):
+        if task is None or ((task.finished or task.paused) and not attempt.delivers_after_finish):
             self._clear_discovery_wait(attempt.id)
             return "skipped"
         now = self.clock()
         if get_platform().name == 'windows' and attempt.target.provider not in (Provider.CODEX, Provider.CLAUDE):
             return self._fail(attempt, 'windows_provider_not_enabled', now)
-        if self._reminder_outdated(task, attempt, now):
+        if self._reminder_outdated(task, attempt, now) or self._note_outdated(attempt, now):
             self._clear_discovery_wait(attempt.id)
             return "skipped"
         # ADAPTERS 覆盖全部 Provider（守卫见 test_bridge_endpoints），漏成员就该是 KeyError 而不是静默放行
@@ -591,6 +630,7 @@ class Dispatcher:
             text = envelope.render(
                 task, attempt, sender=sender_token or "user", device=self.device, command=self.command
             )
+            note_work = self._note_work(attempt)  # 不是补充消息时为 None；优先级与 steer 共用
             context = DeliveryContext(
                 message_uuid=native_message,
                 sender_name=sender_token
@@ -599,12 +639,15 @@ class Dispatcher:
                 if REMINDER_OPTION in attempt.options
                 else "AgentStatus 协作桥（结束回执）"
                 if attempt.is_closure
+                else "AgentStatus 协作桥（告知）"
+                if attempt.is_fyi
                 else "AgentStatus 协作桥（用户）",
                 sender_session=sender.native_id if sender and sender.provider is Provider.CLAUDE else None,
                 sender_class=attempt.sender_class,
                 reply_to=self.reply_address if provider is Provider.CLAUDE else None,
-                priority=native_priority(attempt),
+                priority=native_priority(attempt, note_work=note_work),
                 before_send=(lambda: self._windows_boundary(attempt)) if get_platform().name == 'windows' else None,
+                steer=self._may_steer(attempt, note_work),
             )
         except Exception as error:
             # 尚未外调：可证明未发送，不能让记录停在发送中
@@ -795,7 +838,8 @@ class Dispatcher:
             return None
         open_candidates: list[Attempt] = []
         for attempt in related:
-            if attempt.delivery not in _REPLY_CANDIDATES:
+            # 补充消息不改变执行方在做的那次工作尝试：不带 ID 的回复仍只归给工作尝试（DESIGN §95.5.3）
+            if attempt.delivery not in _REPLY_CANDIDATES or attempt.is_note:
                 continue
             task = self.store.get_task(attempt.task_id)
             if task is not None and not task.finished:

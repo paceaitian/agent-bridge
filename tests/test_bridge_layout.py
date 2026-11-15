@@ -66,8 +66,6 @@ MOVED: tuple[str, ...] = (
     "worker:worker_environment → platforms.linux.lifecycle:worker_environment",
     "worker:worker_path → platforms.linux.lifecycle:worker_path",
     "worker:_acquire_worker_lock → platforms.linux.lifecycle:_acquire_worker_lock",
-    "worker:LOCK_RETRY_ATTEMPTS → platforms.linux.lifecycle:LOCK_RETRY_ATTEMPTS",
-    "worker:LOCK_RETRY_SECONDS → platforms.linux.lifecycle:LOCK_RETRY_SECONDS",
     "endpoints:CLAUDE_SYSTEM_DIR → platforms.linux.files:CLAUDE_SYSTEM_DIR",
     "endpoints:GROK_SYSTEM_DIR → platforms.linux.files:GROK_SYSTEM_DIR",
     # W1-1：P原语整模块下沉；标题纯投影与M采样分开，旧函数不留下双实现。

@@ -22,7 +22,7 @@ from .. import envelope
 from ..dispatch import TARGET_GONE_GRACE_SECONDS, message_uuid, native_priority, select_generation
 from ..endpoints import ADAPTERS, Endpoint
 from ..ids import short
-from ..model import REMINDER_OPTION, Delivery, Provider
+from ..model import REMINDER_OPTION, TERMINAL_WORK, WORK_STARTED, Attempt, Delivery, Provider, Work, note_may_steer
 from ..native_names import id_token, sender_display
 from ..naming import command_name
 from ..platforms import process as procfs
@@ -60,6 +60,11 @@ def _no_log(_event: str, _fields: Mapping[str, object]) -> None:
 def now_ms() -> int:
     return time.time_ns() // 1_000_000
 
+
+# 汇报类别 → 工作状态（复核结论与结果同记为 RESULT，与本机 reports 口径一致）
+_REPORT_WORK: dict[str, Work] = {"ack": Work.ACKNOWLEDGED, "progress": Work.IN_PROGRESS, "result": Work.RESULT,
+                                 "blocked": Work.BLOCKED, "failed": Work.FAILED, "approve": Work.RESULT,
+                                 "changes": Work.RESULT}
 
 class FederationDispatcher:
     """worker 内的联邦作业分发器；与本机 Dispatcher 并列，各开各的库、各自捕获存储错误。"""
@@ -269,6 +274,9 @@ class FederationDispatcher:
         reason = self._suppress_reason(task, attempt)
         if reason is not None:
             return self._finish_pre_intent(attempt, task, reason, state="cancelled")
+        if attempt.is_note and (work := self._note_work(task, attempt)) is not None and work.work in TERMINAL_WORK:
+            # 所补的那次尝试已终态汇报（本设备交过的或 A 已采纳的）：不再发出这条补充（G4 审计 r1 P3-4/F-3）
+            return self._finish_pre_intent(attempt, task, "note_outdated", state="cancelled")
         if self._blocked(task, attempt):
             return "waiting"
         local = attempt.target.local
@@ -422,8 +430,11 @@ class FederationDispatcher:
             name = "AgentStatus 协作桥（提醒）"
         elif attempt.is_closure:
             name = "AgentStatus 协作桥（结束回执）"
+        elif attempt.is_fyi:
+            name = "AgentStatus 协作桥（告知）"
         else:
             name = "AgentStatus 协作桥（用户）"
+        note_work = self._note_work(task, attempt)  # 不是补充消息时为 None；优先级与 steer 共用
         context = DeliveryContext(
             message_uuid=message_uuid(attempt.msg_id),
             sender_name=name,
@@ -431,10 +442,37 @@ class FederationDispatcher:
             # 已认证设备转述的真实类别；unknown 照 unknown，不升级（§88.9）
             sender_class=attempt.sender_class if attempt.sender_class in ("bypass", "prompting") else None,
             reply_to=self.reply_address if provider is Provider.CLAUDE else None,
-            priority=native_priority(view_attempt),
+            priority=native_priority(view_attempt, note_work=note_work),
             before_send=(lambda: self._windows_boundary(attempt)) if get_platform().name == "windows" else None,
+            steer=view_attempt.steers and (not view_attempt.is_note or note_may_steer(note_work)),
         )
         return text, context
+
+    def _note_work(self, task: FedTask, attempt: FedAttempt) -> Attempt | None:
+        """补充消息所补的工作尝试，按本设备所知的最新工作状态投影（G4 审计 r1 P3-1、P3-2）。
+
+        联邦作业不追踪 Codex 队列消费，工作状态取三处里最新的：A 采纳后写下的 effective_work（A 本机目标）、
+        checkpoint 带来的 reportHigh（A 已采纳过这次尝试的汇报），以及本设备自己交过的汇报（镜像上执行方刚交、
+        还没回到 A 的也算）。查不到工作尝试时为 None。
+        """
+        for_seq = attempt.options.get("forSeq")
+        if not attempt.is_note or not isinstance(for_seq, int) or isinstance(for_seq, bool):
+            return None
+        work = next((item for item in self.store.attempts(task.authority_device, task.task_id) if item.seq == for_seq),
+                    None)
+        if work is None:
+            return None
+        view = model_attempt(work)
+        reported = [_REPORT_WORK[kind] for row in self.store.reports(task.authority_device, task.task_id,
+                                                                       attempt_seq=for_seq)
+                    if isinstance(kind := row["report"].get("kind"), str) and kind in _REPORT_WORK]
+        terminal = next((item for item in reported if item in TERMINAL_WORK), None)
+        report_high = work.authority_state.get("reportHigh")
+        if terminal is not None and view.work not in TERMINAL_WORK:
+            view = replace(view, work=terminal)
+        elif view.work not in WORK_STARTED and (reported or (isinstance(report_high, int) and report_high > 0)):
+            view = replace(view, work=Work.ACKNOWLEDGED)
+        return view
 
     def _windows_boundary(self, attempt: FedAttempt) -> None:
         with self.store.transaction():

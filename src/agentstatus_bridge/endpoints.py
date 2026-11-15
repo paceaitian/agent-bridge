@@ -38,10 +38,10 @@ from .platforms.types import BridgePlatform, Capability
 from .codex_metadata import MetadataCache, discovery_cache
 from .codex_argv import _codex_class, _codex_non_interactive, codex_app_server
 from .ids import opaque_id
-from .model import UNRESOLVED_NATIVE_ID, Endpoint, EndpointRef, Provider, Runtime
+from .model import UNRESOLVED_NATIVE_ID, Endpoint, EndpointRef, Provider, Runtime, claude_registry_runtime
 from .native_names import binding as native_binding
 from .native_names import (NO_NAME, TARGET_ID_UNVERIFIED, UNKNOWN_NAME, NameFacts, NameSource, NameView,
-                           SelectorError, canonical, codex_source, name_source, parse_selector, project)
+                           SelectorError, canonical, codex_source, cwd_tail, name_source, parse_selector, project)
 from .observer_dbus import ObserverRow, ObserverView, agentstatus_view
 from .paths import claude_sessions_dirs, codex_home as default_codex_home, codex_sqlite_home, grok_home
 
@@ -69,13 +69,6 @@ CODEX_STATE_TIMEOUT_SECONDS = 0.2
 _GROK_EVENTS = re.compile(
     r"/(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/events\.jsonl$"
 )
-# Claude 2.1.x 注册表 status：waiting 为对话框打开，shell 为正在执行 shell 命令
-_CLAUDE_STATUS = {
-    "idle": Runtime.IDLE,
-    "busy": Runtime.BUSY,
-    "shell": Runtime.BUSY,
-    "waiting": Runtime.WAITING,
-}
 
 
 def _evidence_covers(evidence_at: float | None, status_at_ms: Any) -> bool:
@@ -244,7 +237,7 @@ def _discover_claude(
             socket_path = None
         pane = _pane_for(pid, panes, sources.proc_root)
         status = data.get("status")
-        state = _CLAUDE_STATUS.get(status, Runtime.UNKNOWN) if isinstance(status, str) else Runtime.UNKNOWN
+        state = claude_registry_runtime(status)  # 与 Windows 共用的映射表（§96.2）
         source = "claude_registry"
         released = _claude_background_row(runtime, session_id, pane, pid, proc_start)
         if pane is not None and runtime.pane_runtime(pane.pane_id, Provider.CLAUDE) is Runtime.WAITING:
@@ -277,6 +270,7 @@ def _discover_claude(
                 name=name[:80] if isinstance(name, str) and name else None,
                 issues=tuple(issues),
                 name_source=name_source(name, limit=80),  # 截断前原文：80 只是显示上限（§91.3）
+                workdir=cwd_tail(data.get("cwd")),  # 注册信息的 cwd 只留末段（§95.3）
             )
         )
     groups: dict[int, list[Endpoint]] = {}
@@ -356,15 +350,20 @@ class CodexThreadClasses:
     parent_not_needed: frozenset[str] = frozenset()
     # §91：thread → 原生主名采样（SQL paginated 行或新鲜的 thread/read）；没有的 thread 名字来源未知
     names: dict[str, NameSource] = field(default_factory=dict)
+    # §95.3：thread → 工作目录末段原文（同库同行的 cwd 列，完整路径不保留）；没有的 thread 不显示目录
+    workdirs: dict[str, str] = field(default_factory=dict)
 
 
 def _posix_tail(cwd: str) -> str:
     return posixpath.basename(cwd.rstrip('/'))
 
 
-def _sql_codex_names(connection: sqlite3.Connection, found: list[str], names: dict[str, NameSource]) -> None:
+def _sql_codex_names(connection: sqlite3.Connection, found: list[str], names: dict[str, NameSource],
+                     workdirs: dict[str, str]) -> None:
     """§91：在给出分类行的同一个库里补读原生名字。只认 history_mode=paginated 且 name/cwd 类型有效的行
     （legacy 行的名字来自 title，可能是首条消息内容，不读）；缺列或出错只是没有名字证据，不影响分类。
+
+    §95.3：同一条查询顺带取 cwd 末段。cwd 不是消息内容，legacy 行也取；只留末段，完整路径不保留。
     """
     try:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
@@ -376,6 +375,9 @@ def _sql_codex_names(connection: sqlite3.Connection, found: list[str], names: di
         ):
             if isinstance(key, str) and mode == "paginated" and all(v is None or isinstance(v, str) for v in (name, cwd)):
                 names[key.lower()] = codex_source(name, cwd, basename=_posix_tail)
+            tail = cwd_tail(cwd) if isinstance(key, str) else None
+            if tail is not None:
+                workdirs[key.lower()] = tail
     except sqlite3.Error:
         return
 
@@ -406,6 +408,7 @@ def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThr
     parents: dict[str, str] = {}
     parent_not_needed: set[str] = set()
     thread_names: dict[str, NameSource] = {}
+    thread_workdirs: dict[str, str] = {}
     newest_failed = False
     for position, (_, name) in enumerate(reversed(candidates)):
         if not remaining:
@@ -427,7 +430,7 @@ def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThr
             ).fetchall()
             found = [row[0] for row in rows if isinstance(row[0], str)]
             if found:
-                _sql_codex_names(connection, found, thread_names)  # 名字跟分类行出自同一个库，不倒查旧库
+                _sql_codex_names(connection, found, thread_names, thread_workdirs)  # 名字跟分类行出自同一个库，不倒查旧库
         except sqlite3.Error:
             newest_failed = newest_failed or position == 0
             continue
@@ -447,7 +450,8 @@ def _sql_codex_threads(sources: DiscoverySources, threads: set[str]) -> CodexThr
                 if parent is not None:
                     parents[thread_id.lower()] = parent
     return CodexThreadClasses(kinds, parents, newest_failed, sql_checked=True, present=frozenset(threads - remaining),
-                              parent_not_needed=frozenset(parent_not_needed), names=thread_names)
+                              parent_not_needed=frozenset(parent_not_needed), names=thread_names,
+                              workdirs=thread_workdirs)
 
 
 def _classify_codex_threads(
@@ -513,7 +517,7 @@ def _classify_codex_threads(
     return CodexThreadClasses({**sql.kinds, **kinds},
                               {**{key: value for key, value in sql.parents.items() if key not in kinds}, **parents},
                               sql.unavailable, sql.sql_checked, sql.present, sql.parent_not_needed,
-                              {**sql.names, **names})
+                              {**sql.names, **names}, workdirs=sql.workdirs)
 
 
 @dataclass(frozen=True)
@@ -664,10 +668,11 @@ def _with_codex_name(item: Endpoint, classes: CodexThreadClasses) -> Endpoint:
     thread = item.ref.native_id.lower()
     if item.ref.native_id == UNRESOLVED_NATIVE_ID:
         known_nameless = {"no_thread_yet", "subagent_only"} & set(item.issues)
-        return replace(item, name_source=NO_NAME if known_nameless else UNKNOWN_NAME)
+        return replace(item, name_source=NO_NAME if known_nameless else UNKNOWN_NAME, workdir=None)
     if classes.kinds.get(thread) == "subagent":
-        return replace(item, name_source=NO_NAME)
-    return replace(item, name_source=classes.names.get(thread, UNKNOWN_NAME))
+        return replace(item, name_source=NO_NAME, workdir=None)
+    # 目录末段跟名字同一个 thread 取（§95.3）：for_thread 生成的副本也在这里按解析后的 thread 重取，不沿用别的根
+    return replace(item, name_source=classes.names.get(thread, UNKNOWN_NAME), workdir=classes.workdirs.get(thread))
 
 
 def _codex_base(

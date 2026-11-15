@@ -437,6 +437,26 @@ class DaemonPublisherTests(daemon_fixture.DaemonBase):
         self.assertEqual(sorted(item["nativeId"] for item in snapshot["endpoints"]),  # type: ignore[union-attr]
                          sorted([DA_CODEX, UNRESOLVED_NATIVE_ID]))
 
+    def test_daemon_threads_publish_their_workdir(self) -> None:
+        # §95.3 端到端：托管 daemon 下按标题认出的 thread，目录末段经真实发现与 directory_source 进快照行
+        import sqlite3  # 本用例自建带 name/cwd 列的状态库
+
+        self.daemon(self.lock(DA_CODEX))
+        self.tui(1000, "%1", shows=DA_CODEX)
+        with sqlite3.connect(self.codex_home / "state_5.sqlite") as db:
+            db.execute("CREATE TABLE threads (id TEXT, source TEXT, name TEXT, cwd TEXT, history_mode TEXT)")
+            db.execute("INSERT INTO threads VALUES (?,?,?,?,?)", (DA_CODEX, "cli", "impl", "/home/u/repo-a", "paginated"))
+        store = FederatedStore.create(self.root / "fed")
+        self.addCleanup(store.close)
+        store.set_meta("deviceId", DEV_A)
+        runtime = SimpleNamespace(store=store, ident=SimpleNamespace(device_id=DEV_A),
+                                  config=SimpleNamespace(publish_names=True))
+        with patch.object(commands, "DiscoverySources", return_value=self.sources()), \
+                patch.object(directory, "root_binding", return_value="f" * 32):
+            snapshot = commands.directory_source(runtime)()  # type: ignore[arg-type]
+        [item] = snapshot["endpoints"]  # type: ignore[misc]
+        self.assertEqual((item["nativeId"], item.get("name"), item.get("workdir")), (DA_CODEX, "impl", "repo-a"))
+
 
 class WindowsPublisherTests(DirectoryCase):
     """D-A 的 Windows 写方（§94.1）：一行 Codex 元数据未核实只降 providers.codex，Claude 远端名字与前缀不连带失效。
@@ -445,7 +465,7 @@ class WindowsPublisherTests(DirectoryCase):
     """
 
     def discoveries(self, *, codex_complete: bool = True, hidden_verified: bool = False,
-                    hidden_stable: bool = True) -> tuple[object, object]:
+                    hidden_stable: bool = True, workdirs: bool = False) -> tuple[object, object]:
         """合成的 Codex 与 Claude 发现结果：Codex 一行已核实且稳定，另一行按参数（元数据核实、稳定）合成。"""
         from agentstatus_bridge.platforms.windows import claude_discovery as wc  # layout: allow 合成 Windows 发现结果
         from agentstatus_bridge.platforms.windows import codex_discovery as wd  # layout: allow 合成 Windows 发现结果
@@ -453,12 +473,13 @@ class WindowsPublisherTests(DirectoryCase):
         from agentstatus_bridge.model import NameSource
 
         rows = (wd.Candidate(DA_CODEX, "root", None, "impl", True, "impl", "", True, stable=True,
-                             name_source=NameSource("named", "impl")),
+                             name_source=NameSource("named", "impl"), workdir="proj-a" if workdirs else None),
                 wd.Candidate(DA_HIDDEN, "root", None, "", hidden_verified, "", "", False, stable=hidden_stable))
         codex = wd.Discovery(rows, codex_complete, "metadata_unverified", "a" * 64, (200, "1"), AliasSet({}, "ok"),
                              "b" * 64)
         lead = replace(endpoint(EndpointRef(Provider.CLAUDE, DA_CLAUDE, 300, "win-filetime:1", data_root="c" * 64)),
-                       name_view=NameView(Provider.CLAUDE, DA_CLAUDE, "lead", "lead", True, DA_CLAUDE[:8]))
+                       name_view=NameView(Provider.CLAUDE, DA_CLAUDE, "lead", "lead", True, DA_CLAUDE[:8]),
+                       workdir="lead-dir" if workdirs else None)
         return codex, wc.Discovery((lead,), True, "complete")
 
     def collect(self, **kwargs: bool) -> dict[str, object]:
@@ -473,6 +494,58 @@ class WindowsPublisherTests(DirectoryCase):
                 patch.object(wcommands, "discover", return_value=codex), \
                 patch.object(wc, "discover", return_value=claude):
             return commands.directory_source(runtime)()  # type: ignore[arg-type]
+
+    def test_windows_rows_publish_their_workdir(self) -> None:
+        # §95.3 端到端：Codex 候选经 Discovery.endpoint() 带出 workdir，Claude 端点原样带出，都进快照行
+        snapshot = self.collect(hidden_verified=True, workdirs=True)
+        rows = {item["nativeId"]: item.get("workdir") for item in snapshot["endpoints"]}  # type: ignore[union-attr]
+        self.assertEqual(rows, {DA_CODEX: "proj-a", DA_HIDDEN: None, DA_CLAUDE: "lead-dir"})
+
+    LONG_DIR = "d" * 100
+
+    def publish_long_directory(self) -> dict[str, object]:
+        """审计 r1 Opus P3-7 远端一侧：同一个 100 字符目录下一个无名线程（主名取自 cwd 末段、按 96 字符截断）、
+        一个有名线程，经真实 directory_source 发布。"""
+        from agentstatus_bridge.platforms.windows import claude_discovery as wc  # layout: allow 合成 Windows 发现结果
+        from agentstatus_bridge.platforms.windows import codex_discovery as wd  # layout: allow 合成 Windows 发现结果
+        from agentstatus_bridge.platforms.windows import commands as wcommands  # layout: allow 合成 Windows 发现结果
+        from agentstatus_bridge.platforms.windows.target_aliases import AliasSet  # layout: allow 合成 Windows 候选
+        from agentstatus_bridge.model import NameSource
+
+        long_dir = self.LONG_DIR
+        rows = (wd.Candidate(DA_CODEX, "root", None, "", True, "", long_dir[:96], True, stable=True,
+                             name_source=NameSource("named", long_dir[:96], True), workdir=long_dir, name_from_cwd=True),
+                wd.Candidate(DA_HIDDEN, "root", None, "Fix bug", True, "Fix bug", long_dir[:96], True, stable=True,
+                             name_source=NameSource("named", "Fix bug"), workdir=long_dir))
+        codex = wd.Discovery(rows, True, "complete", "a" * 64, (200, "1"), AliasSet({}, "ok"), "b" * 64)
+        runtime = SimpleNamespace(store=self.store, ident=SimpleNamespace(device_id=DEV_A),
+                                  config=SimpleNamespace(publish_names=True))
+        with using_platform(make_platform("windows", win_api=Kernel(self.root).api)), \
+                patch.object(wcommands, "discover", return_value=codex), \
+                patch.object(wc, "discover", return_value=wc.Discovery((), True, "complete")):
+            return commands.directory_source(runtime)()  # type: ignore[arg-type]
+
+    def test_a_name_taken_from_the_directory_is_published_without_workdir(self) -> None:
+        # 无名行不带 workdir（名字就是目录名），有名行照常带；键集不变，旧读方不受影响
+        published = {item["nativeId"]: item for item in self.publish_long_directory()["endpoints"]}  # type: ignore[union-attr]
+        self.assertNotIn("workdir", published[DA_CODEX])
+        self.assertEqual(published[DA_CODEX]["displayName"], self.LONG_DIR[:96] + "…")
+        self.assertEqual(published[DA_HIDDEN]["workdir"], self.LONG_DIR)
+
+    def test_the_remote_reader_does_not_repeat_a_long_directory_name(self) -> None:
+        # 远端读方读这份快照：100 字符目录名的无名行不重复显示「目录」，有名行照常
+        long_dir = self.LONG_DIR
+        snapshot = self.publish_long_directory()
+        self.store.put_device_state(device_id=DEV_B, name="win", revision=1, snapshot=snapshot, last_seen=NOW,
+                                    state="online")
+        lines = directory.peer_lines(self.store, "win", now=NOW)
+        unnamed = next(line for line in lines if f"codex@id:{DA_CODEX}" in line)
+        named = next(line for line in lines if f"codex@id:{DA_HIDDEN}" in line)
+        self.assertNotIn("目录", unnamed)
+        self.assertTrue(named.endswith(f"  目录 {long_dir}"), named)
+        [device] = directory.peer_devices(self.store, "win", now=NOW)
+        self.assertEqual({peer["remoteRef"]["nativeId"]: peer["workdir"] for peer in device["peers"]},
+                         {DA_CODEX: None, DA_HIDDEN: long_dir})
 
     def test_unverified_codex_row_only_lowers_providers_codex(self) -> None:
         snapshot = self.collect()
@@ -647,6 +720,214 @@ class SnapshotTests(DirectoryCase):
                          (directory.MAX_ENDPOINTS, False, "too_many_endpoints"))
         partial = directory.snapshot(self.store, DEV_A, many[:1], provider_complete={"claude": False})
         self.assertFalse(partial["complete"])  # 一个 provider 不完整就不是完整目录
+
+
+class WorkdirSnapshotTests(DirectoryCase):
+    """§95.3 写方：行里可选键 workdir（已转义、限长的末段），与名字共用 publish_names；超预算先静默去掉它。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        bound = patch.object(directory, "root_binding", return_value="f" * 32)  # 只测投影与预算，不测根核实
+        bound.start()
+        self.addCleanup(bound.stop)
+
+    def live(self, native: str = THREAD, *, name: str = "impl", workdir: str | None = "repo-a",
+             pid: int = 4242) -> object:
+        [item] = with_name_views([replace(endpoint(ref(Provider.CODEX, native, pid=pid), name=name), workdir=workdir)])
+        return item
+
+    def test_workdir_is_escaped_and_follows_the_name_switch(self) -> None:
+        document = directory.snapshot(self.store, DEV_A, [self.live(workdir="a\u202eb")], provider_complete={"codex": True})
+        [item] = document["endpoints"]
+        self.assertEqual(item["workdir"], "a\\u202eb")  # 与 displayName 同一套转义
+        self.assertTrue(document["complete"])
+        hidden = directory.snapshot(self.store, DEV_A, [self.live()], publish_names=False)
+        self.assertNotIn("workdir", hidden["endpoints"][0])  # publishNames=false：名字与目录末段都不发
+        unknown = directory.snapshot(self.store, DEV_A, [self.live(workdir=None)])
+        self.assertNotIn("workdir", unknown["endpoints"][0])  # 不知道就不带键（不发 null）
+        long = directory.snapshot(self.store, DEV_A, [self.live(workdir="d" * 300)])
+        self.assertEqual(len(long["endpoints"][0]["workdir"]), 120)
+
+    def padded(self, size: int, *, workdir: str | None) -> object:
+        """nativeId 补齐到让「不带 workdir 的行」恰好 size 字节。"""
+        head = "019a0000-0000-7000-8000-"
+        probe = directory.snapshot(self.store, DEV_A, [self.live(head, workdir=None)])["endpoints"][0]
+        native = head + "f" * (size - len(canonical_bytes(probe)))
+        return self.live(native, workdir=workdir)
+
+    def test_a_row_that_fits_exactly_without_workdir_only_loses_the_workdir(self) -> None:
+        exact = self.padded(directory.MAX_ENDPOINT_BYTES, workdir=None)
+        bare = directory.snapshot(self.store, DEV_A, [exact], provider_complete={"codex": True})
+        self.assertEqual(len(canonical_bytes(bare["endpoints"][0])), directory.MAX_ENDPOINT_BYTES)
+        document = directory.snapshot(self.store, DEV_A, [self.padded(directory.MAX_ENDPOINT_BYTES, workdir="repo-a")],
+                                      provider_complete={"codex": True})
+        # 只丢 workdir：名字、namesVerified、complete 都不变，不写 reason；与不带 workdir 的结果逐字节相同
+        self.assertEqual(canonical_bytes(document), canonical_bytes(bare))
+        self.assertEqual((document["endpoints"][0]["name"], document["endpoints"][0]["namesVerified"]), ("impl", True))
+        self.assertNotIn("reason", document)
+
+    def test_a_row_that_fits_exactly_with_workdir_keeps_it(self) -> None:
+        room = len(canonical_bytes({"workdir": "repo-a"})) - 1  # 多一个键要多一个逗号，花括号已在行里
+        document = directory.snapshot(self.store, DEV_A,
+                                      [self.padded(directory.MAX_ENDPOINT_BYTES - room, workdir="repo-a")],
+                                      provider_complete={"codex": True})
+        [item] = document["endpoints"]
+        self.assertEqual(len(canonical_bytes(item)), directory.MAX_ENDPOINT_BYTES)
+        self.assertEqual(item["workdir"], "repo-a")
+        self.assertTrue(document["complete"])
+
+    def test_a_row_too_large_even_without_workdir_still_degrades(self) -> None:
+        document = directory.snapshot(self.store, DEV_A, [self.padded(directory.MAX_ENDPOINT_BYTES + 1, workdir="repo-a")],
+                                      provider_complete={"codex": True})
+        [item] = document["endpoints"]
+        self.assertFalse({"workdir", "name", "displayName"} & set(item))
+        self.assertEqual((item["namesVerified"], document["complete"], document["reason"]),
+                         (False, False, "endpoint_too_large"))
+
+    def many(self, *, workdir: str | None) -> list[object]:
+        return [self.live(_codex(index), name=f"n{index}", workdir=workdir, pid=6000 + index) for index in range(1, 6)]
+
+    def test_whole_snapshot_budget_strips_workdirs_before_dropping_rows(self) -> None:
+        bare = directory.snapshot(self.store, DEV_A, self.many(workdir=None), provider_complete={"codex": True})
+        limit = len(canonical_bytes(bare))
+        with patch.object(directory, "MAX_SNAPSHOT_BYTES", limit):
+            document = directory.snapshot(self.store, DEV_A, self.many(workdir="repo-a"),
+                                          provider_complete={"codex": True})
+        # 带 workdir 超限、去掉后放得下：不掉行，complete 不变，不写 reason
+        self.assertEqual(canonical_bytes(document), canonical_bytes(bare))
+        with patch.object(directory, "MAX_SNAPSHOT_BYTES", limit - 1):
+            stripped = directory.snapshot(self.store, DEV_A, self.many(workdir="repo-a"),
+                                          provider_complete={"codex": True})
+            plain = directory.snapshot(self.store, DEV_A, self.many(workdir=None), provider_complete={"codex": True})
+        # 去掉后仍超：按原降级从尾部弹行、标 snapshot_too_large；与没有 workdir 的快照结果相同
+        self.assertEqual((len(stripped["endpoints"]), stripped["complete"], stripped["reason"]),
+                         (4, False, "snapshot_too_large"))
+        self.assertEqual(canonical_bytes(stripped), canonical_bytes(plain))
+
+    def test_without_workdirs_the_snapshot_is_unchanged(self) -> None:
+        # 夹具端点不带 workdir：行的键集与 §91 相同（逐字节对旧写方的对照在跨版本工装里做）
+        document = directory.snapshot(self.store, DEV_A, self.many(workdir=None), provider_complete={"codex": True})
+        self.assertTrue(all("workdir" not in item for item in document["endpoints"]))
+        self.assertNotIn("workdir", canonical_bytes(document).decode())
+
+
+class RemoteWorkdirTests(DirectoryCase):
+    """§95.3 读方：远端行文字加「目录 <末段>」、JSON 加 workdir；显示前去掉控制/格式字符（只对新字段）。"""
+
+    FIRST, SECOND = "019a0000-1111-7222-8333-44445555bbbb", "019a0000-2222-7222-8333-44445555cccc"
+
+    def put_workdirs(self, first: object, second: object = None) -> None:
+        named, unnamed = row(self.FIRST, "impl"), row(self.SECOND, "dup", verified=False)
+        named["displayName"] = "impl"
+        unnamed["displayName"] = "dup"
+        for item, value in ((named, first), (unnamed, second)):
+            if value is not None:
+                item["workdir"] = value
+        self.put(named, unnamed)
+
+    def lines(self) -> list[str]:
+        return directory.peer_lines(self.store, "win", now=NOW)
+
+    def test_remote_rows_show_the_directory_unless_it_equals_the_shown_name(self) -> None:
+        self.put_workdirs("repo-a", "dup")
+        first, second = self.lines()[1:]
+        self.assertTrue(first.endswith(f"target=--device win --to codex@id:{self.FIRST}  目录 repo-a"), first)
+        self.assertTrue(second.endswith(f"target=--device win --to codex@id:{self.SECOND}"), second)  # 与展示名相同
+        [device] = directory.peer_devices(self.store, "win", now=NOW)
+        self.assertEqual([peer["workdir"] for peer in device["peers"]], ["repo-a", "dup"])
+
+    def test_hostile_workdirs_are_cleaned_before_display(self) -> None:
+        forged = "a\n设备 forged〔ffffffff〕：在线\u202e\u200b\x1b[2K"
+        self.put_workdirs(forged, 5)
+        lines = self.lines()
+        self.assertEqual(len(lines), 3)  # 换行不能伪造出新行
+        self.assertTrue(lines[1].endswith("  目录 a设备 forged〔ffffffff〕：在线[2K"), lines[1])
+        self.assertFalse(any(char in "\n\x1b\u202e\u200b" for char in "".join(lines)))
+        [device] = directory.peer_devices(self.store, "win", now=NOW)
+        self.assertEqual([peer["workdir"] for peer in device["peers"]], ["a设备 forged〔ffffffff〕：在线[2K", None])
+        self.put_workdirs("\n\t", "x" * 300)  # 去完只剩空白当作没有；超长按 120 字符截断
+        [device] = directory.peer_devices(self.store, "win", now=NOW)
+        self.assertEqual([peer["workdir"] for peer in device["peers"]], [None, "x" * 119 + "…"])
+
+    def test_remote_length_limit_keeps_120_and_cuts_121(self) -> None:
+        # 审计 r1 MN4/Y14：恰好 120 字符原样保留，121 字符截成 119 字符加省略号
+        self.put_workdirs("x" * 120, "y" * 121)
+        [device] = directory.peer_devices(self.store, "win", now=NOW)
+        self.assertEqual([peer["workdir"] for peer in device["peers"]], ["x" * 120, "y" * 119 + "…"])
+
+    def test_unverified_rows_compare_with_the_display_name(self) -> None:
+        # 审计 r1 MN6/Y11：未核实且没有 name 的行，显示的是 displayName；它与目录相同就不重复写目录
+        bare = row(self.SECOND)
+        bare.update(namesVerified=False, displayName="dir-x", workdir="dir-x")
+        self.put(row(self.FIRST, "impl"), bare)
+        line = self.lines()[2]
+        self.assertIn("名称=dir-x（仅展示）", line)
+        self.assertNotIn("目录", line)
+
+    def test_old_frames_without_workdir_keep_the_old_text(self) -> None:
+        self.put_workdirs(None)
+        self.assertEqual(self.lines()[1:], [
+            f"  codex@impl〔019a0000-1〕 device=win target=--device win --to codex@id:{self.FIRST}",
+            f"  codex@id:019a0000-2 名称=dup（仅展示） device=win target=--device win --to codex@id:{self.SECOND}"])
+        [device] = directory.peer_devices(self.store, "win", now=NOW)
+        self.assertEqual([peer["workdir"] for peer in device["peers"]], [None, None])
+
+
+class WorkdirAndFeaturesTests(DirectoryCase):
+    """G2 的行键 workdir（§95.3）与 fyi 的顶层键 features（§95.5.7）同在一份快照：预算顺序与新旧读方。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        bound = patch.object(directory, "root_binding", return_value="f" * 32)  # 只测投影与预算，不测根核实
+        bound.start()
+        self.addCleanup(bound.stop)
+
+    def live(self, index: int, *, workdir: str | None = "repo-a") -> object:
+        [item] = with_name_views([replace(endpoint(ref(Provider.CODEX, _codex(index), pid=7000 + index),
+                                                   name=f"w{index}"), workdir=workdir)])
+        return item
+
+    def test_budget_drops_workdir_then_rows_then_features(self) -> None:
+        rows = [self.live(index) for index in range(1, 6)]
+        full = directory.snapshot(self.store, DEV_A, rows, provider_complete={"codex": True})
+        self.assertEqual(full["features"], ["fyi"])
+        self.assertTrue(all("workdir" in item for item in full["endpoints"]))
+        bare = directory.snapshot(self.store, DEV_A, [self.live(index, workdir=None) for index in range(1, 6)],
+                                  provider_complete={"codex": True})
+        # 只差 workdir：先静默去掉全部 workdir，不掉行，features 照发
+        with patch.object(directory, "MAX_SNAPSHOT_BYTES", len(canonical_bytes(bare))):
+            stripped = directory.snapshot(self.store, DEV_A, rows, provider_complete={"codex": True})
+        self.assertEqual(canonical_bytes(stripped), canonical_bytes(bare))
+        # 再紧：掉行并标不完整，features 仍在
+        with patch.object(directory, "MAX_SNAPSHOT_BYTES", len(canonical_bytes(bare)) - 1):
+            dropped = directory.snapshot(self.store, DEV_A, rows, provider_complete={"codex": True})
+        self.assertEqual((len(dropped["endpoints"]), dropped["reason"], dropped["features"]),
+                         (4, "snapshot_too_large", ["fyi"]))
+        self.assertFalse(any("workdir" in item for item in dropped["endpoints"]))
+        # 行掉光仍超限：最后才丢 features
+        empty = directory.snapshot(self.store, DEV_A, [], provider_complete={"codex": True})
+        with patch.object(directory, "MAX_SNAPSHOT_BYTES", len(canonical_bytes(empty)) - 1):
+            last = directory.snapshot(self.store, DEV_A, rows, provider_complete={"codex": True})
+        self.assertEqual(last["endpoints"], [])
+        self.assertNotIn("features", last)
+
+    def test_new_and_old_readers_with_a_workdir_row_and_features(self) -> None:
+        document = directory.snapshot(self.store, DEV_A, [self.live(1), self.live(2, workdir=None)],
+                                      provider_complete={"codex": True})
+        self.assertEqual((document["features"], document["endpoints"][0]["workdir"]), (["fyi"], "repo-a"))
+        self.store.put_device_state(device_id=DEV_B, name="win", revision=1, snapshot=document, last_seen=NOW,
+                                    state="online")
+        # 新读方：能力表与 workdir 都认，寻址不受影响
+        self.assertEqual(directory.device_features(self.store, DEV_B), frozenset({"fyi"}))
+        [device] = directory.peer_devices(self.store, "win", now=NOW)
+        self.assertEqual([peer["workdir"] for peer in device["peers"]], ["repo-a", None])
+        for selector, expected in (("codex@w1", _codex(1)), (f"codex@id:{_codex(1)}", _codex(1)),
+                                   ("codex@w2", _codex(2))):
+            with self.subTest(selector=selector):
+                self.assertEqual(directory.resolve_remote(self.store, "win", selector, now=NOW).remote.native_id,
+                                 expected)
+                # 旧读方（104f286 预言机，不认这两个键）：照常按名字/完整 ID 选中同一行
+                self.assertEqual(legacy.resolve_remote(self.store, "win", selector).remote.native_id, expected)
 
 
 def _codex(index: int) -> str:

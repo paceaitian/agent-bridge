@@ -260,7 +260,8 @@ class ReasonTextCommandTests(unittest.TestCase):
         # §91 的 target_id_unverified 提示用当前入口名刷新 peers。
         # §93.1 的 mine_requires_session 提示改用当前入口名的不带 --mine 的 tasks。
         # §94.2 的 follows_not_found 注明联邦库读不了时只查了本机账本，提示用当前入口名查 federation status。
-        self.assertEqual(len(carriers), 18, carriers)
+        # §95.5 的 note_no_active_attempt（改用 retry/send）与 note_task_paused（先 resume）提示用当前入口名。
+        self.assertEqual(len(carriers), 20, carriers)
         for code in labels.REASON_TEXTS:
             with self.subTest(code=code):
                 self.assertNotIn(labels.PLACEHOLDER, labels.reason_text(code, command="testcmd"))

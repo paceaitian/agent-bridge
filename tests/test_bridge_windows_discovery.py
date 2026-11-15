@@ -18,7 +18,7 @@ from bridge_short_socket import short_root
 from bridge_platform_guard import windows_fixture
 from test_bridge_windows_codex import DaemonKernel
 from agentstatus_bridge import cli, views
-from agentstatus_bridge.model import Provider, Flow
+from agentstatus_bridge.model import NameSource, Provider, Flow
 from agentstatus_bridge.store import Store
 from agentstatus_bridge.platforms.factory import make_platform, using_platform
 from agentstatus_bridge.platforms.windows import codex_discovery as D, codex_sql as Q, codex_version
@@ -552,6 +552,133 @@ class DiscoveryTests(unittest.TestCase):
         self.k.files[str(path)]={};alias.replace([])
         self.assertEqual(alias.load(row['rootIdentity']).names,{})
 
+    def workdir_fixture(self):
+        """§95.3：SQL 行（paginated）给 uuid(1)/uuid(3)，uuid(2) 没有 SQL 行、走 thread/read。"""
+        self.k.loaded = [uuid(1), uuid(2), uuid(3)]
+        path = self.sql([(uuid(1), 'cli'), (uuid(3), 'cli')])
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', (None, 'C:\\w\\proj-a', uuid(1)))
+            db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', ('root dir', 'C:\\', uuid(3)))
+        self.k.metadata[uuid(2)] = dict(id=uuid(2), source='cli', parentThreadId=None, name='Fix bug',
+                                        cwd='D:/w/a\u202eb/', preview='NOT_EXPORTED', turns=[])
+
+    def test_workdir_tail_from_sql_and_native_reads(self):
+        self.workdir_fixture()
+        result = self.discover()
+        # 原文末段：Windows 同时认 \\ 与 /；根目录视为无；不拿已转义的 cwd_label
+        self.assertEqual({r.thread: r.workdir for r in result.rows},
+                         {uuid(1): 'proj-a', uuid(2): 'a\u202eb', uuid(3): None})
+        self.assertEqual(result.endpoint(result.rows[1]).workdir, 'a\u202eb')
+        self.assertEqual([row['workdir'] for row in result.document()['peers']], ['proj-a', 'a\\u202eb', None])
+        doc = json.dumps(result.document(), ensure_ascii=False)
+        self.assertNotIn('D:/w', doc)
+        self.assertNotIn('NOT_EXPORTED', doc)
+
+    def test_workdir_suffix_in_the_codex_peer_lines(self):
+        self.workdir_fixture()
+        out = io.StringIO()
+        result = self.discover()
+        with redirect_stdout(out):
+            D.print_peers(result)
+        lines = {uuid(n): next(line for line in out.getvalue().splitlines() if 'target=codex@id:' + uuid(n) in line)
+                 for n in (1, 2, 3)}
+        self.assertNotIn('目录', lines[uuid(1)])  # 无名时主名就是 cwd 末段：与显示的名字相同不重复
+        self.assertTrue(lines[uuid(2)].endswith('  目录 a\\u202eb'), lines[uuid(2)])
+        self.assertNotIn('目录', lines[uuid(3)])
+
+    def test_invalid_native_fields_give_no_directory(self):
+        # 审计 r1 Fable Y13：thread/read 的 name/cwd 类型无效时不取名字，也不取目录
+        self.k.loaded = [uuid(1)]
+        self.k.metadata[uuid(1)] = dict(id=uuid(1), source='cli', parentThreadId=None, name=3, cwd='C:\\w\\proj-a')
+        self.assertIsNone(self.discover().rows[0].workdir)
+
+    def test_a_name_taken_from_a_long_directory_is_not_repeated(self):
+        # 审计 r1 Opus P3-7：无名线程的主名取自 cwd 末段（按 96 字符截断），目录 100 字符时也不再写一次「目录」；
+        # 按名字来源判断：同一目录下有名字的线程照常显示目录
+        long_dir = 'd' * 100
+        self.k.loaded = [uuid(1), uuid(2), uuid(3)]
+        path = self.sql([(uuid(1), 'cli'), (uuid(2), 'cli')])
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', (None, 'C:\\w\\' + long_dir, uuid(1)))
+            db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', ('Fix bug', 'C:\\w\\' + long_dir, uuid(2)))
+        self.k.metadata[uuid(3)] = dict(id=uuid(3), source='cli', parentThreadId=None, name='',
+                                        cwd='D:/w/' + long_dir + '/')  # 原生读：空名同样取自 cwd
+        result = self.discover()
+        self.assertEqual([r.workdir for r in result.rows], [long_dir] * 3)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            D.print_peers(result)
+        lines = {n: next(line for line in out.getvalue().splitlines() if 'target=codex@id:' + uuid(n) in line)
+                 for n in (1, 2, 3)}
+        self.assertNotIn('目录', lines[1])
+        self.assertNotIn('目录', lines[3])
+        self.assertTrue(lines[2].endswith('  目录 ' + long_dir), lines[2])
+        self.assertEqual([row['workdir'] for row in result.document()['peers']], [long_dir] * 3)  # JSON 照给
+        # 发布侧（Discovery.endpoint 进快照）：名字就是目录名的行不带 workdir，有名行照常
+        self.assertEqual([result.endpoint(r).workdir for r in result.rows], [None, long_dir, None])
+
+    def test_sql_failure_clears_collected_workdirs(self):
+        self.sql([(uuid(1), 'cli')])
+        with closing(sqlite3.connect(self.home/'state_5.sqlite')) as db, db:
+            db.execute('UPDATE threads SET cwd=? WHERE id=?', ('C:\\w\\proj-a', uuid(1)))
+        workdirs: dict[str, str] = {}
+        cwd_named: set[str] = set()
+        with self.scope():
+            Q.read_classes(self.p.files, self.home, [uuid(1)], 1001, lambda: 1000, labels={}, workdirs=workdirs,
+                           cwd_named=cwd_named)
+        self.assertEqual((workdirs, cwd_named), ({uuid(1): 'proj-a'}, {uuid(1)}))  # 名字为空：主名取自 cwd
+        with self.scope(), patch.object(Q, 'sql_source', side_effect=ValueError('synthetic')):
+            self.assertEqual(Q.read_classes(self.p.files, self.home, [uuid(1)], 1001, lambda: 1000, labels={},
+                                            workdirs=workdirs, cwd_named=cwd_named), {})
+        # 出错时与 labels 一起清空，不留半批（审计 r1 Fable N9：名字来源标记同样清空）
+        self.assertEqual((workdirs, cwd_named), ({}, set()))
+
+    def test_name_source_marker_needs_the_name_key(self):
+        # 审计 r1 Fable N10：响应没有 name 键是旧服务端、名字来源未知，不算取自 cwd；空名与 null 才算
+        from agentstatus_bridge.platforms.windows.thread_names import name_from_cwd
+        cwd = 'C:\\w\\proj-a'
+        self.assertFalse(name_from_cwd({'cwd': cwd}))
+        self.assertTrue(name_from_cwd({'name': None, 'cwd': cwd}))
+        self.assertTrue(name_from_cwd({'name': '', 'cwd': cwd}))
+        self.assertFalse(name_from_cwd({'name': 'Foo', 'cwd': cwd}))
+        self.assertFalse(name_from_cwd({'name': None, 'cwd': 7}))
+        self.assertFalse(name_from_cwd({'name': None, 'cwd': '  '}))
+
+    def test_a_verified_subagent_row_still_shows_its_directory(self):
+        # 审计 r1 Opus MR4：已核实的子代理行不显示名字（codex@id:…），即使 SQL 名为空、主名来源是 cwd，
+        # 本机文字也照常写「目录」——只有显示的是原生主名时才因名字就是目录名而省略
+        self.k.loaded = [uuid(1), uuid(2)]
+        spawn = '{"subagent":{"thread_spawn":{"parent_thread_id":"' + uuid(1) + '","depth":1}}}'
+        path = self.sql([(uuid(1), 'cli'), (uuid(2), spawn)], [(uuid(2), uuid(1))])
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', ('Lead', 'C:\\w\\lead', uuid(1)))
+            db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', (None, 'C:\\w\\sub-x', uuid(2)))
+        result = self.discover()
+        child = next(r for r in result.rows if r.thread == uuid(2))
+        self.assertEqual((child.kind, child.metadata_verified, child.name_from_cwd), ('subagent', True, True))
+        self.assertFalse(child.name_is_workdir)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            D.print_peers(result)
+        line = next(line for line in out.getvalue().splitlines() if '[subagent]' in line)  # 子代理行不可投，没有 target ID
+        self.assertTrue(line.endswith('  目录 sub-x'), line)
+
+    def test_a_native_name_clears_the_sql_directory_name_marker(self):
+        # 审计 r1 Fable N8 / Opus MR5：SQL 子代理行没有父线程、名字为空（记下「主名取自 cwd」），随后补读的原生
+        # 响应给出 name='Foo'：主名换成 Foo，旧标记必须撤销，否则会把这一行的目录藏掉
+        self.k.loaded = [uuid(1)]
+        path = self.sql([(uuid(1), '{"subagent":"review"}')])
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', (None, 'C:\\w\\proj-x', uuid(1)))
+        self.k.metadata[uuid(1)] = dict(id=uuid(1), source='cli', parentThreadId=None, name='Foo',
+                                        cwd='C:\\w\\proj-x')
+        result = self.discover()
+        self.assertIn(uuid(1), [m['params']['threadId'] for m in self.k.messages if m['method'] == 'thread/read'])
+        [row] = result.rows
+        self.assertEqual(row.native_name, NameSource('named', 'Foo'))
+        self.assertFalse(row.name_from_cwd)
+        self.assertFalse(row.name_is_workdir)
+
     def test_peers_cli_real_entry_readonly_text_json_and_send_gate(self):
         for json_mode in (False,True):
             self.rebuild()
@@ -669,11 +796,609 @@ class AllDevicesPeersTests(unittest.TestCase):
         self.assertNotIn(uuid(1), out.getvalue())
         self.assertNotIn(self.CLAUDE, out.getvalue())
 
+    def test_local_rows_show_the_workdir_tail_unless_it_equals_the_name(self):
+        # §95.3：Codex 与 Claude 两部分都在行尾加「目录 <末段>」；与显示的名字相同（区分大小写）时不加
+        from agentstatus_bridge.platforms.windows import claude_discovery
+        self.sql([(uuid(1), 'cli')])
+        with closing(sqlite3.connect(self.home/'state_5.sqlite')) as db, db:
+            db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', ('Fix bug', 'C:\\w\\proj-a\\', uuid(1)))
+        lead = self.claude().endpoints[0]
+        twin = replace(lead, ref=replace(lead.ref, native_id=self.CLAUDE.replace('c', 'd'), pid=301))
+        peers = claude_discovery.Discovery((replace(lead, workdir='Lead'), replace(twin, workdir='lead')), True, 'complete')
+        with patch.object(self, 'claude', return_value=peers):
+            text = self.run_peers(remote=False)
+            rows = json.loads(self.run_peers('--json', remote=False))['peers']
+        codex = next(line for line in text.splitlines() if 'target=codex@id:' in line)
+        self.assertTrue(codex.endswith('  目录 proj-a'), codex)
+        claude = [line for line in text.splitlines() if 'target=claude@id:' in line]
+        self.assertTrue(claude[0].endswith('  目录 Lead'), claude[0])
+        self.assertEqual([row['workdir'] for row in rows], ['proj-a', 'Lead', 'lead'])
+        self.assertTrue(claude[1].endswith('状态未知'), claude[1])  # 第二行未核实也照规则比较显示名
+
+    def test_claude_rows_escape_the_directory_in_text_and_json(self):
+        # 审计 r1 Fable P2-1（Y10）与 Opus P3-1（MN3）：注册信息 cwd 末段带 RLO，文字行尾与 document() 都是转义文本
+        from agentstatus_bridge.platforms.windows import claude_discovery
+        data = {'pid': 300, 'sessionId': self.CLAUDE, 'name': 'lead', 'cwd': 'C:\\w\\a\u202eb'}
+        found = claude_discovery.project(data, 300, '1', 'c' * 64)
+        peers = claude_discovery.Discovery((found,), True, 'complete')
+        self.assertEqual(peers.document()[0]['workdir'], 'a\\u202eb')
+        with patch.object(self, 'claude', return_value=peers):
+            text = self.run_peers(remote=False)
+        claude = next(line for line in text.splitlines() if 'target=claude@id:' in line)
+        self.assertTrue(claude.endswith('  目录 a\\u202eb'), claude)
+        self.assertNotIn('\u202e', text)
+
+    def test_claude_registry_projection_keeps_only_the_tail(self):
+        from agentstatus_bridge.platforms.windows import claude_discovery
+        data = {'pid': 300, 'sessionId': self.CLAUDE, 'name': 'lead', 'cwd': 'C:\\Users\\x\\proj\\'}
+        self.assertEqual(claude_discovery.project(data, 300, '1', 'c' * 64).workdir, 'proj')
+        for cwd in ('C:\\', None, 7, ''):
+            self.assertIsNone(claude_discovery.project({**data, 'cwd': cwd}, 300, '1', 'c' * 64).workdir)
+
+    def status_fixture(self, *, statuses=True):
+        """§96 完整输出夹具：Codex 两个根线程（active、idle），Claude 两个会话（注册信息 busy、idle）；
+        statuses 为假时去掉两边的状态字段，作对照。"""
+        from agentstatus_bridge.platforms.windows import claude_discovery
+        self.k.loaded = [uuid(1), uuid(2)]
+        path = self.home/'state_5.sqlite'
+        if not path.exists():  # 同一用例里重建夹具时沿用已有的库，只改行，不在用例中途删库
+            path = self.sql([(uuid(1), 'cli'), (uuid(2), 'cli')])
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', ('impl', 'C:\\w\\proj-a', uuid(1)))
+            db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', ('review', 'C:\\w\\proj-b', uuid(2)))
+        self.k.metadata[uuid(1)] = dict(id=uuid(1), source='cli', parentThreadId=None, name='impl',
+                                        cwd='C:\\w\\proj-a', status=thread_status('active'))
+        self.k.metadata[uuid(2)] = dict(id=uuid(2), source='cli', parentThreadId=None, name='review',
+                                        cwd='C:\\w\\proj-b', status=thread_status('idle'))
+        if not statuses:
+            for n in (1, 2):
+                del self.k.metadata[uuid(n)]['status']
+        second = self.CLAUDE.replace('c', 'd')
+        rows = []
+        for pid, session, name, status in ((300, self.CLAUDE, 'lead', 'busy'), (301, second, 'helper', 'idle')):
+            data = {'pid': pid, 'sessionId': session, 'peerProtocol': 1, 'messagingSocketPath': pipe(pid),
+                    'name': name, 'cwd': 'C:\\w\\proj-c', 'status': status, 'statusUpdatedAt': 1}
+            if not statuses:
+                del data['status'], data['statusUpdatedAt']
+            rows.append(claude_discovery.project(data, pid, '1', 'c' * 64))
+        return claude_discovery.Discovery(tuple(rows), True, 'complete').with_views()  # 与真实发现一样带名字投影
+
+    def test_full_peers_output_with_busy_and_idle_sessions(self):
+        # §96.5 假内核：Windows `ab peers` 文字与 --json 在 Claude busy/idle、Codex active/idle 下的完整输出
+        with patch.object(self, 'claude', return_value=self.status_fixture()):
+            text = self.run_peers(remote=False)
+            document = json.loads(self.run_peers('--json', remote=False))
+        second = self.CLAUDE.replace('c', 'd')
+        self.assertEqual(text, '\n'.join([
+            D.NO_PANE_WARNING,
+            f'codex@impl〔{uuid(1)}〕  target=codex@id:{uuid(1)}  [root] 忙  目录 proj-a',
+            f'codex@review〔{uuid(2)}〕  target=codex@id:{uuid(2)}  [root] 空闲  目录 proj-b',
+            'Windows Claude 原生 peer：发现完整',
+            f'claude@lead〔{self.CLAUDE[:8]}〕  target=claude@id:{self.CLAUDE}  [root] 忙  目录 proj-c',
+            f'claude@helper〔{second[:8]}〕  target=claude@id:{second}  [root] 空闲  目录 proj-c',
+        ]) + '\n')
+        self.assertEqual([(row['provider'], row['nativeId'], row['runtime']) for row in document['peers']],
+                         [('codex', uuid(1), 'busy'), ('codex', uuid(2), 'idle'),
+                          ('claude', self.CLAUDE, 'busy'), ('claude', second, 'idle')])
+        self.assertFalse(any('runtimeSource' in row for row in document['peers']))
+        # 同一夹具去掉状态字段：JSON 除各行 runtime 外逐键相同（形状、nativeReads 等诊断键都不变）
+        self.rebuild()
+        with patch.object(self, 'claude', return_value=self.status_fixture(statuses=False)):
+            plain = json.loads(self.run_peers('--json', remote=False))
+        self.assertEqual([row['runtime'] for row in plain['peers']], ['unknown'] * 4)
+        strip = lambda doc: {**doc, 'peers': [{k: v for k, v in row.items() if k != 'runtime'} for row in doc['peers']]}
+        self.assertEqual(strip(document), strip(plain))
+
+    def test_duplicate_claude_rows_show_their_status(self):
+        # 审计 r1 Fable P3-5 第二项：同一会话起了两个进程（duplicates，不可选但照样列出）的行也显示各自的忙闲
+        from agentstatus_bridge.platforms.windows import claude_discovery
+        twin = self.CLAUDE.replace('c', 'e')
+        rows = []
+        for pid, status in ((310, 'busy'), (311, 'waiting')):
+            data = {'pid': pid, 'sessionId': twin, 'peerProtocol': 1, 'messagingSocketPath': pipe(pid),
+                    'name': 'twin', 'status': status}
+            rows.append(claude_discovery.project(data, pid, '1', 'c' * 64))
+        peers = claude_discovery.Discovery((), True, 'complete', duplicates=tuple(rows)).with_views()
+        with patch.object(self, 'claude', return_value=peers):
+            text = self.run_peers(remote=False)
+        lines = [line for line in text.splitlines() if f'target=claude@id:{twin}' in line]
+        self.assertEqual(len(lines), 2)
+        self.assertIn('  [root] 忙', lines[0])
+        self.assertIn('  [root] 等待用户', lines[1])
+
     def test_without_federation_only_the_local_section_is_listed(self):
         local = self.run_peers(remote=False)
         self.assertEqual(self.run_peers('--all-devices', remote=False), '设备 winbox（本机）：\n' + local)
         document = json.loads(self.run_peers('--all-devices', '--json', remote=False))
         self.assertEqual(document, {**json.loads(self.run_peers('--json', remote=False)), 'devices': []})
+
+
+def thread_status(kind, *flags):
+    """上游 ThreadStatus 的 serde 形状（0.169 v2/thread.rs:1749）：tag=type，active 带 activeFlags 字符串列表。"""
+    return {'type': kind, 'activeFlags': list(flags)} if kind == 'active' else {'type': kind}
+
+
+def pipe(n):
+    return '\\\\.\\pipe\\cc-msg-' + f'{n:032x}'
+
+
+class RuntimeMappingTests(unittest.TestCase):
+    """§96.2 两张映射：Claude 注册信息 status（与 Linux 共用）与 Codex thread.status；纯函数，两种系统都跑。"""
+
+    def test_claude_registry_status_table(self):
+        from agentstatus_bridge.model import CLAUDE_REGISTRY_STATUS, Runtime, claude_registry_runtime
+        cases = {'idle': Runtime.IDLE, 'busy': Runtime.BUSY, 'shell': Runtime.BUSY, 'waiting': Runtime.WAITING}
+        self.assertEqual(CLAUDE_REGISTRY_STATUS, cases)
+        for value, expected in cases.items():
+            self.assertIs(claude_registry_runtime(value), expected, value)
+        for value in (None, 1, ['busy'], 'Busy', 'future', ''):
+            self.assertIs(claude_registry_runtime(value), Runtime.UNKNOWN, value)
+
+    def test_windows_claude_registry_projection_reads_status(self):
+        from agentstatus_bridge.model import Runtime
+        from agentstatus_bridge.platforms.windows import claude_discovery
+        session = '0000000c-cccc-4ccc-8ccc-00000000000c'
+        data = {'pid': 300, 'sessionId': session, 'peerProtocol': 1, 'messagingSocketPath': pipe(1), 'name': 'lead'}
+        cases = {'idle': Runtime.IDLE, 'busy': Runtime.BUSY, 'shell': Runtime.BUSY, 'waiting': Runtime.WAITING,
+                 'future': Runtime.UNKNOWN, 7: Runtime.UNKNOWN}
+        for value, expected in cases.items():
+            found = claude_discovery.project({**data, 'status': value}, 300, '1', 'c' * 64)
+            self.assertEqual((found.runtime, found.runtime_source), (expected, 'claude_registry'), value)
+        missing = claude_discovery.project(data, 300, '1', 'c' * 64)
+        self.assertEqual((missing.runtime, missing.runtime_source), (Runtime.UNKNOWN, 'claude_registry'))
+
+    def test_codex_thread_status_table(self):
+        from agentstatus_bridge.model import Runtime
+        from agentstatus_bridge.transports.codex_rpc import thread_runtime
+        def read(status):
+            return {'thread': {'id': uuid(1), 'status': status}}
+        cases = [(thread_status('idle'), Runtime.IDLE), (thread_status('active'), Runtime.BUSY),
+                 (thread_status('active', 'waitingOnApproval'), Runtime.WAITING),
+                 (thread_status('active', 'waitingOnUserInput'), Runtime.WAITING),
+                 (thread_status('active', 'futureFlag', {'x': 1}, 3), Runtime.BUSY),  # 不认识的旗标当作没有
+                 (thread_status('active', 'futureFlag', 'waitingOnApproval'), Runtime.WAITING),
+                 (thread_status('notLoaded'), Runtime.UNKNOWN), (thread_status('systemError'), Runtime.UNKNOWN),
+                 # type 认得是 active、旗标认不出：按「其他 active」为忙（与 thread_active 同样看作 active）
+                 ({'type': 'active'}, Runtime.BUSY), ({'type': 'active', 'activeFlags': 'waitingOnApproval'}, Runtime.BUSY),
+                 ({'type': 'active', 'activeFlags': {'waitingOnApproval': True}}, Runtime.BUSY),
+                 ({'type': 'future'}, Runtime.UNKNOWN), ('idle', Runtime.UNKNOWN), (None, Runtime.UNKNOWN)]
+        for status, expected in cases:
+            self.assertIs(thread_runtime(read(status)), expected, status)
+        for bad in (None, {}, {'thread': None}, {'thread': {}}, []):
+            self.assertIs(thread_runtime(bad), Runtime.UNKNOWN, bad)
+
+    def test_steer_judgement_is_unchanged(self):
+        # thread_active 仍只看 type：active 不论旗标形状都为真（steer 的通道选择不受忙闲显示影响）
+        from agentstatus_bridge.transports.codex_rpc import thread_active
+        self.assertIs(thread_active({'thread': {'status': {'type': 'active'}}}), True)
+        self.assertIs(thread_active({'thread': {'status': thread_status('active', 'waitingOnApproval')}}), True)
+        self.assertIs(thread_active({'thread': {'status': thread_status('notLoaded')}}), False)
+        self.assertIsNone(thread_active({'thread': {'status': {'type': 'future'}}}))
+
+
+class RuntimeDiscoveryTests(unittest.TestCase):
+    """§96.2 Windows Codex 忙闲：只有 discover(with_status=True)（peers 显示）才给可投递根线程取 thread.status。
+
+    假 Win32 内核 + 合成 daemon/SQL；thread/read 只返回元数据形状，不带 turns。
+    """
+    setUp = DiscoveryTests.setUp
+    rebuild = DiscoveryTests.rebuild
+    scope = DiscoveryTests.scope
+    sql = DiscoveryTests.sql
+
+    def roots(self, statuses, *, sql=True):
+        """loaded 线程 uuid(n)；sql 为真时每行都有 paginated 名字（发现过程不必读 thread/read），状态放进 thread/read。"""
+        self.k.loaded = sorted(uuid(n) for n in statuses)
+        if sql and not (self.home/'state_5.sqlite').exists():  # 同一用例重建内核时沿用已有的库
+            path = self.sql([(uuid(n), 'cli') for n in statuses])
+            with closing(sqlite3.connect(path)) as db, db:
+                for n in statuses:
+                    db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', (f'n{n}', 'C:\\w\\p', uuid(n)))
+        for n, status in statuses.items():
+            self.k.metadata[uuid(n)] = dict(id=uuid(n), source='cli', parentThreadId=None, name=f'n{n}',
+                                            cwd='C:\\w\\p', status=status, preview='NOT_EXPORTED', turns=[])
+
+    def run_discover(self, **kw):
+        with self.scope():
+            return D.discover(self.p.transport, **kw)
+
+    def reads(self):
+        return [m['params']['threadId'] for m in self.k.messages if m['method'] == 'thread/read']
+
+    def runtimes(self, result):
+        return {row.thread: row.runtime.value for row in result.rows}
+
+    def test_eligible_roots_get_their_thread_status(self):
+        statuses = {1: thread_status('idle'), 2: thread_status('active'), 3: thread_status('active', 'waitingOnApproval'),
+                    4: thread_status('active', 'waitingOnUserInput'), 5: thread_status('notLoaded'),
+                    6: thread_status('systemError'), 7: {'type': 'future'}, 8: thread_status('active', 'futureFlag')}
+        self.roots(statuses)
+        result = self.run_discover(with_status=True)
+        self.assertEqual((result.complete, result.reason), (True, 'complete'))
+        self.assertEqual(self.runtimes(result), {uuid(1): 'idle', uuid(2): 'busy', uuid(3): 'waiting', uuid(4): 'waiting',
+                                                 uuid(5): 'unknown', uuid(6): 'unknown', uuid(7): 'unknown',
+                                                 uuid(8): 'busy'})
+        self.assertEqual(sorted(self.reads()), sorted(uuid(n) for n in statuses))  # 每个可投递根线程一次补读
+        reads = [m['params'] for m in self.k.messages if m['method'] == 'thread/read']
+        self.assertTrue(all(params['includeTurns'] is False for params in reads))
+        self.assertEqual(result.native_reads, 0)  # 补读不计入分类补证次数（JSON nativeReads 口径不变）
+        self.assertNotIn('NOT_EXPORTED', json.dumps(result.document(), ensure_ascii=False))
+
+    def test_plain_discovery_reads_no_status(self):
+        # worker、send、status 用的发现不取忙闲：不多发 thread/read，行都是 UNKNOWN
+        self.roots({1: thread_status('active'), 2: thread_status('idle')})
+        result = self.run_discover()
+        self.assertEqual(self.reads(), [])
+        self.assertEqual(set(self.runtimes(result).values()), {'unknown'})
+        self.assertEqual(result.endpoint(result.rows[0]).runtime_source, 'none')
+
+    def test_plain_discovery_never_maps_thread_status(self):
+        # 审计 r1 Opus P3-2：不带 with_status 的发现（worker、send、status、caller）即使做了分类补证，也不执行
+        # thread_runtime；忙闲映射将来出错也拖不垮投递路径的发现
+        self.roots({2: thread_status('active')})
+        self.k.loaded = [uuid(1), uuid(2)]
+        self.k.metadata[uuid(1)] = dict(id=uuid(1), source='cli', parentThreadId=None, name='n1', cwd='C:\\w\\p',
+                                        status=thread_status('idle'))
+        with patch.object(D, 'thread_runtime', wraps=D.thread_runtime) as mapped:
+            result = self.run_discover()
+            self.assertEqual(self.reads(), [uuid(1)])  # 有一次分类补证
+            self.assertEqual(mapped.call_count, 0)
+            self.rebuild()
+            self.roots({2: thread_status('active')})
+            self.k.loaded = [uuid(1), uuid(2)]
+            self.k.metadata[uuid(1)] = dict(id=uuid(1), source='cli', parentThreadId=None, name='n1', cwd='C:\\w\\p',
+                                            status=thread_status('idle'))
+            self.run_discover(with_status=True)
+            self.assertEqual(mapped.call_count, 2)  # peers：分类读到的一次 + 补读一次
+        self.assertTrue(result.complete)
+
+    def test_statuses_read_during_classification_are_reused(self):
+        # uuid(1) 没有 SQL 行，分类时已读过 thread/read：直接复用它的 status，不再读第二次；uuid(2) 补读
+        self.roots({2: thread_status('active')})
+        self.k.loaded = [uuid(1), uuid(2)]
+        self.k.metadata[uuid(1)] = dict(id=uuid(1), source='cli', parentThreadId=None, name='n1', cwd='C:\\w\\p',
+                                        status=thread_status('idle'))
+        result = self.run_discover(with_status=True)
+        self.assertEqual(self.reads(), [uuid(1), uuid(2)])
+        self.assertEqual(self.runtimes(result), {uuid(1): 'idle', uuid(2): 'busy'})
+        self.assertEqual(result.native_reads, 1)
+
+    def test_an_exhausted_read_budget_leaves_the_rest_unknown(self):
+        # 32 个没有 SQL 行的线程用完 MAX_IDS 次分类补证；有 SQL 行的 uuid(1) 不再补读，保持 UNKNOWN
+        self.roots({1: thread_status('active')})
+        self.k.loaded = [uuid(n) for n in range(1, 34)]
+        for n in range(2, 34):
+            self.k.metadata[uuid(n)] = dict(id=uuid(n), source='cli', parentThreadId=None, name=f'n{n}', cwd='C:\\w\\p',
+                                            status=thread_status('idle'))
+        result = self.run_discover(with_status=True)
+        self.assertEqual(result.native_reads, 32)
+        self.assertEqual(len(self.reads()), 32)
+        self.assertNotIn(uuid(1), self.reads())
+        runtimes = self.runtimes(result)
+        self.assertEqual(runtimes.pop(uuid(1)), 'unknown')
+        self.assertEqual(set(runtimes.values()), {'idle'})  # 分类时读到的照样复用
+
+    def test_a_timed_out_status_read_keeps_the_discovery_complete(self):
+        # 补读新线程优先（uuid(3) → uuid(2) → uuid(1)）：第二个补读超时，它与之后的行都是 UNKNOWN，已读到的保留；
+        # 完整性与 eligible 不变
+        self.roots({1: thread_status('idle'), 2: thread_status('active'), 3: thread_status('active')})
+        clock = {'now': 1000.0}
+        def after(message):
+            if message['method'] == 'thread/read' and message['params']['threadId'] == uuid(2):
+                clock['now'] = 5000.0  # 应答写进去了，但读应答前已过截止时刻
+        self.k.after = after
+        result = self.run_discover(with_status=True, clock=lambda: clock['now'])
+        self.assertEqual((result.complete, result.reason), (True, 'complete'))
+        self.assertTrue(all(row.eligible for row in result.rows))
+        self.assertEqual(self.runtimes(result), {uuid(1): 'unknown', uuid(2): 'unknown', uuid(3): 'busy'})
+        self.assertEqual(self.reads(), [uuid(3), uuid(2)])  # 连接已不可信：不再补读 uuid(1)
+
+    def test_a_protocol_failure_stops_further_status_reads(self):
+        # 第二个补读的应答 id 对不上（流已失步，连接不可信）：停止补读，后面的行不再发请求，保持 UNKNOWN；
+        # 与超时不同，这时连接本身还能写，换成「继续读」就会再发一条请求
+        self.roots({1: thread_status('idle'), 2: thread_status('active'), 3: thread_status('active')})
+        self.k.override = lambda m, r: ({**r, 'id': m['id'] + 100}
+                                        if m['method'] == 'thread/read' and m['params']['threadId'] == uuid(2) else r)
+        result = self.run_discover(with_status=True)
+        self.assertEqual((result.complete, result.reason), (True, 'complete'))
+        self.assertEqual(self.runtimes(result), {uuid(1): 'unknown', uuid(2): 'unknown', uuid(3): 'busy'})
+        self.assertEqual(self.reads(), [uuid(3), uuid(2)])
+
+    def test_each_transport_failure_of_a_status_read_is_contained(self):
+        # _statuses 的捕获集合逐项：补读抛 _Closed、OSError、ValueError（以及 NativeFailure、_Timeout）都只让该行与之后的行
+        # UNKNOWN，不让整次发现失败
+        from agentstatus_bridge.transports.websocket import _Closed, _Timeout
+        real = D.Reader.request
+        for error in (_Closed('closed'), OSError('reset'), ValueError('bad json'), NativeFailure('response_id_mismatch'),
+                      _Timeout('deadline')):
+            with self.subTest(error=type(error).__name__):
+                self.rebuild()
+                self.roots({1: thread_status('idle'), 2: thread_status('active')})
+                def request(reader, method, params, error=error):
+                    if method == 'thread/read' and params['threadId'] == uuid(1):  # 新线程优先：uuid(1) 是第二个补读
+                        raise error
+                    return real(reader, method, params)
+                with patch.object(D.Reader, 'request', request):
+                    result = self.run_discover(with_status=True)
+                self.assertEqual((result.complete, result.reason), (True, 'complete'))
+                self.assertEqual(self.runtimes(result), {uuid(1): 'unknown', uuid(2): 'busy'})
+
+    def test_unstable_roots_get_no_status(self):
+        # 两次 loaded 只出现一次的根线程不可投递：不补读，也不复用分类时读到的 status
+        self.roots({1: thread_status('idle'), 2: thread_status('active')})
+        self.k.loaded = [uuid(1), uuid(2), uuid(3)]
+        self.k.metadata[uuid(3)] = dict(id=uuid(3), source='cli', parentThreadId=None, name='n3', cwd='C:\\w\\p',
+                                        status=thread_status('active'))
+        def after(message):
+            if message['method'] == 'thread/loaded/list':
+                self.k.loaded = [uuid(1)]  # 第二次 loaded 里 uuid(2)、uuid(3) 已不在
+        self.k.after = after
+        result = self.run_discover(with_status=True)
+        self.assertEqual([(r.thread, r.kind, r.stable, r.eligible) for r in result.rows],
+                         [(uuid(1), 'root', True, True), (uuid(2), 'root', False, False), (uuid(3), 'root', False, False)])
+        self.assertEqual(self.runtimes(result), {uuid(1): 'idle', uuid(2): 'unknown', uuid(3): 'unknown'})
+        self.assertEqual(self.reads(), [uuid(3), uuid(1)])  # uuid(3) 是分类补证，uuid(1) 是补读；uuid(2) 不读
+
+    def test_status_reads_share_the_discovery_deadline(self):
+        # 审计 r1 Opus P2-1（p1）：补读与分类共用同一个 5 秒截止时刻。分类结束时已到 1004.5（截止 1005），
+        # 第一个补读 uuid(2) 来得及；第二个补读 uuid(1) 发出后时钟到 1006，按共用截止它必须 UNKNOWN（另起截止就会读到）
+        self.roots({1: thread_status('idle'), 2: thread_status('active')})
+        clock = {'now': 1000.0, 'loaded': 0}
+        def after(message):
+            if message['method'] == 'thread/loaded/list':
+                clock['loaded'] += 1
+                if clock['loaded'] == 2:
+                    clock['now'] = 1004.5
+            if message['method'] == 'thread/read' and message['params']['threadId'] == uuid(1):
+                clock['now'] = 1006.0
+        self.k.after = after
+        result = self.run_discover(with_status=True, clock=lambda: clock['now'])
+        self.assertEqual((result.complete, result.reason), (True, 'complete'))
+        self.assertEqual(self.runtimes(result), {uuid(1): 'unknown', uuid(2): 'busy'})
+
+    def test_the_read_budget_counts_failed_classification_reads(self):
+        # 审计 r1 Opus P2-1（p2）：额度按分类补证的请求次数扣，错误应答也算。32 个无 SQL 行的线程用完 32 次（其中
+        # uuid(33) 是错误应答），有 SQL 行的 uuid(1) 不再补读，总读取不超过 MAX_IDS
+        self.roots({1: thread_status('active')})
+        self.k.loaded = [uuid(n) for n in range(1, 34)]
+        for n in range(2, 34):
+            self.k.metadata[uuid(n)] = dict(id=uuid(n), source='cli', parentThreadId=None, name=f'n{n}', cwd='C:\\w\\p',
+                                            status=thread_status('idle'))
+        self.k.override = lambda m, r: ({'id': m['id'], 'error': {'code': -1}}
+                                        if m['method'] == 'thread/read' and m['params']['threadId'] == uuid(33) else r)
+        result = self.run_discover(with_status=True)
+        self.assertEqual(result.native_reads, 32)
+        self.assertEqual(len(self.reads()), 32)
+        self.assertNotIn(uuid(1), self.reads())
+        self.assertEqual(self.runtimes(result)[uuid(1)], 'unknown')
+
+    def test_a_response_for_another_thread_stops_status_reads(self):
+        # 审计 r1 Opus P3-1（p3）：补读应答的 thread.id 不是所请求的线程：不采用它的 status，与协议失步同口径停止补读。
+        # id 缺失、非字符串、不是 UUID 都算不符（与分类路径 _project_kind 同一比较），且不抛异常
+        missing = object()
+        for label, value in (('other', uuid(9)), ('absent', missing), ('none', None), ('int', 5), ('garbage', 'x')):
+            with self.subTest(id=label):
+                self.rebuild()
+                self.roots({1: thread_status('idle'), 2: thread_status('idle'), 3: thread_status('idle')})
+                thread = dict(source='cli', status=thread_status('active'))
+                if value is not missing:
+                    thread['id'] = value
+                def swap(m, r, thread=thread):
+                    if m['method'] == 'thread/read' and m['params']['threadId'] == uuid(2):
+                        return {**r, 'result': {'thread': thread}}
+                    return r
+                self.k.override = swap
+                result = self.run_discover(with_status=True)
+                self.assertEqual((result.complete, result.reason), (True, 'complete'))
+                self.assertEqual(self.runtimes(result), {uuid(1): 'unknown', uuid(2): 'unknown', uuid(3): 'idle'})
+                self.assertEqual(self.reads(), [uuid(3), uuid(2)])
+
+    def test_a_response_id_in_upper_case_is_the_same_thread(self):
+        # 正例：id 只差大小写时与分类路径同样按同一线程处理（native_id 归一为小写），照常采用 status、继续补读。
+        # 用 10–12（尾段是十六进制字母 a–c）：uuid(1..9) 全是数字，upper() 不改变它，正例会是空的
+        self.assertNotEqual(uuid(11).upper(), uuid(11))
+        self.roots({10: thread_status('idle'), 11: thread_status('idle'), 12: thread_status('idle')})
+        def upper(m, r):
+            if m['method'] == 'thread/read' and m['params']['threadId'] == uuid(11):
+                return {**r, 'result': {'thread': dict(id=uuid(11).upper(), source='cli', status=thread_status('active'))}}
+            return r
+        self.k.override = upper
+        result = self.run_discover(with_status=True)
+        self.assertEqual(self.runtimes(result), {uuid(10): 'idle', uuid(11): 'busy', uuid(12): 'idle'})
+        self.assertEqual(self.reads(), [uuid(12), uuid(11), uuid(10)])
+
+    def test_newest_threads_get_their_status_first(self):
+        # 审计 r1 Fable P3-3：40 个可投递根只够补读 32 个，新线程优先（线程 ID 是 UUID v7，升序即创建时间升序），
+        # 拿不到忙闲的是最旧的 8 个。nativeReadBudgetHit 只反映分类补证，这里仍为假（JSON 不另加提示键）
+        self.roots({n: thread_status('active') for n in range(1, 41)})
+        result = self.run_discover(with_status=True)
+        runtimes = self.runtimes(result)
+        self.assertEqual(self.reads(), [uuid(n) for n in range(40, 8, -1)])
+        self.assertEqual([n for n in range(1, 41) if runtimes[uuid(n)] == 'unknown'], list(range(1, 9)))
+        self.assertFalse(result.native_read_budget_hit)
+
+    def test_a_partial_budget_reads_only_what_is_left(self):
+        # 审计 r1 Fable P3-2：30 个无 SQL 行的线程用掉 30 次分类补证，5 个有 SQL 行的根只剩 2 次补读：最新的两个拿到
+        self.roots({n: thread_status('active') for n in range(1, 6)})
+        self.k.loaded = [uuid(n) for n in range(1, 36)]
+        for n in range(6, 36):
+            self.k.metadata[uuid(n)] = dict(id=uuid(n), source='cli', parentThreadId=None, name=f'n{n}', cwd='C:\\w\\p',
+                                            status=thread_status('idle'))
+        result = self.run_discover(with_status=True)
+        self.assertEqual((result.native_reads, len(self.reads()), result.complete), (30, 32, True))
+        runtimes = self.runtimes(result)
+        self.assertEqual([runtimes[uuid(n)] for n in range(1, 6)], ['unknown', 'unknown', 'unknown', 'busy', 'busy'])
+        self.assertEqual({runtimes[uuid(n)] for n in range(6, 36)}, {'idle'})
+
+    def test_a_daemon_change_while_reading_status_is_contained(self):
+        # 审计 r1 Fable P3-5：补读期间控制 socket 身份变了（response() 里 unchanged() 抛 daemon_changed）：停止补读，
+        # 发现仍完整
+        from agentstatus_bridge.transports import codex_native
+        self.roots({1: thread_status('idle'), 2: thread_status('active'), 3: thread_status('active')})
+        real = codex_native.BoundedConnection.unchanged
+        state = {'reads': 0}
+        def after(message):
+            if message['method'] == 'thread/read':
+                state['reads'] += 1
+        self.k.after = after
+        def unchanged(conn):
+            if state['reads'] >= 2:
+                raise NativeFailure('daemon_changed')
+            return real(conn)
+        with patch.object(codex_native.BoundedConnection, 'unchanged', unchanged):
+            result = self.run_discover(with_status=True)
+        self.assertEqual((result.complete, result.reason), (True, 'complete'))
+        self.assertEqual(self.runtimes(result), {uuid(1): 'unknown', uuid(2): 'unknown', uuid(3): 'busy'})
+
+    def test_other_call_sites_read_no_status(self):
+        # 审计 r1 Fable P3-1：worker（两处）与命令作用域的发现不取忙闲：全部根都有 SQL 行时不出现任何 thread/read
+        from agentstatus_bridge.platforms.windows import commands
+        self.roots({1: thread_status('active'), 2: thread_status('idle')})
+        with self.scope():
+            endpoints = D.WorkerDiscovery(self.p.transport)()
+        self.assertEqual(self.reads(), [])
+        self.assertEqual({(e.runtime.value, e.runtime_source) for e in endpoints}, {('unknown', 'none')})
+        self.rebuild()
+        self.roots({1: thread_status('active'), 2: thread_status('idle')})
+        with self.scope():
+            sampled = commands.sample()
+        self.assertEqual(self.reads(), [])
+        self.assertEqual(set(self.runtimes(sampled).values()), {'unknown'})
+        self.rebuild()
+        self.roots({1: thread_status('active'), 2: thread_status('idle')})
+        with self.scope(), patch.object(commands.claude, 'discover',
+                                        return_value=commands.claude.Discovery((), True, 'complete')):
+            found = commands.WorkerDiscovery(self.p.transport)()
+        self.assertEqual(self.reads(), [])
+        self.assertEqual({(e.runtime.value, e.runtime_source) for e in found}, {('unknown', 'none')})
+
+    def test_only_peers_asks_for_status(self):
+        # 审计 r1 Fable P3-1 的静态一侧：全部 Codex 发现调用点里，只有 cli._windows_local_peers 传 with_status。
+        # 上面的行为用例覆盖 worker 与命令作用域；caller 与 alias 的调用点要真实进程链/别名文件，这里按源码钉住
+        import ast
+        root = Path(D.__file__).resolve().parents[2]  # agentstatus_bridge 包目录
+        calls: dict[tuple[str, str], bool] = {}
+        for path in sorted(root.rglob('*.py')):
+            tree = ast.parse(path.read_text(encoding='utf-8'))
+            for func in [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+                for call in [node for node in ast.walk(func) if isinstance(node, ast.Call)]:
+                    name = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, 'id', None)
+                    owner = call.func.value.id if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) else None
+                    if name != 'discover' or owner in ('claude', 'claude_discovery'):
+                        continue
+                    asked = any(k.arg == 'with_status' and not (isinstance(k.value, ast.Constant) and not k.value.value)
+                                for k in call.keywords)
+                    key = (path.relative_to(root).as_posix(), func.name)
+                    calls[key] = calls.get(key, False) or asked
+        asking = {key for key, asked in calls.items() if asked}
+        self.assertEqual(asking, {('cli.py', '_windows_local_peers')})
+        for site in (('platforms/windows/commands.py', 'sample'), ('platforms/windows/commands.py', '__call__'),
+                     ('platforms/windows/codex_discovery.py', '__call__'), ('platforms/windows/caller.py', '_identify'),
+                     ('platforms/windows/alias_command.py', 'run')):
+            self.assertIn(site, calls)
+            self.assertFalse(calls[site], site)
+
+    def test_an_error_response_only_leaves_that_row_unknown(self):
+        # 错误应答放在中间一行（新线程优先：读序 3、2、1）：只让 uuid(2) UNKNOWN，之后的 uuid(1) 照常补读（审计 r1 回归）
+        self.roots({1: thread_status('idle'), 2: thread_status('active'), 3: thread_status('active')})
+        self.k.override = lambda m, r: ({'id': m['id'], 'error': {'code': -1}}
+                                        if m['method'] == 'thread/read' and m['params']['threadId'] == uuid(2) else r)
+        result = self.run_discover(with_status=True)
+        self.assertEqual(self.runtimes(result), {uuid(1): 'idle', uuid(2): 'unknown', uuid(3): 'busy'})
+        self.assertEqual(self.reads(), [uuid(3), uuid(2), uuid(1)])
+        self.assertTrue(result.complete)
+
+    def test_non_recipient_rows_stay_unknown(self):
+        # 子代理、internal、元数据未核实的行即使 thread/read 报 active 也不显示忙闲，也不为它们补读
+        self.k.loaded = [uuid(n) for n in range(1, 5)]
+        spawn = '{"subagent":{"thread_spawn":{"parent_thread_id":"' + uuid(1) + '","depth":1}}}'
+        self.sql([(uuid(1), 'cli'), (uuid(2), spawn), (uuid(3), '{"internal":"guardian"}'), (uuid(4), 'future')],
+                 [(uuid(2), uuid(1))])
+        with closing(sqlite3.connect(self.home/'state_5.sqlite')) as db, db:
+            db.execute('UPDATE threads SET name=?,cwd=? WHERE id=?', ('lead', 'C:\\w\\p', uuid(1)))
+        for n in range(1, 5):
+            self.k.metadata[uuid(n)] = dict(id=uuid(n), source='cli', parentThreadId=None, status=thread_status('active'))
+        result = self.run_discover(with_status=True)
+        self.assertEqual([(r.kind, r.eligible) for r in result.rows],
+                         [('root', True), ('subagent', False), ('internal', False), ('unknown', False)])
+        self.assertEqual(self.runtimes(result), {uuid(1): 'busy', uuid(2): 'unknown', uuid(3): 'unknown',
+                                                 uuid(4): 'unknown'})
+        self.assertEqual(self.reads(), [uuid(1)])
+
+    def test_statuses_read_for_non_recipient_rows_are_not_reused(self):
+        # 分类时读过 thread/read、但最终不可投递的行（原生判为 internal、无父子代理）不复用它的 status
+        self.roots({1: thread_status('idle')})
+        self.k.loaded = [uuid(1), uuid(2), uuid(3)]
+        self.k.metadata[uuid(2)] = dict(id=uuid(2), source={'internal': 'guardian'}, parentThreadId=None,
+                                        status=thread_status('active'))
+        self.k.metadata[uuid(3)] = dict(id=uuid(3), source={'subAgent': 'review'}, parentThreadId=None,
+                                        status=thread_status('active'))
+        result = self.run_discover(with_status=True)
+        self.assertEqual([(r.kind, r.eligible) for r in result.rows],
+                         [('root', True), ('internal', False), ('subagent', False)])
+        self.assertEqual(self.runtimes(result), {uuid(1): 'idle', uuid(2): 'unknown', uuid(3): 'unknown'})
+
+    def test_text_json_and_endpoint_agree(self):
+        self.roots({1: thread_status('idle'), 2: thread_status('active'), 3: thread_status('active', 'waitingOnApproval'),
+                    4: thread_status('notLoaded')})
+        result = self.run_discover(with_status=True)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            D.print_peers(result)
+        lines = {n: next(line for line in out.getvalue().splitlines() if f'target=codex@id:{uuid(n)}' in line)
+                 for n in range(1, 5)}
+        labels = {1: '空闲', 2: '忙', 3: '等待用户', 4: '状态未知'}
+        for n, label in labels.items():
+            self.assertIn(f'  [root] {label}', lines[n])
+        self.assertEqual([row['runtime'] for row in result.document()['peers']], ['idle', 'busy', 'waiting', 'unknown'])
+        endpoints = [result.endpoint(row) for row in result.rows]
+        self.assertEqual([(e.runtime.value, e.runtime_source) for e in endpoints],
+                         [('idle', 'codex_thread_status'), ('busy', 'codex_thread_status'),
+                          ('waiting', 'codex_thread_status'), ('unknown', 'none')])
+        self.assertNotIn('runtimeSource', json.dumps(result.document()))  # JSON 形状不变
+
+
+class WindowsClaudeRegistryStatusTests(unittest.TestCase):
+    """§96 r1：注册文件 → claude_discovery.discover（inspect、project）→ 端点 runtime 这条未打桩的路径。
+
+    放在 bridge-windows 选择集已有的模块里，真实 Windows CI 也跑；夹具同 test_bridge_windows_claude.NativeTests
+    （假 Win32 内核、临时注册目录、假管道），不碰真实注册目录。
+    """
+    PIPE = r'\\.\pipe\LOCAL\cc-msg-0123456789abcdef0123456789abcdef'
+    SESSION = '019a0000-0000-7000-8000-000000000001'
+    BIRTH = '134362090000012230'
+
+    def setUp(self):
+        from bridge_winapi import Kernel
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.sessions = self.root / 'config' / 'sessions'
+        self.sessions.mkdir(parents=True)
+        self.k = Kernel(self.root)
+        self.k.processes[200] = (0, int(self.BIRTH), self.k.sid, False, 'claude.exe')
+        self.k.images[200] = r'C:\fixture\claude.exe'
+        self.k.peer = 200
+        self.p = make_platform('windows', win_api=self.k.api)
+        self.addCleanup(lambda: self.assertEqual(self.k.handles, {}))
+        self.enterContext(patch.object(self.p.files, 'claude_sessions_dir', return_value=self.sessions))
+        self.enterContext(using_platform(self.p))
+        self.enterContext(windows_fixture('pipe', self.PIPE))
+
+    def test_registry_status_reaches_the_discovered_endpoint(self):
+        from agentstatus_bridge.platforms.windows import claude_discovery
+        record = {'pid': 200, 'sessionId': self.SESSION, 'peerProtocol': 1, 'kind': 'interactive',
+                  'messagingSocketPath': self.PIPE, 'procStartFt': self.BIRTH, 'name': 'fixture-peer'}
+        for status, expected in (('idle', 'idle'), ('busy', 'busy'), ('shell', 'busy'), ('waiting', 'waiting'),
+                                 ('future', 'unknown'), (None, 'unknown')):
+            with self.subTest(status=status):
+                (self.sessions / '200.json').write_text(
+                    json.dumps(record if status is None else {**record, 'status': status}), encoding='utf-8')
+                result = claude_discovery.discover(self.p.transport)
+                self.assertTrue(result.complete)
+                [endpoint] = result.endpoints
+                self.assertEqual((endpoint.runtime.value, endpoint.runtime_source), (expected, 'claude_registry'))
+                self.assertEqual(result.document()[0]['runtime'], expected)
 
 
 if __name__=='__main__': unittest.main()

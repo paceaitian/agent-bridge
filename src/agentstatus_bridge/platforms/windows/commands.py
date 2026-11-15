@@ -15,8 +15,9 @@ from .codex_discovery import Discovery, discover
 from .local_transport import WindowsPlatform, IdentityEvidence
 from . import claude_discovery as claude
 
-WRITES = frozenset({'send', 'report', 'retry', 'pause', 'resume', 'cancel', 'accept', 'close'})
-LIGHT = frozenset({'report', 'accept', 'close', 'pause', 'cancel', 'resume'})
+WRITES = frozenset({'send', 'report', 'retry', 'pause', 'resume', 'cancel', 'accept', 'close', 'note'})
+# note 只需调用方归属（消息头 from=），目标由任务决定，不做整体发现（§95.5.2）
+LIGHT = frozenset({'report', 'accept', 'close', 'pause', 'cancel', 'resume', 'note'})
 ALLOWED = WRITES | {'doctor', 'tasks', 'status', 'summary', 'peers', 'wait', 'worker', 'federation'}
 
 
