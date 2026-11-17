@@ -899,6 +899,57 @@ class SyncTests(RelayTestCase):
                          "accepted")
 
 
+class SupersededDecisionTests(RelayTestCase):
+    """§97.2 第 4 条 r2：A 判 superseded 也发回决定。走真实 hub + relay：B 的报告乱序到 A 后，镜像在 A 处理迟到低号后
+    的下一个周期就越过它，不等 relay 的 _decision_overdue（报告送达 A 60 秒后仍无决定才发窄同步）。"""
+
+    def derived_work(self, task_id: str) -> str:
+        task = self.b.store.get_task(self.a.device_id, task_id)
+        assert task is not None
+        attempt = self.b.store.attempts(self.a.device_id, task_id)[0]
+        return str(mirror.derived_attempt(self.b.store, task, attempt, device_id=self.b.device_id).effective_work["work"])
+
+    def b_syncs(self) -> int:
+        return self.b.store.connection.execute(
+            "SELECT COUNT(*) FROM fed_outbox WHERE json_extract(envelope_json,'$.kind')='sync_request'").fetchone()[0]
+
+    def test_late_low_report_converges_without_waiting_for_the_overdue_sync(self) -> None:
+        task, first = self.create()
+        self.a.cycle()
+        self.tick()
+        self.b.cycle()
+        one = self.b_report(task.task_id, "progress")
+        self.b_report(task.task_id, "result")
+        # 1 号退避 30 秒（附件上传重试等真实情形的等价物），2 号先进 hub、先到 A
+        (msg_one,) = self.b.store.connection.execute(
+            "SELECT msg_id FROM fed_outbox WHERE operation_id=?", (one.operation_id,)).fetchone()
+        self.b.store.set_outbox_state(msg_one, state="ready", next_try_at=self.clock.now + 30_000)
+        self.tick()
+        self.b.cycle()
+        self.tick()
+        self.a.cycle()
+        self.tick(31_000)
+        self.b.cycle()  # 1 号这时才进 hub；同一周期收到 2 号的 accepted 决定
+        self.assertEqual(self.derived_work(task.task_id), "awaiting_ack")  # 1 号还没有决定：停在前缀
+        self.tick()
+        self.a.cycle()  # A 判 1 号 superseded，并把决定发回
+        late = self.clock.now
+        self.tick()
+        self.b.cycle()
+        decided = self.b.store.decision(self.b.device_id, one.operation_id)
+        assert decided is not None
+        self.assertEqual(decided["decision"], "superseded")
+        a_attempt = self.a.store.attempt_by_msg(first.msg_id)
+        assert a_attempt is not None
+        self.assertEqual((self.derived_work(task.task_id), a_attempt.effective_work["work"]),
+                         ("result_submitted", "result_submitted"))
+        self.assertLess(self.clock.now - late, 60_000)
+        self.assertEqual(self.b_syncs(), 0)  # 没有靠窄同步
+        self.tick(61_000)  # 之后的周期没有未决报告，不再发窄同步，推导值不变
+        self.b.cycle()
+        self.assertEqual((self.b_syncs(), self.derived_work(task.task_id)), (0, "result_submitted"))
+
+
 class BudgetTests(RelayTestCase):
     """设备内容预算（§88.11/T15）：收端新附件超出预算或磁盘写满就延后、不发 L2；腾出空间后接上；没有附件的事实照常。"""
 

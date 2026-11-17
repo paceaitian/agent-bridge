@@ -21,11 +21,10 @@ from . import envelopes
 from .codec import SENDER_CLASSES
 from .fedstore import LOCAL_NOTICE_KIND, FederatedStore, FedAttempt, FedTask, dump, notice_options
 from .refs import AttemptDefinition, Checkpoint, RemoteEndpointRef, TargetRef, WireActor
-from .views import model_attempt, model_attempts, model_task
+from .views import TERMINAL_REPORTS, fold_report, initial_work, model_attempt, model_attempts, model_task
 
 # A 视角里「投递设备已证明未投」的状态：只来自 B 的证据或 hub 运输拒绝，A 本机的取消请求不算（§88.4 P2-1）
 REMOTE_PROVEN_UNDELIVERED = frozenset({"failed", "refused", "denied", "expired", "cancelled"})
-TERMINAL_REPORTS = frozenset({ReportKind.RESULT, ReportKind.FAILED, ReportKind.APPROVE, ReportKind.CHANGES})
 NOTIFYING_REPORTS = frozenset(TERMINAL_REPORTS | {ReportKind.BLOCKED})
 DECISION_REASONS = frozenset(
     {"task_finished", "stale_attempt", "attempt_not_found", "attempt_not_reportable", "report_kind_mismatch",
@@ -210,7 +209,7 @@ def _new_attempt(task: FedTask, *, seq: int, role: str, target: TargetRef, body:
         body=body, refs=list(refs), options=dict(options),
         authority_state={"createdAt": now, "cancelRequested": False, "superseded": False, "reportHigh": 0},
         evidence_no=0, delivery={"state": "pending"},
-        effective_work={"work": (Work.NONE if role == "notice" else Work.AWAITING_ACK).value},
+        effective_work=initial_work(role),
     )
 
 
@@ -483,9 +482,12 @@ def apply_report(store: FederatedStore, ident: Identity, report: dict[str, Any],
             return _reject(store, ident, task, report, reporter_device=reporter_device, reason="reporter_mismatch", now=now)
         high = int(attempt.authority_state.get("reportHigh", 0))
         if report_no <= high:
-            # 迟到低号只记历史，不覆盖高号、不开新通知（§88.4 第 3 条）
+            # 迟到低号只记历史，不覆盖高号、不开新通知（§88.4 第 3 条）；决定照样发回报告方，镜像不用等 relay 的窄同步
+            # 就能越过这一号（§97.2 第 4 条 r2）。取值旧 B 已认识，窄同步本来也会给出同样的答案
             store.add_decision(reporter_device=reporter_device, report_operation_id=report["operationId"],
                                authority_revision=task.revision, decision="superseded", reason=None)
+            _send_decision(store, ident, task, report, reporter_device=reporter_device, decision="superseded",
+                           reason=None, now=now)
             return Decision("superseded", None, task.revision)
         if task.finished:
             return _reject(store, ident, task, report, reporter_device=reporter_device, reason="task_finished", now=now)
@@ -517,15 +519,8 @@ def _accept_report(store: FederatedStore, ident: Identity, task: FedTask, attemp
                               "source": report.get("source", "agent"), "reportedAt": now}
     if isinstance(report.get("commit"), dict):
         result["commit"] = report["commit"]
-    work_map = {ReportKind.ACK: Work.ACKNOWLEDGED, ReportKind.PROGRESS: Work.IN_PROGRESS,
-                ReportKind.BLOCKED: Work.BLOCKED, ReportKind.FAILED: Work.FAILED}
-    work = work_map.get(kind, Work.RESULT)
-    effective = dict(attempt.effective_work)
-    if not (kind is ReportKind.ACK and effective.get("work") != Work.AWAITING_ACK.value):
-        effective["work"] = work.value
-        effective["at"] = now
-    if kind in TERMINAL_REPORTS:
-        effective["result"] = result
+    # 与镜像读时推导共用同一个折叠函数（§97.2）：A 的行为不变
+    effective = fold_report(attempt.effective_work, kind, result=result, at=now)
     delivery = dict(attempt.delivery)
     delivery["receiverReported"] = True  # 只写 A 侧派生视图，不覆盖 B 的原始证据
     authority_state = dict(attempt.authority_state)

@@ -329,6 +329,31 @@ class HandoffFlowTests(FederationTestCase):
                       reporter_device=DEV_B, now=T0 + 7)
         self.assertEqual(after.reason, "task_finished")
 
+    def test_superseded_decision_is_sent_to_the_reporter(self) -> None:
+        # §97.2 第 4 条 r2：迟到低号判 superseded 时与 accepted/rejected 一样发回决定（各自一封信封、取值旧 B 已认识）；
+        # 重复收到同一条报告只返回原决定，不再发
+        task, _ = self.create()
+        apply = authority.apply_report_safely
+        self.assertEqual(apply(self.a.store, self.a.ident, self._remote_report(task.task_id, 1, "progress", 3),
+                               reporter_device=DEV_B, now=T0 + 1).decision, "accepted")
+        for number in (2, 1):
+            late = apply(self.a.store, self.a.ident, self._remote_report(task.task_id, 1, "result", number),
+                         reporter_device=DEV_B, now=T0 + 1 + number)
+            self.assertEqual(late.decision, "superseded")
+        again = apply(self.a.store, self.a.ident, self._remote_report(task.task_id, 1, "result", 2),
+                      reporter_device=DEV_B, now=T0 + 9)
+        self.assertTrue(again.duplicate)
+        sent = [json.loads(item["envelope_json"]) for item in self.a.store.outbox()
+                if json.loads(item["envelope_json"])["kind"] == "report_decision"]
+        self.assertEqual(sorted((item["targetDeviceId"], item["data"]["reportNo"], item["data"]["decision"]) for item in sent),
+                         [(DEV_B, 1, "superseded"), (DEV_B, 2, "superseded"), (DEV_B, 3, "accepted")])
+        self.assertEqual(len({item["msg_id"] for item in sent}), 3)
+        self.assertEqual(len({item["operationId"] for item in sent}), 3)
+        self.assertEqual({item["data"]["reportOperationId"] for item in sent},
+                         {(str(number) * 32)[:32] for number in (1, 2, 3)})
+        a_attempt = next(iter(self.a.store.attempts(DEV_A, task.task_id)))
+        self.assertEqual(a_attempt.effective_work["work"], "in_progress")  # 迟到低号照旧不覆盖高号
+
     def test_reporter_must_match_every_part_of_the_target_binding(self) -> None:
         task, _ = self.create()
         variants = {

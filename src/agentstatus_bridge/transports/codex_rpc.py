@@ -65,6 +65,10 @@ STEER_PATH_NO_ACTIVE_TURN: Final = "no_active_turn"
 STEER_PATH_TURNS_UNREADABLE: Final = "turns_unreadable"
 STEER_PATH_REJECTED: Final = "steer_rejected"
 STEER_PATH_UNKNOWN: Final = "steer_unknown"
+# steerPath 的取值闭集：跨设备只同步闭集内的值（DESIGN §97.3）
+STEER_PATHS: Final = frozenset({STEER_PATH_STEERED, STEER_PATH_THREAD_NOT_ACTIVE, STEER_PATH_THREAD_UNREADABLE,
+                                STEER_PATH_NO_ACTIVE_TURN, STEER_PATH_TURNS_UNREADABLE, STEER_PATH_REJECTED,
+                                STEER_PATH_UNKNOWN})
 # 只读步骤读到一半中断：连接失步，不复用，按写前回退 CLI
 FALLBACK_STEER_READ_FAILED: Final = "steer_read_failed"
 
@@ -100,6 +104,8 @@ _STEER_NOT_SUBMITTED: Final[tuple[tuple[int, _SteerMatch, str, str], ...]] = (
     (-32600, "exact", "active turn uses a different output schema", "codex_steer_schema_mismatch"),
     (-32600, "exact", "Server is draining; retry after reconnecting", "codex_server_draining"),
 )
+# steerRejected 的取值闭集：上表的原因码（`classify_steer_error` 只会返回这些），跨设备只同步这组固定码（§97.3）
+STEER_REJECTED_CODES: Final = frozenset(reason for *_, reason in _STEER_NOT_SUBMITTED)
 _EXPECTED_TURN_MISMATCH: Final = re.compile(r"expected active turn id `[^`\n]*` but found `[^`\n]*`")
 
 # 回退原因（`rpcFallback` 证据键的取值；version_unavailable 由调用方给出）

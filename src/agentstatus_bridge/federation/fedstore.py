@@ -907,11 +907,16 @@ class FederatedStore:
         return True
 
     def evidence(self, msg_id: str) -> list[dict[str, Any]]:
+        """该尝试的全部证据行，按 evidence_no 升序。
+
+        先展开证据 JSON、再放 evidenceNo/deliveryDevice 两个列值：证据正文来自投递设备，里面的同名键不能覆盖列值
+        （§97.2 第 4 条 r2；否则读方按号取行会抛异常或把 detail 挂到错号上）。
+        """
         rows = self._conn.execute(
             "SELECT evidence_no,delivery_device,evidence_json FROM fed_evidence WHERE msg_id=? ORDER BY evidence_no",
             (msg_id,),
         ).fetchall()
-        return [{"evidenceNo": row[0], "deliveryDevice": row[1], **load_dict(row[2])} for row in rows]
+        return [{**load_dict(row[2]), "evidenceNo": row[0], "deliveryDevice": row[1]} for row in rows]
 
     # ---- 报告与裁决 ----
 

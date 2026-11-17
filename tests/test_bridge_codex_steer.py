@@ -25,6 +25,7 @@ from unittest.mock import patch
 
 import bridge_support  # noqa: F401  导入即隔离宿主会话环境
 
+from agentstatus_bridge.federation.views import steer_detail
 from agentstatus_bridge.model import Delivery
 from agentstatus_bridge.transports import DeliveryContext, codex_rpc
 from agentstatus_bridge.transports.codex_rpc import (
@@ -391,6 +392,8 @@ class LinuxSteerTests(unittest.TestCase):
         self.assertEqual((outcome.delivery, outcome.reason, outcome.provider_ref, outcome.native_root),
                          (Delivery.DELIVERED, "codex_steered", None, None))
         self.assertEqual(outcome.detail, {"codexVersion": "0.169.0", "steerPath": STEER_PATH_STEERED})
+        # 跨设备只同步闭集细节（§97.3）：Linux 传输的键名与取值要落在投影里
+        self.assertEqual(steer_detail(outcome.detail), {"steerPath": STEER_PATH_STEERED})
         self.assertEqual(summarize_rpc_evidence([outcome.detail])["state"], "no_samples")
         self.assertEqual(summarize_queue_evidence([outcome.detail], "0.169.0")["state"], "no_samples")
         # 退回队列：照旧是 RPC 队列样本，另附通道选择路径与拒绝原因
@@ -400,6 +403,8 @@ class LinuxSteerTests(unittest.TestCase):
         self.assertEqual(outcome.delivery, Delivery.QUEUED)
         self.assertEqual(outcome.detail, {"queueChannel": "rpc", "codexVersion": "0.169.0", "queueOutput": "recognized",
                                           "steerPath": STEER_PATH_REJECTED, "steerRejected": "codex_steer_review_turn"})
+        self.assertEqual(steer_detail(outcome.detail),
+                         {"steerPath": STEER_PATH_REJECTED, "steerRejected": "codex_steer_review_turn"})
         self.assertEqual(summarize_rpc_evidence([outcome.detail])["recognized"], 1)
         self.assertEqual([argv for argv in self.cli_calls if argv[1] == "queue"], [])
 
@@ -502,6 +507,8 @@ class WindowsSteerTests(unittest.TestCase):
                          (Delivery.DELIVERED, "codex_steered", None, None))
         self.assertEqual(result.detail, {"steerPath": STEER_PATH_STEERED, "codexVersion": "0.162.1",
                                          "serverVersion": "0.162.1"})
+        # 跨设备只同步闭集细节（§97.3）：Windows 传输的键名与取值要落在投影里
+        self.assertEqual(steer_detail(result.detail), {"steerPath": STEER_PATH_STEERED})
         self.assertEqual(boundaries, ["boundary"])
         self.assertEqual(self.methods(), ["thread/read", "thread/turns/list", "turn/steer"])
         steer = [m for m in self.k.messages if m["method"] == "turn/steer"][0]
@@ -560,6 +567,8 @@ class WindowsSteerTests(unittest.TestCase):
         self.assertEqual(boundaries, ["boundary", "boundary"])
         self.assertEqual((result.detail["steerPath"], result.detail["steerRejected"]),
                          (STEER_PATH_REJECTED, "codex_steer_no_active_turn"))
+        self.assertEqual(steer_detail(result.detail),
+                         {"steerPath": STEER_PATH_REJECTED, "steerRejected": "codex_steer_no_active_turn"})
         self.assertEqual(self.methods()[-2:], ["turn/steer", "thread/queue/add"])
         # 复位方向：拒绝之后、add 帧之前的写前失败仍是 FAILED（可证明未送入），不是 UNKNOWN
         self.rebuild()
@@ -652,6 +661,7 @@ class WindowsSteerTests(unittest.TestCase):
         self.assertIs(result.delivery, Delivery.QUEUED)
         self.assertEqual((result.detail["steerPath"], result.detail["steerReadFailed"]),
                          (STEER_PATH_TURNS_UNREADABLE, "codex_steer_read_desync"))
+        self.assertNotIn("steerReadFailed", steer_detail(result.detail))  # 队列诊断键不跨设备同步（§97.3）
         # 新连接照常先做根会话分类（metadata-only thread/read），再直接 add，不再读轮次、不 steer
         self.assertEqual(self.methods(), ["thread/read", "thread/turns/list", "thread/read", "thread/queue/add"])
         self.assertEqual(sum(1 for m in self.k.messages if m["method"] == "initialize"), 2)  # 两条连接

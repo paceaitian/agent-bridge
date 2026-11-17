@@ -17,9 +17,9 @@ from . import authority, envelopes
 from .codec import CodecError, canonical_bytes, is_hex32, sha256_hex
 from .fedstore import FederatedStore, FedAttempt, FedTask, dump, load_dict
 from .refs import AttemptDefinition, Checkpoint, RemoteEndpointRef, TargetRef, WireActor
-from ..model import EndpointRef
+from ..model import EndpointRef, Phase, TaskView, describe
 from ..reminders import PendingReminder, pending_reminder, reminder_candidate
-from .views import model_attempts, model_task
+from .views import derive_work, initial_work, model_attempts, model_task
 
 FROM_AUTHORITY = frozenset({"handoff", "review", "notice", "task_state", "report_decision", "sync_state"})
 TO_AUTHORITY = frozenset({"report", "delivery_status", "sync_request"})
@@ -691,3 +691,72 @@ def mark_sync_required(store: FederatedStore, *, authority_device: str | None) -
                                  (row[0], row[1]))
         count += 1
     return count
+
+
+# ---- 显示用的读时推导（§97.2）：不写回账本，只给 status/tasks/wait 与 report --json 回显用 ----
+
+# 当前工作尝试在别的设备上（镜像没有它的行）：只知道由谁处理，完整状态以发起设备为准
+HANDLED_ON_OTHER_DEVICE = "handled_on_other_device"
+
+
+def _report_high(attempt: FedAttempt) -> int:
+    value = attempt.authority_state.get("reportHigh", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def derived_attempt(store: FederatedStore, task: FedTask, attempt: FedAttempt, *, device_id: str) -> FedAttempt:
+    """镜像任务里本机目标的工作尝试换上读时推导的有效 work；权威端、通知类与别的设备的尝试原样返回。
+
+    推导只用本机交过的报告、A 发回的决定与 checkpoint 带来的 reportHigh（`views.derive_work`）；原始列不改。
+    推导出已有报告被采纳（work 离开 awaiting_ack）时，显示副本同时置 `receiverReported`，与 A 采纳报告时写的
+    派生视图同口径（§97.2 第 4 条 r2）：否则本机投递 unknown/failed 时阶段停在投递异常，`ab wait` 也与 A 不同。
+    """
+    if task.is_authority or attempt.role == "notice" or attempt.target_device != device_id:
+        return attempt
+    rows: list[tuple[int, dict[str, Any], str | None]] = []
+    for row in store.reports(task.authority_device, task.task_id, attempt.seq):
+        if row["reporter_device"] != device_id:
+            continue
+        decision = store.decision(device_id, str(row["operation_id"]))
+        rows.append((int(row["report_no"]), row["report"], str(decision["decision"]) if decision else None))
+    effective = derive_work(attempt.role, rows, report_high=_report_high(attempt))
+    if effective.get("work") == initial_work(attempt.role).get("work"):
+        return replace(attempt, effective_work=effective)
+    return replace(attempt, effective_work=effective, delivery={**attempt.delivery, "receiverReported": True})
+
+
+def display_attempts(store: FederatedStore, task: FedTask, *, device_id: str) -> list[FedAttempt]:
+    """显示用的尝试列表：镜像上本机工作尝试的 work 是读时推导值（§97.2 第 3 条的读方分工）。"""
+    return [derived_attempt(store, task, item, device_id=device_id)
+            for item in store.attempts(task.authority_device, task.task_id)]
+
+
+def current_definition(task: FedTask) -> AttemptDefinition | None:
+    """镜像保存的 checkpoint 里当前工作尝试的定义；没有当前工作或坏数据时为 None。"""
+    if task.current_work_seq is None:
+        return None
+    return next((item for item in _stored_checkpoint_attempts(task) if item.seq == task.current_work_seq), None)
+
+
+def describe_view(task: FedTask, attempts: list[FedAttempt], *, device_id: str) -> TaskView:
+    """联邦任务的阶段折叠：权威端照本机 describe；镜像上当前工作尝试不在本机时按 checkpoint 定义判（§97.2 第 2 条）。
+
+    镜像只物化发给本设备的尝试，`describe` 取到的最后一个工作尝试可能早已不是当前的（复核方在 A、retry 改派别处），
+    这时不拿它当当前：目标是本机（信封还在路上）→ 等待发送；复核已有结论 → 沿用现有映射；否则 → 由别的设备处理。
+    """
+    view = describe(model_task(task), model_attempts(attempts))
+    if task.is_authority or task.finished or task.current_work_seq is None:
+        return view
+    if any(item.seq == task.current_work_seq and item.role != "notice" for item in attempts):
+        return view
+    definition = current_definition(task)
+    if definition is None or definition.role == "notice":
+        return view  # 坏数据或没有定义：退回原判定，不猜
+    if definition.target.device_id == device_id:
+        return TaskView(Phase.QUEUED, "paused" if task.paused else "waiting_for_target", None)
+    verdict = task.state.get("verdict")
+    if verdict == "approved":
+        return TaskView(Phase.AWAITING_ACCEPTANCE, "review_approved", None)
+    if verdict == "changes_requested":
+        return TaskView(Phase.NEEDS_ATTENTION, "changes_requested", None)
+    return TaskView(Phase.RUNNING, HANDLED_ON_OTHER_DEVICE, None)

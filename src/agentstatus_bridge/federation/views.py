@@ -7,12 +7,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
+from typing import Any
+
+from ..transports.codex_rpc import STEER_PATHS, STEER_REJECTED_CODES
 from ..model import (
     Attempt,
     Consumption,
     Delivery,
     EndpointRef,
     Flow,
+    ReportKind,
     Role,
     Task,
     Verdict,
@@ -148,3 +153,76 @@ def model_attempt(attempt: FedAttempt) -> Attempt:
 
 def model_attempts(attempts: list[FedAttempt]) -> list[Attempt]:
     return [model_attempt(item) for item in attempts]
+
+
+# 已采纳报告对有效 work 的推进（§97.2）：A 采纳报告与镜像读时推导共用同一张表与同一条 ACK 规则，两端不会各算各的
+_REPORT_WORK: dict[ReportKind, Work] = {ReportKind.ACK: Work.ACKNOWLEDGED, ReportKind.PROGRESS: Work.IN_PROGRESS,
+                                        ReportKind.BLOCKED: Work.BLOCKED, ReportKind.FAILED: Work.FAILED}
+TERMINAL_REPORTS = frozenset({ReportKind.RESULT, ReportKind.FAILED, ReportKind.APPROVE, ReportKind.CHANGES})
+
+
+def fold_report(effective: Mapping[str, Any], kind: ReportKind, *, result: dict[str, Any],
+                at: int | None) -> dict[str, Any]:
+    """一条已采纳报告推进后的有效 work（A 的 `_accept_report` 与镜像读时推导共用，§97.2）。
+
+    ACK 只把 awaiting_ack 推进到 acknowledged，之后再到的 ACK 不改 work；其余报告按表推进（复核结论记为
+    result_submitted）。终态报告另记 result。at 为 None 时不写时间：镜像不知道 A 的采纳时刻。
+    """
+    folded = dict(effective)
+    if not (kind is ReportKind.ACK and folded.get("work") != Work.AWAITING_ACK.value):
+        folded["work"] = _REPORT_WORK.get(kind, Work.RESULT).value
+        if at is not None:
+            folded["at"] = at
+    if kind in TERMINAL_REPORTS:
+        folded["result"] = result
+    return folded
+
+
+def initial_work(role: str) -> dict[str, Any]:
+    """尝试建立时的有效 work：通知类不跟踪，其余等待对方确认（A 建尝试与镜像推导的起点相同）。"""
+    return {"work": (Work.NONE if role == "notice" else Work.AWAITING_ACK).value}
+
+
+def derive_work(role: str, reports: Iterable[tuple[int, Mapping[str, Any], str | None]], *,
+                report_high: int) -> dict[str, Any]:
+    """镜像读时推导本机尝试的有效 work（§97.2 第 1 条），不写回账本。
+
+    reports 是本设备为这个尝试交过的报告：(reportNo, 报告事实, A 的决定或 None)。按 reportNo 升序只折叠**连续
+    前缀**（r1）：accepted 的计入；rejected/superseded 已知未采纳，跳过继续；还没有决定行、号码又恰好等于 A 的
+    reportHigh 的那一条按已采纳处理（A 只在采纳时抬高 reportHigh），已知被拒的绝不提升；遇到第一条决定未知的报告
+    就停下，后面的即使已有 accepted 决定也暂不计入；不认识的报告类别同样停下（r2）。这样推导值总是 A 某个时刻真实
+    有过的状态（只会落后，不会出现 A 没有过的状态）；窄同步补回决定后自然收敛。
+    """
+    effective = initial_work(role)
+    if role == "notice":
+        return effective
+    for number, fact, decision in sorted(reports, key=lambda item: item[0]):
+        if decision in ("rejected", "superseded"):
+            continue  # 已知未采纳：不计入，但前缀仍然连续
+        if not (decision == "accepted" or (decision is None and report_high > 0 and number == report_high)):
+            break  # 第一条决定未知的报告：后面的暂不计入，否则可能拼出 A 从来没有过的状态
+        try:
+            kind = ReportKind(fact.get("kind"))
+        except ValueError:
+            break  # 不认识的类别不知道 A 怎么折叠：与决定未知同样停下，宁可落后（r2）
+        result: dict[str, Any] = {"note": fact.get("note") or "", "refs": list(fact.get("refs") or []),
+                                  "source": fact.get("source", "agent")}
+        if isinstance(fact.get("commit"), dict):
+            result["commit"] = fact["commit"]
+        effective = fold_report(effective, kind, result=result, at=None)
+    return effective
+
+
+def steer_detail(detail: Mapping[str, object]) -> dict[str, str]:
+    """投递明细里可以跨设备同步的部分（§97.3）：只留 steerPath 与 steerRejected 两键，值不在闭集内就不放。
+
+    执行端写证据与两端读证据共用这一投影：版本号、pid、filetime、登录细节与队列诊断键一律不出本机；
+    旧权威端会把收到的证据原样存下，所以闭集必须由写方守住，读方再过滤一遍。
+    """
+    shown: dict[str, str] = {}
+    path, rejected = detail.get("steerPath"), detail.get("steerRejected")
+    if isinstance(path, str) and path in STEER_PATHS:
+        shown["steerPath"] = path
+    if isinstance(rejected, str) and rejected in STEER_REJECTED_CODES:
+        shown["steerRejected"] = rejected
+    return shown

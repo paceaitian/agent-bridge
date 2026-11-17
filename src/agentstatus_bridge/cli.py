@@ -1891,7 +1891,7 @@ def _fed_task_list(include_finished: bool, now: float,
                 target = where + NO_NAMES.text(view.current.target)  # 跨设备：设备名 + 完整 ID，不用对端名字（§91.4.2）
             role = "本机发起" if task.is_authority else f"发起设备 {document['authorityDeviceName']}"
             flag = "，需处理：远端离线/传输未恢复" if document["stalled"] else ""
-            phase, reason = PHASE_LABELS[view.phase], reason_text(view.reason)
+            phase, reason = PHASE_LABELS[view.phase], fed.reason_label(rt, task, view)
             rows = document["attempts"]
             if task.is_fyi and isinstance(rows, list) and rows:
                 # 一句话告知（§95.5.7）：阶段列写「告知」，目标取那条告知，原因写投递状态
@@ -1983,7 +1983,7 @@ def _fed_wait(args: argparse.Namespace, rt: FedRuntime, task: FedTask) -> int:
                 return reached
             if time.monotonic() >= deadline:
                 if not args.json:
-                    print(f"等待超时：{PHASE_LABELS[view.phase]}（{reason_text(view.reason)}）")
+                    print(f"等待超时：{PHASE_LABELS[view.phase]}（{fed.reason_label(rt, current, view)}）")
                 return EXIT_TIMEOUT
             time.sleep(1.0)
     finally:

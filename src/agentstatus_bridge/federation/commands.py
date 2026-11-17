@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from collections.abc import Callable
@@ -21,7 +22,7 @@ from ..endpoints import ADAPTERS, Caller, DiscoverySources, Endpoint, discover
 from ..endpoints import _ids_complete  # pyright: ignore[reportPrivateUsage]  与本机解析/名字投影同一身份判据（§94.1）
 from ..ids import short
 from ..labels import FYI_LABEL, FYI_STATUS_LABEL, NOTE_LABEL, reason_text
-from ..model import PHASE_LABELS, Attempt, EndpointRef, Phase, Provider, ReportKind, Task, TaskView, describe
+from ..model import PHASE_LABELS, Attempt, EndpointRef, Phase, Provider, ReportKind, Task, TaskView
 from ..naming import command_name
 from ..native_names import full_id_token
 from ..platforms import process as procfs
@@ -49,11 +50,13 @@ from .refs import TargetRef, WireActor
 from .relay import STOP_STATES, Relay, RelayPaths, ssh_connector
 from .relay_control import RelayDiagnostics, StopController, config_disabled, install_sigterm
 from .relay_control import valid_distribution_version
-from .views import model_attempt, model_attempts, model_task
+from .views import model_attempt, model_task, steer_detail
 
 RELAY_LOCK = "federation-relay.lock"
 # 待传超过 30 分钟叠加「远端离线/传输未恢复」提示（§88.6）；只是提示，不改业务状态
 STALLED_MS = 30 * 60 * 1000
+# 投递原因码来自投递设备（可能是另一台）：只显示形状合规的固定码，不合规显示 unknown（§97.3）
+_REASON_SHAPE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 RELAY_STATES = frozenset({"starting", "connected", "reconnecting", "offline", "auth_failed", "incompatible",
                           "storage_failed"})
 
@@ -481,9 +484,23 @@ def device_name(rt: Runtime, device_id: str) -> str:
     return device_id  # 这个值会进 --origin-device/--device 等可复制命令：8 位前缀解析不了，用完整 deviceId
 
 
+def display_attempts(rt: Runtime, task: FedTask) -> list[FedAttempt]:
+    """显示与 `ab wait` 用的尝试：镜像上本机工作尝试的 work 改读读时推导值，权威端原样（§97.2 第 3 条）。"""
+    return mirror.display_attempts(rt.store, task, device_id=rt.ident.device_id)
+
+
 def view_of(rt: Runtime, task: FedTask) -> TaskView:
-    """联邦任务的本机阶段折叠（复用 describe）；远端目标在视图里是仅供显示的引用。"""
-    return describe(model_task(task), model_attempts(rt.store.attempts(task.authority_device, task.task_id)))
+    """联邦任务的本机阶段折叠（复用 describe；镜像另按 checkpoint 的当前尝试判，§97.2 第 2 条）。"""
+    return mirror.describe_view(task, display_attempts(rt, task), device_id=rt.ident.device_id)
+
+
+def reason_label(rt: Runtime, task: FedTask, view: TaskView) -> str:
+    """原因的人读文本；当前尝试由别的设备处理时写出是哪台设备（§97.2 第 2 条）。"""
+    if view.reason == mirror.HANDLED_ON_OTHER_DEVICE:
+        definition = mirror.current_definition(task)
+        if definition is not None:
+            return f"当前由 {device_name(rt, definition.target.device_id)} 处理，完整状态以发起设备为准"
+    return reason_text(view.reason)
 
 
 def phase_of(rt: Runtime, task: FedTask) -> tuple[Phase, str]:
@@ -501,9 +518,39 @@ def stalled(rt: Runtime, task: FedTask, *, now: int) -> bool:
     return int(row[0]) > 0
 
 
-def _attempt_rows(rt: Runtime, task: FedTask) -> list[dict[str, Any]]:
+def delivery_reason(attempt: FedAttempt) -> str | None:
+    """尝试的投递原因码（投递设备随证据回传，§97.3）；没有为 None，形状不合规为 unknown。"""
+    raw = attempt.delivery.get("reason")
+    if raw is None:
+        return None
+    return raw if isinstance(raw, str) and _REASON_SHAPE.fullmatch(raw) else "unknown"
+
+
+def delivery_detail(rt: Runtime, attempt: FedAttempt) -> dict[str, str]:
+    """跨设备投递细节闭集（§97.3）：两端都从 fed_evidence 读该尝试高水位那一行的 detail，按闭集过滤。
+
+    高水位行要与显示的投递状态、原因码一致；它没有 detail 时才往低号找，而且只在投递状态与原因码都与高水位行相同
+    时找，一旦不同就省略——不把一行的 state/reason 与另一行的 steerPath 拼在一起。A 升级前收到的证据同样可读。
+    """
+    rows = {int(row["evidenceNo"]): row for row in rt.store.evidence(attempt.msg_id)}
+    high = rows.get(attempt.evidence_no)
+    if high is None or (high.get("state"), high.get("reason")) != (attempt.delivery.get("state"),
+                                                                  attempt.delivery.get("reason")):
+        return {}
+    for number in sorted((item for item in rows if item <= attempt.evidence_no), reverse=True):
+        row = rows[number]
+        if (row.get("state"), row.get("reason")) != (high.get("state"), high.get("reason")):
+            return {}
+        raw = row.get("detail")
+        detail = steer_detail(raw) if isinstance(raw, dict) else {}  # pyright: ignore[reportUnknownArgumentType]
+        if detail:
+            return detail
+    return {}
+
+
+def _attempt_rows(rt: Runtime, attempts: list[FedAttempt]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for attempt in rt.store.attempts(task.authority_device, task.task_id):
+    for attempt in attempts:
         outbox = rt.store.outbox_item(attempt.msg_id)
         native = rt.store.native(attempt.msg_id)
         files: list[dict[str, Any]] = []
@@ -519,14 +566,16 @@ def _attempt_rows(rt: Runtime, task: FedTask) -> list[dict[str, Any]]:
         # 补充消息另标类别与所补序号（§95.5.6），告知标类别（§95.5.7）
         kind: dict[str, Any] = ({"noticeKind": "note", "forSeq": attempt.options.get("forSeq")} if attempt.is_note
                                 else {"noticeKind": "fyi"} if attempt.is_fyi else {})
+        detail = delivery_detail(rt, attempt)
         rows.append({
             **kind,
+            **({"deliveryDetail": detail} if detail else {}),  # 只含闭集键，没有就省略（§97.3）
             "seq": attempt.seq, "role": attempt.role, "msgId": attempt.msg_id,
             "targetDevice": attempt.target_device, "targetDeviceName": device_name(rt, attempt.target_device),
             "target": f"{attempt.target.remote.provider.value}@id:{attempt.target.remote.native_id}",
             "network": outbox["state"] if outbox else ("local" if local else None),
             "native": native["state"] if native else None,
-            "delivery": attempt.delivery.get("state", "pending"),
+            "delivery": attempt.delivery.get("state", "pending"), "deliveryReason": delivery_reason(attempt),
             "receiverReported": attempt.delivery.get("receiverReported") is True,
             "work": attempt.effective_work.get("work"), "attachments": files,
         })
@@ -546,14 +595,14 @@ def _report_rows(rt: Runtime, task: FedTask) -> list[dict[str, Any]]:
 
 def task_document(rt: Runtime, task: FedTask, *, now: int, include_body: bool = False) -> dict[str, Any]:
     """status/tasks --json 的联邦形状：scope=federation，不伪造本机进程字段。"""
-    attempts = rt.store.attempts(task.authority_device, task.task_id)
-    view = describe(model_task(task), model_attempts(attempts))
+    attempts = display_attempts(rt, task)
+    view = mirror.describe_view(task, attempts, device_id=rt.ident.device_id)
     document: dict[str, Any] = {
         "scope": "federation", "id": task.task_id, "authorityDevice": task.authority_device,
         "authorityDeviceName": device_name(rt, task.authority_device), "isAuthority": task.is_authority,
         "title": task.title, "phase": view.phase.value, "reason": view.reason, "revision": task.revision,
         "lastSyncAt": task.last_sync_at, "syncRequired": task.sync_required, "archived": task.local_archived,
-        "stalled": stalled(rt, task, now=now), "attempts": _attempt_rows(rt, task), "reports": _report_rows(rt, task),
+        "stalled": stalled(rt, task, now=now), "attempts": _attempt_rows(rt, attempts), "reports": _report_rows(rt, task),
     }
     follows = task.state.get("follows")
     if isinstance(follows, str):
@@ -585,7 +634,7 @@ def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False)
     age = max(0, (now - task.last_sync_at) // 1000)
     flags = ("；需同步" if task.sync_required else "") + ("；仅本机已归档" if task.local_archived else "")
     state = (f"{FYI_STATUS_LABEL}（{_fyi_delivery(document)}）" if task.is_fyi
-             else f"{PHASE_LABELS[view.phase]}（{reason_text(view.reason)}）")
+             else f"{PHASE_LABELS[view.phase]}（{reason_label(rt, task, view)}）")
     lines = [f"跨设备任务 {short(task.task_id)}  {task.title}",
              f"  {role}；{state}；最近同步 {age} 秒前{flags}"]
     if document["stalled"]:
@@ -593,10 +642,17 @@ def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False)
     for row in document["attempts"]:
         network = _NETWORK_LABELS.get(str(row["network"]), "-")
         reported = "，对方已汇报" if row["receiverReported"] else ""
+        causes = [str(row["deliveryReason"])] if row["deliveryReason"] else []
+        steer = row.get("deliveryDetail") or {}
+        if "steerPath" in steer:
+            causes.append(f"steer：{steer['steerPath']}")
+        if "steerRejected" in steer:
+            causes.append(f"steer 拒绝：{steer['steerRejected']}")
+        cause = f"（{'；'.join(causes)}）" if causes else ""
         label = (f"{NOTE_LABEL} #{row['seq']}" if row.get("noticeKind") == "note"
                  else f"{FYI_LABEL} #{row['seq']}" if row.get("noticeKind") == "fyi" else f"#{row['seq']} {row['role']}")
         lines.append(f"  {label} → {row['targetDeviceName']} {row['target']}"
-                     f"  网络 {network}  投递 {row['delivery']}{reported}")
+                     f"  网络 {network}  投递 {row['delivery']}{cause}{reported}")
         for item in row["attachments"]:
             where = f" {item['path']}" if "path" in item else ""
             state = "已过留存期" if item["state"] == "expired" else item["state"]
@@ -608,8 +664,9 @@ def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False)
     if show_body:
         lines.extend(["", str(document.get("body", ""))])
     cmd = command_name()
-    if not task.is_authority and not task.finished:
-        # 联邦页脚带 --origin-device：CLI 只据本机索引找发起设备，不读正文里的远端路径（§88.8）
+    if not task.is_authority and not task.finished and view.reason != mirror.HANDLED_ON_OTHER_DEVICE:
+        # 联邦页脚带 --origin-device：CLI 只据本机索引找发起设备，不读正文里的远端路径（§88.8）；
+        # 当前工作在别的设备上时不提示，照做会被本机以 attempt_not_found 拒绝（§97.2 第 4 条 r2）
         lines.append(f"汇报：{cmd} report {short(task.task_id)} --origin-device {document['authorityDeviceName']}"
                      " --result（或 --blocked / --failed）")
     return lines

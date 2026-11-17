@@ -147,8 +147,8 @@ class FedCliCase(unittest.TestCase):
                 moved += 1
         return moved
 
-    def deliver_on_b(self) -> RecordingTransport:
-        transport = RecordingTransport(Provider.CODEX)
+    def deliver_on_b(self, outcome: DeliveryOutcome | None = None) -> RecordingTransport:
+        transport = RecordingTransport(Provider.CODEX, outcome)
         with self.store("win") as store:
             FederationDispatcher(store, self.ident("win"), RelayPaths(self.states["win"]),
                                  discover=lambda: [WORKER], transports={Provider.CODEX: transport},
@@ -1038,6 +1038,40 @@ class ListingTests(FedCliCase):
         assert projection is not None
         self.assertEqual((projection["ledgerReadable"], projection["storageReason"]),
                          (False, "federation_store_unavailable"))
+
+
+class MirrorDeliveryOutcomeTests(FedCliCase):
+    """§97.2 第 4 条 r2：B 本机投递 unknown/failed、对方汇报已被 A 采纳时，镜像的阶段与 ab wait 退出码与 A 一致
+    （A 采纳时在派生视图写 receiverReported，镜像显示副本同口径）；queued 作对照。经 cli.main（两方 r0 审计 S1）。"""
+
+    def test_phase_and_wait_follow_the_authority_after_an_accepted_report(self) -> None:
+        origin = as_agent(ORIGIN)
+        worker = as_agent(WORKER)
+        for state, reason in ((Delivery.UNKNOWN, "codex_queue_unknown"), (Delivery.FAILED, "codex_queue_failed"),
+                              (Delivery.QUEUED, "codex_queued")):
+            with self.subTest(state=state.value):
+                self.doCleanups()
+                self.setUp()
+                task_id = self.send()
+                self.pump("vm", "win")
+                self.deliver_on_b(DeliveryOutcome(state, reason))
+                self.pump("win", "vm")
+                for flag, until in (("--ack", "ack"), ("--result", "result")):
+                    self.assertEqual(self.run_on("win", "report", task_id, flag, caller=worker)[0], cli.EXIT_OK, flag)
+                    self.pump("win", "vm")
+                    self.pump("vm", "win")
+                    shown: dict[str, tuple[Any, ...]] = {}
+                    for device, caller in (("vm", origin), ("win", worker)):
+                        code, out, err = self.run_on(device, "status", task_id, "--json", caller=caller)
+                        self.assertEqual(code, 0, err)
+                        doc = json.loads(out)
+                        row = doc["attempts"][0]
+                        shown[device] = (doc["phase"], doc["reason"], row["delivery"], row["receiverReported"])
+                    self.assertEqual(shown["win"], shown["vm"], flag)
+                    self.assertEqual(shown["win"][2:], (state.value, True), flag)
+                    codes = [self.run_on(device, "wait", task_id, "--until", until, "--timeout", "0", caller=caller)[0]
+                             for device, caller in (("vm", origin), ("win", worker))]
+                    self.assertEqual(codes, [cli.EXIT_OK, cli.EXIT_OK], flag)
 
 
 class UnconfiguredMachineTests(unittest.TestCase):

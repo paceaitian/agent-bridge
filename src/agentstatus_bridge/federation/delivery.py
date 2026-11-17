@@ -36,7 +36,7 @@ from .directory import root_binding
 from .attachments import REFERENCE_NOTICE, AttachmentError
 from .fedstore import FederatedStore, FedAttempt, FedTask, dump, load_dict
 from .relay import RelayPaths, local_blob
-from .views import model_attempt, model_attempts, model_task, remote_text
+from .views import model_attempt, model_attempts, model_task, remote_text, steer_detail
 
 LogFn = Callable[[str, Mapping[str, object]], None]
 REMINDER_RETRY_MS = 60_000
@@ -541,6 +541,10 @@ class FederationDispatcher:
     def _record_outcome(self, attempt: FedAttempt, live: Endpoint, outcome: DeliveryOutcome) -> None:
         now = self.clock()
         evidence: dict[str, Any] = {"state": outcome.delivery.value, "reason": outcome.reason, "at": now}
+        detail = steer_detail(outcome.detail)
+        if detail:
+            # 只带闭集细节（steer 通道与拒绝码），随证据回传权威端；版本、进程等明细不出本机（§97.3）
+            evidence["detail"] = detail
         result = {"delivery": outcome.delivery.value, "reason": outcome.reason, "providerRef": outcome.provider_ref,
                   "deliveredPane": live.ref.pane, "deliveredPid": live.ref.pid}
         final = "unknown" if outcome.delivery is Delivery.UNKNOWN else "finished"

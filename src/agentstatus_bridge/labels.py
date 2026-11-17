@@ -89,6 +89,8 @@ REASON_TEXTS: dict[str, str] = {
     "review_approved": "复核通过，待验收",
     "changes_requested": "复核要求修改",
     "review_not_dispatched": "结果已交，但复核消息未生成",
+    # 镜像上当前工作尝试在别的设备（§97.2 第 2 条）；联邦 status 另写出设备名
+    "handled_on_other_device": "当前由其他设备处理，完整状态以发起设备为准",
     "accepted": "已验收",
     "closed": "已停止追踪",
     "target_not_found": "找不到目标会话（用 {command} peers 查看可用目标）",
