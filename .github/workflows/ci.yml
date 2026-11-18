@@ -18,3 +18,17 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -t tests -v
       - name: import manifest matches the imported files
         run: python3 scripts/check-import-manifest.py
+
+  windows:
+    # Windows 选择集：假内核与可移植用例在真实 Windows 上跑，另含只读的本对象原生冒烟（不执行 provider 门）
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Windows selection
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -B scripts/verify-bridge-windows.py
