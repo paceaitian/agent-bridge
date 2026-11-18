@@ -38,6 +38,7 @@ from agentstatus_bridge.platforms.linux.process import ProcessInfo
 from agentstatus_bridge.platforms.windows import commands as windows_commands
 from agentstatus_bridge.store import Store
 from agentstatus_bridge.task_filter import FilterError, SessionMatch, TaskFilter, parse_since
+from agentstatus_bridge.transports import DeliveryOutcome
 from agentstatus_bridge.transports.codex_native import NativeFailure
 from agentstatus_bridge.federation import commands as fed_commands, directory
 from agentstatus_bridge.ids import new_id
@@ -661,6 +662,31 @@ class FederatedDecisionJsonTests(FedCliCase):
         self.relay_up = False
         self.assertEqual(self.run_on("vm", "close", other, caller=fed_agent(ORIGIN))[0], cli.EXIT_UNAVAILABLE)  # 文字模式同码
 
+    def test_finish_prompt_text_accept_json_and_close_notes_agree(self) -> None:
+        # §98.1：文字提示、accept --json 的 closure.remoteUnconfirmed、close --json 的 notes 三处同一个值
+        prompt_text = "对方设备尚未证明工作消息是否送达"
+        # 「held 且对方已汇报」在 CLI 层单独证明 receiverReported 覆盖投递状态（两方 r0 审计 Opus P3-5）
+        cases = (("held 且对方已汇报", Delivery.HELD, True, False), ("held", Delivery.HELD, False, True),
+                 ("queued 证据", Delivery.QUEUED, False, False), ("unknown", Delivery.UNKNOWN, False, True))
+        for label, state, reported, prompt in cases:
+            with self.subTest(label):
+                self.doCleanups()
+                self.setUp()
+                ids: list[str] = []
+                for _ in range(3):
+                    task_id = self.send()
+                    self.pump("vm", "win")
+                    self.assertEqual(len(self.deliver_on_b(DeliveryOutcome(state, "test_reason")).calls), 1)
+                    if reported:
+                        self.assertEqual(self.run_on("win", "report", task_id, "--ack", caller=fed_agent(WORKER))[0], 0)
+                    self.pump("win", "vm")
+                    ids.append(task_id)
+                code, out, err = self.run_on("vm", "accept", ids[0], "--force", caller=fed_agent(ORIGIN))  # 没交结果也验收
+                self.assertEqual(code, 0, err)
+                self.assertEqual(prompt_text in out, prompt, out)
+                self.assertEqual(self.decide("accept", ids[1], "--force")["closure"]["remoteUnconfirmed"], prompt)  # type: ignore[index]
+                self.assertEqual("remote_unconfirmed" in self.decide("close", ids[2])["notes"], prompt)  # type: ignore[operator]
+
     def test_federated_accept_json_bytes_are_unchanged(self) -> None:
         task_id = self.delivered_task()
         self.assertEqual(self.run_on("win", "report", task_id, "--result", caller=fed_agent(WORKER))[0], 0)
@@ -669,9 +695,10 @@ class FederatedDecisionJsonTests(FedCliCase):
         self.assertEqual(code, 0, err)
         with self.store("vm") as store:
             [closure] = [item for item in store.attempts(DEV_A, task_id) if item.is_closure]
+        # 键集与字节形状不变（§93.2）；对方已汇报，按 §98.1 有到达证据，remoteUnconfirmed 为假
         expected = {"ok": True, "id": task_id, "scope": "federation", "phase": "done",
                     "closure": {"queued": [{"seq": closure.seq, "targetDevice": DEV_B}], "skipped": [],
-                                "remoteUnconfirmed": True}}
+                                "remoteUnconfirmed": False}}
         self.assertEqual(out, dumped(expected))
 
 

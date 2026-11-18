@@ -25,6 +25,10 @@ from .views import TERMINAL_REPORTS, fold_report, initial_work, model_attempt, m
 
 # A 视角里「投递设备已证明未投」的状态：只来自 B 的证据或 hub 运输拒绝，A 本机的取消请求不算（§88.4 P2-1）
 REMOTE_PROVEN_UNDELIVERED = frozenset({"failed", "refused", "denied", "expired", "cancelled"})
+# 远端工作尝试的到达证据（§98.1）：投递设备的原生通道已接收。不含 held：它是 Claude 接收端暂存、等对方会话里批准，
+# 消息在设备上但还没交给会话，结案后仍可能被批准执行，少提示一句的代价比多一句大；pending/sending/unknown 与将来
+# 新增的状态同样不算
+REMOTE_ARRIVAL_EVIDENCE = frozenset({"written", "queued", "delivered"})
 NOTIFYING_REPORTS = frozenset(TERMINAL_REPORTS | {ReportKind.BLOCKED})
 DECISION_REASONS = frozenset(
     {"task_finished", "stale_attempt", "attempt_not_found", "attempt_not_reportable", "report_kind_mismatch",
@@ -677,6 +681,12 @@ def proven_undelivered(attempt: FedAttempt, ident: Identity) -> bool:
     return state in REMOTE_PROVEN_UNDELIVERED
 
 
+def _has_arrival_evidence(attempt: FedAttempt) -> bool:
+    """A 是否握有远端尝试已到达对方的证据：对方已汇报，或投递状态属于 REMOTE_ARRIVAL_EVIDENCE（§98.1）。"""
+    return (attempt.delivery.get("receiverReported") is True
+            or attempt.delivery.get("state", "pending") in REMOTE_ARRIVAL_EVIDENCE)
+
+
 def _awaiting_remote_evidence(attempt: FedAttempt) -> bool:
     """远端 attempt 还没有投递设备的任何证据（A 视角仍是 pending）：只有这种还值得发抑制请求。"""
     return attempt.delivery.get("state", "pending") == "pending" and attempt.delivery.get("receiverReported") is not True
@@ -812,6 +822,7 @@ class FinishOutcome:
     task: FedTask
     closures: list[FedAttempt] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    # 有远端工作尝试还没有到达证据（§98.1）：CLI 据此打印「尚未证明送达」提示，accept/close 的 JSON 同值
     remote_unconfirmed: bool = False
 
 
@@ -847,7 +858,9 @@ def finish(store: FederatedStore, ident: Identity, task: FedTask, *, state: str,
                 latest = max(remote_unproven, key=lambda item: item.seq)
                 covers = [item.msg_id for item in remote_unproven]
                 planned.append((latest.target, covers, True))
-                outcome.remote_unconfirmed = True
+                # 回执照旧覆盖全部未证明未投的尝试；提示只看到达证据，同一角色任一尝试还没有就提示（§98.1）
+                if any(not _has_arrival_evidence(item) for item in remote_unproven):
+                    outcome.remote_unconfirmed = True
                 continue
             arrived = [item for item in work if item.target_device == ident.device_id
                        and _local_may_have_arrived(item)]

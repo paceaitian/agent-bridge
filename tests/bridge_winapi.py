@@ -9,6 +9,7 @@ import struct
 from pathlib import Path
 from types import SimpleNamespace
 
+import bridge_transcript_guard  # §99：假内核用例同样不得读真实 Claude 会话记录
 import bridge_winapi_sdk as S
 from agentstatus_bridge.platforms.windows.api import WinApi
 from bridge_winapi_sdk import SDK
@@ -718,6 +719,11 @@ class Kernel:
         put(out,S.U32,self.peer)
         return 1
     GetNamedPipeClientProcessId=GetNamedPipeServerProcessId
+    def SetFilePointerEx(self, handle, distance, new_position, method):
+        record = self.record(handle)
+        assert record['kind'] == 'file' and new_position is None and method == 0, 'only FILE_BEGIN absolute seeks'
+        os.lseek(record['fd'], distance, os.SEEK_SET)
+        return 1
     def ReadFile(self, handle, buf, size, count, overlap):
         record = self.record(handle)
         if record['kind'] == 'file':

@@ -33,6 +33,17 @@ def local_path(path: Path) -> Path:
     return path
 
 
+class _HandleRead:
+    """共享读打开的句柄：打开时的大小，按偏移读。"""
+
+    def __init__(self, api: Any, handle: int, size: int) -> None:
+        self._api, self._handle = api, handle
+        self.size = size
+
+    def read_at(self, offset: int, length: int) -> bytes:
+        return self._api.read_at(self._handle, offset, length)
+
+
 class WindowsPaths:
     def __init__(self, api: Any) -> None:
         self.api = api
@@ -155,6 +166,23 @@ class WindowsPaths:
 
     def state_base(self) -> Path:
         return Path(self.api.local_app_data())
+
+    @contextmanager
+    def open_shared_read(self, path: Path) -> Iterator[_HandleRead]:
+        """共享读打开外部普通文件（§99.3）：READ|WRITE|DELETE 共享，不妨碍属主追加、替换或删除；不跟随重解析点。
+
+        目录与重解析点报 OSError('not_regular')；读完即关。只读，不修 ACL、不建任何东西。
+        """
+        with self.api.owned(self.api.open_file(str(local_path(path)), read_data=True, sharing=7)) as handle:
+            try:
+                info = self.api.file_info(handle)
+            except OSError as error:
+                if error.args == ('windows_reparse_unsupported',):
+                    raise OSError('not_regular') from None
+                raise
+            if info.attributes & 0x10:
+                raise OSError('not_regular')
+            yield _HandleRead(self.api, handle, (int(info.size_high) << 32) | int(info.size_low))
 
     def open_private_file(self, path: Path, **options: Any) -> int:
         """Owner has metadata rights even if the old ACL denies data IO."""

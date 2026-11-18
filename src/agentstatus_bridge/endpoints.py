@@ -38,6 +38,7 @@ from .platforms.types import BridgePlatform, Capability
 from .codex_metadata import MetadataCache, discovery_cache
 from .codex_argv import _codex_class, _codex_non_interactive, codex_app_server
 from .ids import opaque_id
+from . import claude_titles
 from .model import UNRESOLVED_NATIVE_ID, Endpoint, EndpointRef, Provider, Runtime, claude_registry_runtime
 from .native_names import binding as native_binding
 from .native_names import (NO_NAME, TARGET_ID_UNVERIFIED, UNKNOWN_NAME, NameFacts, NameSource, NameView,
@@ -194,6 +195,7 @@ def _discover_claude(
         sources.incomplete.add(Provider.CLAUDE.value)  # 预算截断：还有没读的注册记录
     files.sort()
     endpoints: list[Endpoint] = []
+    config_roots: list[Path] = []  # 每个端点注册文件所在 sessions 目录的父目录：取会话记录标题用（§99.3）
     for path in files:
         try:
             if path.stat().st_size > MAX_REGISTRY_BYTES:
@@ -273,13 +275,23 @@ def _discover_claude(
                 workdir=cwd_tail(data.get("cwd")),  # 注册信息的 cwd 只留末段（§95.3）
             )
         )
-    groups: dict[int, list[Endpoint]] = {}
-    for item in endpoints:
+        config_roots.append(path.parent.parent)
+    # §84.1 先按注册事实折叠：同一条记录经多个根被看到时只留一条，并记下看到它的全部配置根（按发现顺序）。
+    # 必须在取名之前比较——取名结果可能因根而异（别名根没有 projects、本轮预算用完），先取名会把同一会话拆成两条
+    groups: dict[int, list[tuple[Endpoint, list[Path]]]] = {}
+    for item, root in zip(endpoints, config_roots):
         group = groups.setdefault(item.ref.pid, [])
-        if item not in group:
-            group.append(item)
-    return [item if len(group) == 1 else replace(item, issues=(*item.issues, 'ambiguous_thread'))
-            for group in groups.values() for item in group]
+        for kept, roots in group:
+            if kept == item:
+                if root not in roots:
+                    roots.append(root)
+                break
+        else:
+            group.append((item, [root]))
+    # 代际核实与折叠之后才取名：每条记录按根的顺序试，取到标题即停，取不到退回注册名（§99.2）；不影响发现完整性
+    titles = claude_titles.TitleReader(get_platform().files.open_shared_read)
+    return [titles.apply(item if len(group) == 1 else replace(item, issues=(*item.issues, 'ambiguous_thread')), *roots)
+            for group in groups.values() for item, roots in group]
 
 
 def _codex_source_kind(value: object) -> str | None:

@@ -29,7 +29,6 @@ from ..platforms import process as procfs
 from ..platforms.factory import get_platform
 from ..platforms.types import Capability
 from ..reports import (  # pyright: ignore[reportPrivateUsage]
-    _UNSENT,
     MAX_NOTE_CHARS,
     ReportError,
     ReportInput,
@@ -314,7 +313,7 @@ def report(rt: Runtime, *, task: FedTask, kind: ReportKind, attempt_seq: int | N
     if attempt_seq is not None and any(item.seq == attempt_seq and item.role == "notice" for item in attempts):
         raise FedCliError("attempt_not_reportable")  # 补充消息等 notice 不需要汇报，与本机同一原因码（§95.5.3）
     mine = [item for item in attempts if item.role != "notice" and item.target_device == rt.ident.device_id]
-    current = next((item for item in mine if item.seq == task.current_work_seq), None)
+    current = mirror.current_local_attempt(rt.store, rt.ident, task)  # 与镜像页脚同一判定（§98.2）
     attempt = current if attempt_seq is None else next((item for item in mine if item.seq == attempt_seq), None)
     if attempt is None:
         raise FedCliError("attempt_not_found")
@@ -326,8 +325,9 @@ def report(rt: Runtime, *, task: FedTask, kind: ReportKind, attempt_seq: int | N
         raise FedCliError("review_requires_verdict")
     if len(files) > MAX_FILES:
         raise FedCliError("too_many_files")
-    if attempt.target.local is None:
-        raise FedCliError("reporter_mismatch")
+    local = mirror.local_binding(attempt)
+    if local is None:
+        raise FedCliError("reporter_mismatch")  # 与镜像页脚同一判定（§98 r1）
     # 只核这一个相关本机 ref 的实际接收代际（§88.7），复用本机 _attribute；不核远端 origin/历史 root
     view = replace(model_attempt(attempt), delivery_detail=_delivery_detail(rt, attempt))
     _windows_root_check(replace(model_task(task), origin=None, reviewer=None), [view])
@@ -336,7 +336,7 @@ def report(rt: Runtime, *, task: FedTask, kind: ReportKind, attempt_seq: int | N
                             procfs.DEFAULT_PROC)
     except ReportError as error:
         raise FedCliError(error.code) from error
-    if view.delivery in _UNSENT:
+    if mirror.attempt_unsent(attempt):
         raise FedCliError("attempt_not_sent")  # 投递设备自己的事实：从未 intent 或已抑制的作业不能汇报
     frozen = freeze_refs(rt, files, cwd)
     commit_ref = None
@@ -345,7 +345,7 @@ def report(rt: Runtime, *, task: FedTask, kind: ReportKind, attempt_seq: int | N
             commit_ref = _commit_reference(commit, cwd=cwd, git=_git_resolve_commit)
         except ReportError as error:
             raise FedCliError(error.code) from error
-    reporter = authority.actor_for(attempt.target, wire_token=full_id_token(attempt.target.local))
+    reporter = authority.actor_for(attempt.target, wire_token=full_id_token(local))
     try:
         result = mirror.submit_report(rt.store, rt.ident, mirror.LocalReport(
             task=task, attempt=attempt, kind=kind.value, note=(note or "").strip()[:MAX_NOTE_CHARS],
@@ -626,6 +626,11 @@ _NETWORK_LABELS = {"ready": "待传", "submitting": "提交中", "accepted": "hu
                    "local": "本机"}
 
 
+# 镜像汇报页脚按角色给出的命令（§98.2）：复核尝试不收 --result，交接尝试不收 --approve/--changes
+HANDOFF_REPORT_CHOICES = "--result（或 --blocked / --failed）"
+REVIEW_REPORT_CHOICES = "--approve 或 --changes（或 --blocked / --failed）"
+
+
 def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False) -> list[str]:
     """status 文本：权威/镜像、同步时间、网络 L0–L2、投递 L3、报告与 A 采纳 L4、附件逐项状态。"""
     document = task_document(rt, task, now=now, include_body=show_body)
@@ -663,12 +668,14 @@ def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False)
         lines.append(f"  报告 #{row['attempt']}.{row['reportNo']} {row['kind']}：{status}{reason}")
     if show_body:
         lines.extend(["", str(document.get("body", ""))])
-    cmd = command_name()
-    if not task.is_authority and not task.finished and view.reason != mirror.HANDLED_ON_OTHER_DEVICE:
-        # 联邦页脚带 --origin-device：CLI 只据本机索引找发起设备，不读正文里的远端路径（§88.8）；
-        # 当前工作在别的设备上时不提示，照做会被本机以 attempt_not_found 拒绝（§97.2 第 4 条 r2）
-        lines.append(f"汇报：{cmd} report {short(task.task_id)} --origin-device {document['authorityDeviceName']}"
-                     " --result（或 --blocked / --failed）")
+    # 本机联邦停用时 ab report 报 federation_disabled，判据与 cli._fed_lookup(write=True) 相同，不给汇报提示（§98 r1）
+    target = mirror.local_report_target(rt.store, rt.ident, task) if rt.config.enabled else None
+    if target is not None:
+        # 页脚只在本机当前尝试真能汇报时打印，判定与 B 端受理条件共用，命令按角色给（§98.2）；
+        # 联邦页脚带 --origin-device：CLI 只据本机索引找发起设备，不读正文里的远端路径（§88.8）
+        choices = (REVIEW_REPORT_CHOICES if target.role == "review" else HANDOFF_REPORT_CHOICES)
+        lines.append(f"汇报：{command_name()} report {short(task.task_id)} --origin-device "
+                     f"{document['authorityDeviceName']} {choices}")
     return lines
 
 

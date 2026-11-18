@@ -344,6 +344,8 @@ class Endpoint:
     # 工作目录末段原文（§95.3，未转义）：只作人读旁注与快照的可选键；完整路径发现时即丢弃，不进 EndpointRef、
     # 不落账本，不参与相等比较
     workdir: str | None = field(default=None, compare=False)
+    # Claude 名字的来源闭集码（§99.3）：found_custom/found_ai 或退回注册名的原因；只作诊断计数，不进目录行与账本
+    name_origin: str | None = field(default=None, compare=False)
 
     @property
     def blocking_issues(self) -> tuple[str, ...]:

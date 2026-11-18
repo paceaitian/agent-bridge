@@ -8,6 +8,7 @@ import re
 import time
 from typing import Any, cast
 
+from ...claude_titles import TitleReader
 from ...model import Endpoint, EndpointRef, Provider, claude_registry_runtime
 from ...native_names import (
     TARGET_ID_UNVERIFIED, UNKNOWN_NAME, NameFacts, NameView, Selector, SelectorError, canonical, cwd_tail, name_source,
@@ -182,6 +183,7 @@ class Discovery:
 
 def discover(backend: WindowsPlatform, *, connect: bool = True) -> Discovery:
     found: list[Endpoint] = []
+    found_roots: list[Path] = []  # 与 found 一一对应的 sessions 目录：取会话记录标题用（§99.3）
     complete, started = True, time.monotonic()
     registries: list[dict[str, Any]] = []
     count = 0
@@ -226,6 +228,7 @@ def discover(backend: WindowsPlatform, *, connect: bool = True) -> Discovery:
                         endpoint, _ = inspect(backend, int(Path(name).stem), connect=connect,
                                               tolerate_pipe=True, sessions=root)
                         found.append(endpoint)
+                        found_roots.append(root)
                     except Ineligible as error:
                         if error.args == ('claude_kind_ineligible',):
                             known_noninteractive.add(int(Path(name).stem))
@@ -263,6 +266,9 @@ def discover(backend: WindowsPlatform, *, connect: bool = True) -> Discovery:
         roles = Roles(backend.api, started + SECONDS, allow_parent=not scan.exclusive)
         if any(birth is None or not roles.exempt(pid, birth, protected) for pid, birth in gaps):
             complete = False
+    # 计时与完整性裁决都已结束才取名（§99.2）：标题优先、取不到退回注册名，读多读少都不改变完整性
+    titles = TitleReader(backend.files.open_shared_read)
+    found = [titles.apply(endpoint, root.parent) for endpoint, root in zip(found, found_roots)]
     counts = Counter(e.ref.native_id for e in found)
     duplicates = tuple(replace(e, issues=(*e.issues, 'ambiguous_thread'))
                        for e in found if counts[e.ref.native_id] > 1)

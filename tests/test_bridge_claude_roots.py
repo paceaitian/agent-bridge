@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import bridge_support
 from bridge_support import FakeProc
-from agentstatus_bridge import endpoints, doctor
+from agentstatus_bridge import claude_titles, endpoints, doctor
 from agentstatus_bridge.observer_dbus import ObserverView
 from agentstatus_bridge.platforms.linux import files as F
 from agentstatus_bridge.platforms.claude_roots import environment_config, MAX_ENV_BYTES
@@ -159,6 +159,100 @@ class ConfigRootsTests(unittest.TestCase):
         (b/'200.json').write_bytes((a/'200.json').read_bytes())
         found=self.discover()
         self.assertEqual(len(found),1); self.assertEqual(found[0].issues,())
+
+    # §99 r1（两方审计 P1）：同一条注册记录经别名根与账号根都被看到时，先按注册事实折叠再取名，
+    # 每条记录按根的顺序取一次名；取名结果因根而异也不能把同一会话拆成两条 ambiguous_thread
+    TITLED = '0000000c-cccc-4ccc-8ccc-00000000000c'
+
+    def aliased(self, *, link_projects):
+        """账号根 account + 别名根 ~/.claude（sessions 必链；projects 按参数链），返回会话记录路径。"""
+        self.addCleanup(claude_titles._MEMO.clear)
+        account = self.root / 'account'
+        sessions = account / 'sessions'; sessions.mkdir(parents=True)
+        self.fake.add(200, comm='claude', start='42')
+        (self.proc / '200' / 'environ').write_bytes(('CLAUDE_CONFIG_DIR=' + str(account) + '\0').encode())
+        (sessions / '200.json').write_text(json.dumps({'pid': 200, 'procStart': '42', 'sessionId': self.TITLED,
+            'kind': 'interactive', 'peerProtocol': 1, 'messagingSocketPath': 'fixture.sock', 'name': 'account-12'}))
+        alias = self.root / '.claude'; alias.mkdir()
+        os.symlink(sessions, alias / 'sessions')
+        if link_projects:
+            os.symlink(account / 'projects', alias / 'projects')
+        record = account / 'projects' / '-w-repo' / f'{self.TITLED}.jsonl'
+        record.parent.mkdir(parents=True)
+        self.assertEqual(set(F.claude_sessions_dirs(self.proc)), {alias / 'sessions', sessions})
+        return record
+
+    @staticmethod
+    def transcript(title, *, filler=0):
+        rows = [{'type': 'user', 'sessionId': 'x'}, {'type': 'ai-title', 'aiTitle': title, 'sessionId': ConfigRootsTests.TITLED}]
+        text = ''.join(json.dumps(row, separators=(',', ':')) + '\n' for row in rows)
+        line = json.dumps({'type': 'user', 'message': 'x' * 1000}, separators=(',', ':')) + '\n'
+        return (text + line * (filler // len(line) + 1 if filler else 0)).encode()
+
+    def test_a10b_round_budget_running_out_between_roots_keeps_one_endpoint(self):
+        self.aliased(link_projects=True).write_bytes(self.transcript('titled', filler=600 * 1024))
+        with patch.object(claude_titles, 'ROUND_BUDGET_BYTES', claude_titles.FILE_BUDGET_BYTES):
+            found = self.discover()
+        self.assertEqual(len(found), 1)
+        [item] = found
+        self.assertEqual((item.issues, item.name, item.name_origin), ((), 'titled', 'found_ai'))
+        self.assertIs(endpoints.resolve_target('claude@id:' + self.TITLED, found), item)
+
+    def test_a10c_alias_root_without_projects_still_gets_the_title(self):
+        self.aliased(link_projects=False).write_bytes(self.transcript('titled'))
+        found = self.discover()
+        self.assertEqual([(item.issues, item.name, item.name_origin) for item in found], [((), 'titled', 'found_ai')])
+        self.assertIs(endpoints.resolve_target('claude@titled', found), found[0])
+
+    def test_a10d_the_session_itself_is_identified_as_caller_under_two_roots(self):
+        self.aliased(link_projects=False).write_bytes(self.transcript('titled'))
+        found = self.discover()
+        for environ in ({}, {'CLAUDE_CODE_SESSION_ID': self.TITLED}):
+            with self.subTest(environ=sorted(environ)):
+                caller = endpoints.identify_caller(found, pid=200, proc_root=self.proc, environ=environ)
+                self.assertIsNotNone(caller.endpoint)
+                self.assertEqual((caller.endpoint.ref.native_id, caller.endpoint.name), (self.TITLED, 'titled'))
+
+    def test_a10e_one_untitled_file_behind_two_roots_is_read_once(self):
+        self.aliased(link_projects=True).write_bytes(self.transcript('far', filler=claude_titles.FILE_BUDGET_BYTES + 4096))
+        used = []
+        real = claude_titles._read_title
+
+        def recorder(reader, session_id, budget):
+            outcome = real(reader, session_id, budget)
+            used.append(outcome[1])
+            return outcome
+        with patch.object(claude_titles, '_read_title', side_effect=recorder):
+            found = self.discover()
+        self.assertEqual([(item.issues, item.name, item.name_origin) for item in found],
+                         [((), 'account-12', 'budget_exhausted')])
+        self.assertEqual(used, [claude_titles.FILE_BUDGET_BYTES])
+
+    def test_a10f_the_first_root_in_registry_path_order_wins(self):
+        # 审计 Opus N8：两个根各有一份不同标题的记录 → 取注册路径排序后第一个根（~/.claude 在 account 之前）的标题即停
+        self.aliased(link_projects=False).write_bytes(self.transcript('account-title'))
+        alias_record = self.root / '.claude' / 'projects' / '-w-repo' / f'{self.TITLED}.jsonl'
+        alias_record.parent.mkdir(parents=True)
+        alias_record.write_bytes(self.transcript('alias-title'))
+        found = self.discover()
+        self.assertEqual([(item.issues, item.name) for item in found], [((), 'alias-title')])
+
+    def test_a10g_same_ref_with_different_registry_facts_stays_two_ambiguous_rows(self):
+        # 审计 Opus N3：§84.1 只折叠相同的注册事实；同 ref（pid、代际、sessionId 相同）而事实不同 → 仍是两条 ambiguous_thread
+        account = self.root / 'account'
+        sessions = account / 'sessions'; sessions.mkdir(parents=True)
+        self.fake.add(200, comm='claude', start='42')
+        (self.proc / '200' / 'environ').write_bytes(('CLAUDE_CONFIG_DIR=' + str(account) + '\0').encode())
+        record = {'pid': 200, 'procStart': '42', 'sessionId': self.TITLED, 'kind': 'interactive', 'peerProtocol': 1,
+                  'messagingSocketPath': 'fixture.sock', 'name': 'account-12'}
+        (sessions / '200.json').write_text(json.dumps(record))
+        alias = self.root / '.claude' / 'sessions'; alias.mkdir(parents=True)
+        (alias / '200.json').write_text(json.dumps({**record, 'name': 'renamed-elsewhere'}))
+        found = self.discover()
+        self.assertEqual(len(found), 2)
+        self.assertEqual(len({item.ref for item in found}), 1)
+        self.assertTrue(all('ambiguous_thread' in item.issues for item in found))
+        self.assertEqual(sorted(item.name for item in found), ['account-12', 'renamed-elsewhere'])
 
     def test_a14_stale_first_root_cannot_starve_live_second_root(self):
         old=self.root/'old/sessions'; old.mkdir(parents=True)

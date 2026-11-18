@@ -11,6 +11,8 @@ the Linux-fixture and federation-store classes SKIP with the same "POSIX-only:" 
 ab note (DESIGN 95.5/95.6): pure footer/capacity/reminder cases run; Linux CLI and ledger
 fixture classes SKIP with the same "POSIX-only:" prefix. Codex turn/steer: the classification
 table and Fake-kernel Windows client run; the Linux UDS fake daemon class SKIPs likewise.
+Claude titles (DESIGN 99): rule/chunk/locate/memo/count cases run; symlink, FIFO and Linux
+open cases SKIP with the same "POSIX-only:" prefix (Fake-kernel title discovery is in _discovery).
 """
 from pathlib import Path
 import sys
@@ -34,7 +36,7 @@ MODULES = ('test_bridge_windows', 'test_bridge_windows_streams',
            'test_bridge_federation_transport_close',
            'test_bridge_task_filters', 'test_bridge_task_follows',
            'test_bridge_note', 'test_bridge_codex_steer', 'test_bridge_fyi',
-           'test_bridge_worker_lock')
+           'test_bridge_worker_lock', 'test_bridge_claude_titles')
 # Only these skips may appear; any other skip means a module silently did not qualify.
 NATIVE_PREFIX = 'test_bridge_windows_native.'
 POSIX_ONLY = "POSIX-only:"

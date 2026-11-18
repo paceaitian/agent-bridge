@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import socket
@@ -179,6 +181,38 @@ def atomic_write(directory: Path, payload: bytes, *, name: str, prefix: str) -> 
         os.close(folder)
 
 
+class _FdRead:
+    """已打开的只读普通文件：按偏移读（pread），不改文件位置；大小取打开时的 fstat。"""
+
+    def __init__(self, fd: int, info: os.stat_result) -> None:
+        self._fd = fd
+        self.size = info.st_size
+
+    def read_at(self, offset: int, length: int) -> bytes:
+        chunks: list[bytes] = []
+        while length > 0:
+            data = os.pread(self._fd, length, offset)
+            if not data:
+                break
+            chunks.append(data)
+            offset += len(data)
+            length -= len(data)
+        return b"".join(chunks)
+
+
+@contextmanager
+def open_shared_read(path: Path) -> Iterator[_FdRead]:
+    """只读打开普通文件（§99.3）：不跟随符号链接、不阻塞在 FIFO 上；不是普通文件报 OSError('not_regular')。"""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("not_regular")
+        yield _FdRead(fd, info)
+    finally:
+        os.close(fd)
+
+
 class LinuxPaths:
     state_base = staticmethod(state_base)
     state_dir = staticmethod(state_dir)
@@ -194,6 +228,7 @@ class LinuxPaths:
     append_log = staticmethod(append_log)
     atomic_write = staticmethod(atomic_write)
     present = staticmethod(_present)
+    open_shared_read = staticmethod(open_shared_read)
 
     @staticmethod
     def uid() -> int:

@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from ..ids import new_id
+from ..reports import _UNSENT  # pyright: ignore[reportPrivateUsage]  与本机汇报同一「未交出」集合（§98.2）
 from ..store import StoreError
 from . import authority, envelopes
 from .codec import CodecError, canonical_bytes, is_hex32, sha256_hex
@@ -19,7 +20,7 @@ from .fedstore import FederatedStore, FedAttempt, FedTask, dump, load_dict
 from .refs import AttemptDefinition, Checkpoint, RemoteEndpointRef, TargetRef, WireActor
 from ..model import EndpointRef, Phase, TaskView, describe
 from ..reminders import PendingReminder, pending_reminder, reminder_candidate
-from .views import derive_work, initial_work, model_attempts, model_task
+from .views import derive_work, initial_work, model_attempt, model_attempts, model_task
 
 FROM_AUTHORITY = frozenset({"handoff", "review", "notice", "task_state", "report_decision", "sync_state"})
 TO_AUTHORITY = frozenset({"report", "delivery_status", "sync_request"})
@@ -580,9 +581,29 @@ class ReportResult:
     reason: str | None = None
 
 
-def _report_frozen(store: FederatedStore, ident: authority.Identity, report: LocalReport) -> str | None:
+# ---- 汇报的前置条件（§98.2）：commands.report、submit_report 与镜像页脚共用同一实现，页脚不会再与受理条件分叉 ----
+
+
+def current_local_attempt(store: FederatedStore, ident: authority.Identity, task: FedTask) -> FedAttempt | None:
+    """task.current_work_seq 对应、已在本机物化、发给本设备的非 notice 尝试，即汇报路径上的「当前尝试」。"""
+    return next((item for item in store.attempts(task.authority_device, task.task_id)
+                 if item.seq == task.current_work_seq and item.role != "notice"
+                 and item.target_device == ident.device_id), None)
+
+
+def local_binding(attempt: FedAttempt) -> EndpointRef | None:
+    """该尝试目标在本机的端点绑定；收信时找不到绑定的尝试保留远端形状（None），没有会话收到它，也没有人能为它汇报。"""
+    return attempt.target.local
+
+
+def attempt_unsent(attempt: FedAttempt) -> bool:
+    """本机作业还没交出（投递 pending/sending/cancelled）：从未 intent 或已抑制的作业不能汇报。"""
+    return model_attempt(attempt).delivery in _UNSENT
+
+
+def report_frozen(store: FederatedStore, ident: authority.Identity, attempt: FedAttempt) -> str | None:
     """源端终态冻结：本 attempt 已有未被拒绝的终态报告时，不接受会覆盖它的新报告（§88.4 第 3 条）。"""
-    for prior in store.reports(report.task.authority_device, report.task.task_id, report.attempt.seq):
+    for prior in store.reports(attempt.authority_device, attempt.task_id, attempt.seq):
         if prior["reporter_device"] != ident.device_id:
             continue
         kind = prior["report"].get("kind")
@@ -594,6 +615,22 @@ def _report_frozen(store: FederatedStore, ident: authority.Identity, report: Loc
         if decision["decision"] == "accepted":
             return "attempt_report_finalized"
     return None
+
+
+def local_report_target(store: FederatedStore, ident: authority.Identity, task: FedTask) -> FedAttempt | None:
+    """镜像上本机现在能否汇报（与报告内容无关的前置条件，§98.2）；能则返回当前尝试，汇报页脚只在这时打印。
+
+    条件：非权威、未结束、未在本机归档；当前尝试已在本机物化且发给本设备，本机有它的端点绑定；已交出；本设备在它上面
+    没有未被拒的终态报告。A 本机参与方的汇报同样走 commands.report，所以「非权威」只在这里判，不进汇报路径。
+    本机联邦是否停用由调用方按运行时配置判（task_lines）。
+    """
+    if task.is_authority or task.finished or task.local_archived:
+        return None
+    attempt = current_local_attempt(store, ident, task)
+    if (attempt is None or local_binding(attempt) is None or attempt_unsent(attempt)
+            or report_frozen(store, ident, attempt) is not None):
+        return None
+    return attempt
 
 
 def submit_report(store: FederatedStore, ident: authority.Identity, report: LocalReport, *, now: int,
@@ -608,9 +645,10 @@ def submit_report(store: FederatedStore, ident: authority.Identity, report: Loca
             raise StoreError("task_finished")
         if current.local_archived:
             raise StoreError("mirror_archived")
-        if current.current_work_seq != attempt.seq:
+        found = current_local_attempt(store, ident, current)  # 事务内按重读的任务判，与页脚同一实现
+        if found is None or found.seq != attempt.seq:
             raise StoreError("stale_attempt")
-        frozen = _report_frozen(store, ident, report)
+        frozen = report_frozen(store, ident, attempt)
         if frozen is not None:
             raise StoreError(frozen)
         report_no = store.max_report_no(current.authority_device, current.task_id, attempt.seq, ident.device_id) + 1

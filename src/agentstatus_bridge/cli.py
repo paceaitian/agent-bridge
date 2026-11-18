@@ -17,7 +17,7 @@ import sys
 import time
 from typing import TYPE_CHECKING, Any
 
-from . import __version__, summary
+from . import __version__, claude_titles, summary
 from .platforms import process as procfs
 from .codex_metadata import command_scope
 from .native_names import NO_NAMES, NameBook, SelectorError, parse_selector, shown_name, workdir_suffix, workdir_text
@@ -318,7 +318,8 @@ def cmd_peers(args: argparse.Namespace) -> int:
             }
         )
     if args.json:
-        document: dict[str, object] = {"peers": rows}
+        # claudeTitles：Claude 名字取自会话记录标题的计数与退回原因码（§99.3，只有计数，不含路径与标题）
+        document: dict[str, object] = {"peers": rows, "claudeTitles": claude_titles.counts(endpoints)}
         if args.all_devices:
             document["devices"] = _fed_all_devices()
         _print_json(document)
@@ -364,6 +365,7 @@ def _windows_local_peers(*, as_json: bool) -> dict[str, object] | None:
         existing = document.get('peers')
         document['peers'] = (existing if isinstance(existing, list) else []) + peers.document()
         document['claudeDiscovery'] = {'complete': peers.complete, 'reason': peers.reason}
+        document['claudeTitles'] = claude_titles.counts((*peers.endpoints, *peers.duplicates))  # §99.3 只计数
         return document
     codex_discovery.print_peers(result)
     print('Windows Claude 原生 peer：' + ('发现完整' if peers.complete else reason_text(peers.reason)))

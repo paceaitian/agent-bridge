@@ -18,6 +18,10 @@ import bridge_support  # noqa: F401  导入即隔离宿主会话环境
 from agentstatus_bridge import cli
 from agentstatus_bridge.cli import EXIT_OK, _wait_outcome  # pyright: ignore[reportPrivateUsage]
 from agentstatus_bridge.federation import authority, commands, mirror
+from agentstatus_bridge.federation.delivery import FederationDispatcher
+from agentstatus_bridge.federation.config import FederationConfig
+from agentstatus_bridge.federation.errors import FedCliError
+from agentstatus_bridge.federation.fedstore import now_ms
 from agentstatus_bridge.federation.mirror import LocalReport
 from agentstatus_bridge.federation.refs import TargetRef
 from agentstatus_bridge.federation.relay import RelayPaths
@@ -27,16 +31,18 @@ from agentstatus_bridge.store import StoreError
 from agentstatus_bridge.transports import DeliveryOutcome, codex_rpc
 from bridge_support import RecordingTransport
 
-from test_bridge_federation_cli import WORKER, FedCliCase, as_agent
+from test_bridge_federation_cli import LOCAL_REVIEW, ORIGIN, THREAD_B, WORKER, FedCliCase, as_agent
 from test_bridge_federation_delivery import DeliveryTestCase
 from test_bridge_federation_relay import RelayTestCase
 from test_bridge_federation_rules import CLAUDE_A2, DEV_A, DEV_B, T0, FederationTestCase, deliver, pump
 
 
-def runtime(device: Any, root: Path) -> commands.Runtime:
-    """status 文档只用到 store/ident/paths；config 不参与。"""
-    return commands.Runtime(root=root, config=None, store=device.store, ident=device.ident,  # type: ignore[arg-type]
-                            paths=RelayPaths(root))
+def runtime(device: Any, root: Path, *, enabled: bool = True) -> commands.Runtime:
+    """status 文档用到 store/ident/paths；config 只用到 enabled（停用时不打汇报页脚，§98 r1）。"""
+    config = FederationConfig(enabled=enabled, hub_id=device.ident.hub_id, device_id=device.ident.device_id,
+                              device_name=device.ident.device_name, host="hub.example", user="ab-relay",
+                              expected_state_root=str(root))
+    return commands.Runtime(root=root, config=config, store=device.store, ident=device.ident, paths=RelayPaths(root))
 
 
 def document(device: Any, root: Path, task_id: str, now: int) -> dict[str, Any]:
@@ -824,6 +830,306 @@ class MirrorCliTests(FedCliCase):
         self.assertIn("当前由 vm 处理，完整状态以发起设备为准", out)
         code, out, _ = self.run_on("win", "status", task_id, "--json", caller=as_agent(WORKER))
         self.assertEqual((json.loads(out)["phase"], json.loads(out)["reason"]), ("running", "handled_on_other_device"))
+
+
+class SubmitReportRereadTests(_MirrorCase):
+    """§98.2 共用的「当前尝试」在 submit_report 事务内按重读的任务判（两方 r0 审计 Opus P2-2 的 M11/M13、Fable B5）。"""
+
+    def test_submit_report_judges_the_task_reread_inside_its_transaction(self) -> None:
+        # 调用方手里的任务已过时：返工派回 B、新尝试已物化。用旧任务与旧尝试直接调 submit_report 得 stale_attempt
+        task, first = self.delivered()
+        stale_task = self.b.store.get_task(DEV_A, task.task_id)
+        old_attempt = self.b.store.attempt_by_msg(first.msg_id)
+        assert stale_task is not None and old_attempt is not None
+        self.round_trip(task.task_id, "blocked", T0 + 4, note="缺权限")
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        retried = authority.retry_task(self.a.store, self.a.ident, current, force=False, message=None,
+                                       new_target=None, rework_body=lambda *args: "返工", now=T0 + 8)
+        pump(self.a, self.b, now=T0 + 9)
+        moved = self.b.store.get_task(DEV_A, task.task_id)
+        assert moved is not None
+        self.assertEqual(moved.current_work_seq, retried.attempt.seq)
+        self.assertIsNotNone(self.b.store.attempt_by_msg(retried.attempt.msg_id))
+        with self.assertRaises(StoreError) as raised:
+            mirror.submit_report(self.b.store, self.b.ident, LocalReport(
+                task=stale_task, attempt=old_attempt, kind="result", note="", refs=[], commit=None,
+                reporter=self.worker_actor(), reporter_class="bypass", source="agent"), now=T0 + 10)
+        self.assertEqual(raised.exception.code, "stale_attempt")
+
+
+class ReportFooterTests(FedCliCase):
+    """§98.2：镜像汇报页脚只在本机当前尝试真能汇报时打印，命令按角色给出；每种会被拒的状态都在同一夹具上直接调用
+    commands.report，证明页脚与受理条件一致（同一组判定）。"""
+
+    HANDOFF = "--result（或 --blocked / --failed）"
+    REVIEW = "--approve 或 --changes（或 --blocked / --failed）"
+
+    def footer(self, device: str, task_id: str) -> list[str]:
+        runtime = commands.open_runtime(self.states[device])
+        try:
+            [task] = runtime.store.find_tasks(task_id)
+            return [line for line in commands.task_lines(runtime, task, now=now_ms()) if line.startswith("汇报：")]
+        finally:
+            runtime.close()
+
+    def one_footer(self, device: str, task_id: str) -> str:
+        """恰好一行页脚；先断言条数，判据改坏时以断言失败而不是解包异常暴露。"""
+        lines = self.footer(device, task_id)
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0]
+
+    def report_code(self, device: str, task_id: str, kind: ReportKind, who: Any = WORKER) -> str | None:
+        """直接调用 commands.report：被拒时返回错误码，受理时返回 None（会真的记一条报告）。"""
+        runtime = commands.open_runtime(self.states[device])
+        try:
+            [task] = runtime.store.find_tasks(task_id)
+            commands.report(runtime, task=task, kind=kind, attempt_seq=None, note=None, files=[], commit=None,
+                            manual=False, caller=as_agent(who), caller_class="bypass", cwd=self.root)
+        except FedCliError as error:
+            return error.code
+        finally:
+            runtime.close()
+        return None
+
+    def reason(self, device: str, task_id: str, who: Any) -> str:
+        code, out, err = self.run_on(device, "status", task_id, "--json", caller=as_agent(who))
+        self.assertEqual(code, 0, err)
+        return str(json.loads(out)["reason"])
+
+    def pump_kind(self, src: str, dst: str, kind: str) -> int:
+        """只把某一类信封交给 dst（其余留在发件箱，模拟还在路上）。"""
+        moved = 0
+        with self.store(src) as source, self.store(dst) as target:
+            for item in source.outbox():
+                envelope = json.loads(item["envelope_json"])
+                if envelope["targetDeviceId"] != self.ids[dst] or envelope["kind"] != kind:
+                    continue
+                mirror.receive(target, self.ident(dst), envelope, source_device=self.ids[src],
+                               payload_hash=item["payload_hash"], now=now_ms())
+                source.set_outbox_state(item["msg_id"], state="received")
+                moved += 1
+        return moved
+
+    def send_task_state(self, task_id: str) -> None:
+        with self.store("vm") as store:
+            [task] = store.find_tasks(task_id)
+            with store.transaction():
+                authority.send_task_state(store, self.ident("vm"), task, now=now_ms())
+
+    def test_handoff_footer_and_still_printed_after_blocked(self) -> None:
+        task_id = self.delivered_task()
+        line = self.one_footer("win", task_id)
+        self.assertTrue(line.endswith(f"report {task_id[:8]} --origin-device vm {self.HANDOFF}"), line)
+        self.assertEqual(self.run_on("win", "report", task_id, "--blocked", caller=as_agent(WORKER))[0], 0)
+        self.pump("win", "vm")
+        self.pump("vm", "win")
+        self.assertEqual(self.reason("win", task_id, WORKER), "blocked_reported")
+        self.assertEqual(len(self.footer("win", task_id)), 1)  # blocked 不是终态，之后仍可交结果
+
+    def test_no_footer_while_the_current_attempt_has_not_arrived(self) -> None:
+        for paused in (False, True):
+            with self.subTest(paused=paused):
+                self.doCleanups()
+                self.setUp()
+                task_id = self.delivered_task()
+                self.assertEqual(self.run_on("win", "report", task_id, "--blocked", caller=as_agent(WORKER))[0], 0)
+                self.pump("win", "vm")
+                self.assertEqual(self.run_on("vm", "retry", task_id, caller=as_agent(ORIGIN))[0], 0)  # 返工派回 B
+                if paused:
+                    self.assertEqual(self.run_on("vm", "pause", task_id, caller=as_agent(ORIGIN))[0], 0)
+                else:
+                    self.send_task_state(task_id)
+                self.assertGreaterEqual(self.pump_kind("vm", "win", "task_state"), 1)  # 新尝试的信封还在路上
+                self.assertEqual(self.reason("win", task_id, WORKER), "paused" if paused else "waiting_for_target")
+                self.assertEqual(self.footer("win", task_id), [])
+                self.assertEqual(self.report_code("win", task_id, ReportKind.RESULT), "attempt_not_found")
+
+    def test_no_footer_once_a_review_verdict_is_mapped_from_the_checkpoint(self) -> None:
+        for flag, reason in (("--approve", "review_approved"), ("--changes", "changes_requested")):
+            with self.subTest(verdict=flag):
+                self.doCleanups()
+                self.setUp()
+                task_id = self.local_review_requested()
+                self.assertEqual(self.run_on("vm", "report", task_id, flag, caller=as_agent(LOCAL_REVIEW))[0], 0)
+                self.pump("vm", "win")
+                self.send_task_state(task_id)  # 复核结论要等 A 下一次发 checkpoint 才到镜像
+                self.pump("vm", "win")
+                self.assertEqual(self.reason("win", task_id, WORKER), reason)
+                self.assertEqual(self.footer("win", task_id), [])
+                self.assertEqual(self.report_code("win", task_id, ReportKind.RESULT), "attempt_not_found")
+
+    def test_no_footer_while_the_local_job_is_not_sent(self) -> None:
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                self.doCleanups()
+                self.setUp()
+                task_id = self.send()
+                self.pump("vm", "win")  # B 已物化，worker 还没交出（pending）
+                if cancelled:
+                    self.assertEqual(self.run_on("vm", "cancel", task_id, caller=as_agent(ORIGIN))[0], 0)
+                    self.pump("vm", "win")  # B 抑制未领取的作业：投递 cancelled
+                self.assertEqual(self.footer("win", task_id), [])
+                self.assertEqual(self.report_code("win", task_id, ReportKind.ACK), "attempt_not_sent")
+
+    def test_no_footer_on_an_archived_mirror(self) -> None:
+        task_id = self.delivered_task()
+        runtime = commands.open_runtime(self.states["win"])
+        try:
+            [task] = runtime.store.find_tasks(task_id)
+            commands.archive(runtime, task)
+        finally:
+            runtime.close()
+        self.assertEqual(self.footer("win", task_id), [])
+        self.assertEqual(self.report_code("win", task_id, ReportKind.ACK), "mirror_archived")
+
+    def test_no_footer_while_a_terminal_report_is_pending_or_accepted(self) -> None:
+        task_id = self.delivered_task()
+        self.assertEqual(self.run_on("win", "report", task_id, "--result", caller=as_agent(WORKER))[0], 0)
+        self.assertEqual(self.footer("win", task_id), [])  # 待发起设备裁决
+        self.assertEqual(self.report_code("win", task_id, ReportKind.FAILED), "report_pending")
+        self.pump("win", "vm")
+        self.pump("vm", "win")
+        self.assertEqual(self.reason("win", task_id, WORKER), "result_ready")
+        self.assertEqual(self.footer("win", task_id), [])  # 已被采纳
+        self.assertEqual(self.report_code("win", task_id, ReportKind.FAILED), "attempt_report_finalized")
+
+    def review_on_this_device(self) -> str:
+        """本机实现、复核在 win：A 的实现方交了结果，复核请求已投到 win 的会话。"""
+        code, out, err = self.run_on("vm", "send", "--to", "codex@review", "--review-device", "win", "--review-by",
+                                     f"codex@id:{THREAD_B}", "-m", "本机实现、远端复核", "--json",
+                                     caller=as_agent(ORIGIN))
+        self.assertEqual(code, 0, err)
+        task_id = json.loads(out)["id"]
+        with self.store("vm") as store:
+            FederationDispatcher(store, self.ident("vm"), RelayPaths(self.states["vm"]),
+                                 discover=lambda: [LOCAL_REVIEW], transports={Provider.CODEX: RecordingTransport(
+                                     Provider.CODEX)}, reply_address=None, command="ab").run_once()
+        self.assertEqual(self.run_on("vm", "report", task_id, "--result", caller=as_agent(LOCAL_REVIEW))[0], 0)
+        self.pump("vm", "win")
+        self.assertEqual(len(self.deliver_on_b().calls), 1)
+        return task_id
+
+    def test_review_on_this_device_prints_the_verdict_footer(self) -> None:
+        # 页脚给出的两种结论照做都被本机受理（两方 r0 审计 Opus P3-5），--result 被拒
+        for flag in ("--approve", "--changes"):
+            with self.subTest(verdict=flag):
+                self.doCleanups()
+                self.setUp()
+                task_id = self.review_on_this_device()
+                line = self.one_footer("win", task_id)
+                self.assertTrue(line.endswith(f"--origin-device vm {self.REVIEW}"), line)
+                self.assertNotIn("--result", line)
+                self.assertEqual(self.report_code("win", task_id, ReportKind.RESULT), "review_requires_verdict")
+                code, _, err = self.run_on("win", "report", task_id, "--origin-device", "vm", flag,
+                                           caller=as_agent(WORKER))
+                self.assertEqual(code, 0, err)
+
+    def test_handoff_attempt_of_a_review_flow_prints_the_handoff_footer(self) -> None:
+        # 页脚按尝试的角色给命令，不按任务流程（两方 r0 审计 Fable C1）：复核流程里镜像上的当前尝试是交接，给 --result
+        code, out, err = self.run_on("vm", "send", "--device", "win", "--to", "codex@impl", "--review-by",
+                                     "codex@review", "-m", "实现 Y", "--json", caller=as_agent(ORIGIN))
+        self.assertEqual(code, 0, err)
+        task_id = json.loads(out)["id"]
+        self.pump("vm", "win")
+        self.assertEqual(len(self.deliver_on_b().calls), 1)
+        line = self.one_footer("win", task_id)
+        self.assertTrue(line.endswith(f"--origin-device vm {self.HANDOFF}"), line)
+        code, _, err = self.run_on("win", "report", task_id, "--origin-device", "vm", "--result",
+                                   caller=as_agent(WORKER))
+        self.assertEqual(code, 0, err)
+
+    def test_no_footer_on_a_finished_mirror_without_a_terminal_report(self) -> None:
+        # 两方 r0 审计 Opus M1、Fable B2：镜像收到关闭后，即使本机没交过终态报告也不打页脚
+        task_id = self.delivered_task()
+        self.assertEqual(self.run_on("vm", "close", task_id, caller=as_agent(ORIGIN))[0], 0)
+        self.pump("vm", "win")
+        self.assertEqual(self.footer("win", task_id), [])
+        self.assertEqual(self.report_code("win", task_id, ReportKind.RESULT), "task_finished")
+
+    def test_footer_returns_after_a_rejected_terminal_report(self) -> None:
+        # 终态汇报被拒即解除冻结（两方 r0 审计 Opus M9）：页脚重新出现，照做被本机受理
+        task_id = self.delivered_task()
+        code, out, err = self.run_on("win", "report", task_id, "--result", "--json", caller=as_agent(WORKER))
+        self.assertEqual(code, 0, err)
+        operation = json.loads(out)["report"]["operationId"]
+        self.assertEqual(self.footer("win", task_id), [])
+        with self.store("win") as store:  # 例如 hub 确定拒收后 B 本机记下 rejected
+            store.add_decision(reporter_device=DEV_B, report_operation_id=operation, authority_revision=1,
+                               decision="rejected", reason="test_rejected")
+        line = self.one_footer("win", task_id)
+        argv = line[len("汇报："):].split("（")[0].split()[1:]  # 去掉命令名与括号里的备选
+        self.assertEqual(argv, ["report", task_id[:8], "--origin-device", "vm", "--result"])
+        code, _, err = self.run_on("win", *argv, caller=as_agent(WORKER))
+        self.assertEqual(code, 0, err)
+
+    def test_no_footer_while_the_local_job_is_mid_send(self) -> None:
+        # 「未交出」含 sending（两方 r0 审计 Fable B12）：B 已 intent、外调结果还没落账
+        task_id = self.send()
+        self.pump("vm", "win")
+        with self.store("win") as store:
+            [attempt] = [item for item in store.attempts(self.ids["vm"], task_id) if item.role != "notice"]
+            with store.transaction() as conn:
+                changed = conn.execute("UPDATE fed_native_sends SET state='intent', intent_at=? WHERE msg_id=?"
+                                       " AND state='prepared'", (now_ms(), attempt.msg_id)).rowcount
+                store.update_attempt_columns(attempt.msg_id, delivery=dict(attempt.delivery, state="sending"))
+        self.assertEqual(changed, 1)
+        self.assertEqual(self.footer("win", task_id), [])
+        self.assertEqual(self.report_code("win", task_id, ReportKind.ACK), "attempt_not_sent")
+
+    def test_attribution_is_checked_before_attempt_not_sent(self) -> None:
+        # 错误码先后顺序不变（两方 r0 审计 Fable C2）：不是收件会话的调用方先得 reporter_mismatch，再轮到「未交出」
+        task_id = self.send()
+        self.pump("vm", "win")
+        self.assertEqual(self.report_code("win", task_id, ReportKind.ACK, who=LOCAL_REVIEW), "reporter_mismatch")
+        self.assertEqual(self.report_code("win", task_id, ReportKind.ACK), "attempt_not_sent")
+
+    def test_authority_session_cannot_report_on_a_remote_current_attempt(self) -> None:
+        # 「当前尝试」只认发给本设备的（两方 r0 审计 Fable B3）：当前尝试在远端时，A 本机会话汇报得 attempt_not_found
+        task_id = self.delivered_task()
+        self.assertEqual(self.report_code("vm", task_id, ReportKind.RESULT, who=LOCAL_REVIEW), "attempt_not_found")
+
+    def test_no_footer_without_a_local_binding(self) -> None:
+        # §98 r1：B 收信时没有该端点的绑定，worker 记 failed（target_not_found），没有会话收到工作：不打页脚，
+        # 照做在 commands.report 报 reporter_mismatch（同一判定）
+        with self.store("win") as store:
+            with store.transaction() as conn:
+                self.assertGreater(conn.execute("DELETE FROM fed_bindings").rowcount, 0)
+        task_id = self.send()
+        self.pump("vm", "win")
+        self.deliver_on_b()
+        with self.store("win") as store:
+            [attempt] = [item for item in store.attempts(self.ids["vm"], task_id) if item.role != "notice"]
+        self.assertEqual((attempt.target.local, attempt.delivery.get("state")), (None, "failed"))
+        self.assertEqual(self.footer("win", task_id), [])
+        self.assertEqual(self.report_code("win", task_id, ReportKind.RESULT), "reporter_mismatch")
+
+    def test_no_footer_once_federation_is_disabled(self) -> None:
+        # §98 r1：本机联邦停用后 ab status 仍可读，但 ab report 报 federation_disabled，所以不打页脚
+        task_id = self.delivered_task()
+        self.assertEqual(len(self.footer("win", task_id)), 1)
+        self.assertEqual(self.run_on("win", "federation", "disable")[0], 0)
+        code, out, err = self.run_on("win", "status", task_id, caller=as_agent(WORKER))
+        self.assertEqual(code, 0, err)
+        self.assertIn("镜像（发起设备 vm）", out)
+        self.assertNotIn("汇报：", out)
+        code, _, err = self.run_on("win", "report", task_id, "--result", caller=as_agent(WORKER))
+        self.assertEqual(code, cli.EXIT_NOT_ENABLED)
+        self.assertIn("federation_disabled", err)
+
+    def test_authority_side_reviewer_still_reports_through_commands_report(self) -> None:
+        # 共用判定的「非权威」条件只用于页脚，不进汇报路径：A 本机复核方照常经 commands.report 汇报并当场采纳
+        task_id = self.local_review_requested()
+        self.assertEqual(self.footer("vm", task_id), [])  # 权威端不打镜像页脚
+        runtime = commands.open_runtime(self.states["vm"])
+        try:
+            [task] = runtime.store.find_tasks(task_id)
+            attempt, result = commands.report(runtime, task=task, kind=ReportKind.APPROVE, attempt_seq=None, note=None,
+                                              files=[], commit=None, manual=False, caller=as_agent(LOCAL_REVIEW),
+                                              caller_class="bypass", cwd=self.root)
+        finally:
+            runtime.close()
+        self.assertEqual((attempt.role, result.decision), ("review", "accepted"))
 
 
 # 每个场景里 B 可能交的报告：交接场景下 approve/changes 会被 A 以 verdict_requires_review 拒绝；复核场景下 result 被拒

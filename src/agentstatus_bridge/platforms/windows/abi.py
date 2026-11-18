@@ -135,6 +135,7 @@ SIGNATURES = {
         'FlushFileBuffers': (BOOL, [HANDLE]),
         'WriteFile': (BOOL, [HANDLE, PTR, DWORD, PTR, PTR]),
         'ReadFile': (BOOL, [HANDLE, PTR, DWORD, PTR, PTR]),
+        'SetFilePointerEx': (BOOL, [HANDLE, C.c_int64, PTR, DWORD]),
         'MoveFileExW': (BOOL, [PTR, PTR, DWORD]), 'DeleteFileW': (BOOL, [PTR]),
         'CreateEventW': (HANDLE, [PTR, BOOL, BOOL, PTR]),
         'WaitForSingleObject': (DWORD, [HANDLE, DWORD]),

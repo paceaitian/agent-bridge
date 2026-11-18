@@ -458,6 +458,22 @@ class CancelAndClosureTests(FederationTestCase):
         assert b_closure is not None
         self.assertEqual(b_closure.target.local, self.worker.local)
 
+    def test_queued_evidence_on_the_authority_clears_the_prompt_but_keeps_the_closure_plan(self) -> None:
+        # §98.1：与上一例相同，只是 accept 前 A 已拿到 B 的 queued 证据：有到达证据，不提示；结束回执的规划与投递不变
+        task, first = self.create()
+        pump(self.a, self.b, now=T0 + 1)
+        deliver(self.b, first.msg_id, "queued", now=T0 + 2)
+        pump(self.b, self.a, now=T0 + 3)
+        self.assertEqual(self.a.store.attempt_by_msg(first.msg_id).delivery["state"], "queued")  # type: ignore[union-attr]
+        outcome = self._accept_and_pump(task.task_id, now=T0 + 10)
+        self.assertFalse(outcome.remote_unconfirmed)
+        (closure,) = outcome.closures
+        self.assertEqual(closure.options["coversWorkMessageIds"], [first.msg_id])
+        self.assertEqual(self.b.store.native(closure.msg_id)["state"], "prepared")  # type: ignore[index]
+        b_closure = self.b.store.attempt_by_msg(closure.msg_id)
+        assert b_closure is not None
+        self.assertEqual(b_closure.target.local, self.worker.local)
+
     def test_closure_suppressed_when_work_never_sent(self) -> None:
         task, first = self.create()
         pump(self.a, self.b, now=T0 + 1)  # B 收到但从未 intent
@@ -508,6 +524,173 @@ class CancelAndClosureTests(FederationTestCase):
         self.assertFalse(remote_pending)
         self.assertEqual(self.a.store.native(first.msg_id)["state"], "suppressed")  # type: ignore[index]
         self.assertEqual(self.a.store.attempt_by_msg(first.msg_id).delivery["state"], "cancelled")  # type: ignore[union-attr]
+
+
+class ArrivalEvidenceTests(FederationTestCase):
+    """§98.1 逐状态对照：跨设备结案的「尚未证明送达」提示只看到达证据（对方已汇报，或 A 记录的投递是 written/queued/
+    delivered）；结束回执照旧覆盖全部未被证明未投递的远端尝试。每行一例。"""
+
+    def finish_after(self, state: str | None, *, reported: bool = False) -> tuple[authority.FinishOutcome, Any]:
+        """A 记下 B 的投递状态（None=还没有证据，A 视角 pending），可选让 B 汇报一次 ack，然后 accept。"""
+        task, first = self.create()
+        pump(self.a, self.b, now=T0 + 1)
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        if state is not None:
+            authority.apply_evidence(self.a.store, current, first.msg_id, 1, {"state": state, "at": T0 + 2},
+                                     delivery_device=DEV_B, now=T0 + 2)
+        if reported:
+            self.b_report(task.task_id, 1, "ack", now=T0 + 3)
+            pump(self.b, self.a, now=T0 + 4)
+            self.assertTrue(self.a.store.attempt_by_msg(first.msg_id).delivery["receiverReported"])  # type: ignore[union-attr]
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        outcome = authority.finish(self.a.store, self.a.ident, current, state=ACCEPTED, reason=None, decider="owner",
+                                   sender=self.origin_actor(), sender_class="bypass", now=T0 + 10)
+        return outcome, first
+
+    def assert_row(self, state: str | None, *, prompt: bool, planned: bool, reported: bool = False) -> None:
+        with self.subTest(state=state, reported=reported):
+            self.tearDown()
+            self.setUp()
+            outcome, first = self.finish_after(state, reported=reported)
+            self.assertEqual(outcome.remote_unconfirmed, prompt)
+            # 结束回执的规划不受提示口径影响：进 remote_unproven 的尝试照旧由对方按实际情况投递或抑制
+            self.assertEqual([item.options.get("coversWorkMessageIds") for item in outcome.closures],
+                             [[first.msg_id]] if planned else [])
+
+    def test_pending_and_sending_still_prompt(self) -> None:
+        for state in (None, "sending"):
+            self.assert_row(state, prompt=True, planned=True)
+
+    def test_written_queued_and_delivered_do_not_prompt(self) -> None:
+        for state in ("written", "queued", "delivered"):
+            self.assert_row(state, prompt=False, planned=True)
+
+    def test_held_still_prompts(self) -> None:
+        # held 是对方设备暂存、等会话里批准：结案后仍可能被批准执行，所以不算到达证据
+        self.assert_row("held", prompt=True, planned=True)
+
+    def test_unknown_still_prompts(self) -> None:
+        self.assert_row("unknown", prompt=True, planned=True)
+
+    def test_proven_undelivered_states_neither_prompt_nor_plan_a_closure(self) -> None:
+        for state in ("failed", "refused", "denied", "expired", "cancelled"):
+            self.assert_row(state, prompt=False, planned=False)
+
+    def test_an_unlisted_new_state_prompts(self) -> None:
+        self.assert_row("future_state", prompt=True, planned=True)
+
+    def test_receiver_reported_overrides_every_state(self) -> None:
+        for state in (None, "held", "unknown", "failed", "future_state"):
+            self.assert_row(state, reported=True, prompt=False, planned=True)
+
+    def test_older_unknown_attempt_still_prompts_after_a_newer_one_reported(self) -> None:
+        # 判据看同一角色的全部尝试：#1 投递 unknown，强制重发后的新尝试已汇报，#1 仍可能在执行，提示对它成立
+        task, first = self.create()
+        pump(self.a, self.b, now=T0 + 1)
+        deliver(self.b, first.msg_id, "unknown", now=T0 + 2)  # B 真实回传：外调结果不明
+        pump(self.b, self.a, now=T0 + 2)
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        retried = authority.retry_task(self.a.store, self.a.ident, current, force=True, message=None, new_target=None,
+                                       rework_body=lambda *args: "重发", now=T0 + 3)
+        pump(self.a, self.b, now=T0 + 4)
+        deliver(self.b, retried.attempt.msg_id, "queued", now=T0 + 5)
+        self.b_report(task.task_id, retried.attempt.seq, "ack", now=T0 + 6)
+        pump(self.b, self.a, now=T0 + 7)
+        newer = self.a.store.attempt_by_msg(retried.attempt.msg_id)
+        assert newer is not None
+        self.assertTrue(newer.delivery["receiverReported"])
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        outcome = authority.finish(self.a.store, self.a.ident, current, state=ACCEPTED, reason=None, decider="owner",
+                                   sender=self.origin_actor(), sender_class="bypass", now=T0 + 10)
+        self.assertTrue(outcome.remote_unconfirmed)
+        (closure,) = outcome.closures
+        self.assertEqual(sorted(closure.options["coversWorkMessageIds"]), sorted([first.msg_id, retried.attempt.msg_id]))
+
+    def test_proven_undelivered_older_attempt_does_not_prompt(self) -> None:
+        # 判据只看 remote_unproven（两方 r0 审计 Fable A6）：#1 被证明未投递（failed）、重发的 #2 已送达并汇报，
+        # #1 不进 remote_unproven，#2 有到达证据，不提示；回执只覆盖 #2
+        task, first = self.create()
+        pump(self.a, self.b, now=T0 + 1)
+        deliver(self.b, first.msg_id, "failed", now=T0 + 2)
+        pump(self.b, self.a, now=T0 + 2)
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        retried = authority.retry_task(self.a.store, self.a.ident, current, force=False, message=None, new_target=None,
+                                       rework_body=lambda *args: "重发", now=T0 + 3)
+        pump(self.a, self.b, now=T0 + 4)
+        deliver(self.b, retried.attempt.msg_id, "queued", now=T0 + 5)
+        self.b_report(task.task_id, retried.attempt.seq, "ack", now=T0 + 6)
+        pump(self.b, self.a, now=T0 + 7)
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        outcome = authority.finish(self.a.store, self.a.ident, current, state=ACCEPTED, reason=None, decider="owner",
+                                   sender=self.origin_actor(), sender_class="bypass", now=T0 + 10)
+        self.assertFalse(outcome.remote_unconfirmed)
+        (closure,) = outcome.closures
+        self.assertEqual(closure.options["coversWorkMessageIds"], [retried.attempt.msg_id])
+
+    def test_either_remote_role_without_evidence_prompts(self) -> None:
+        # 两个角色都在远端时，任一角色有尝试缺到达证据就提示，后一个角色不覆盖前一个（两方 r0 审计 Opus A7、Fable A8）：
+        # 交接 #1 unknown、强制重发的新尝试交了结果；复核也在 B 且已 queued
+        reviewer = self.b.bind(Provider.CLAUDE, CLAUDE_A2.replace("a", "b", 1), pid=4343)
+        task, first = self.create(flow="review", reviewer=TargetRef(remote=reviewer.remote))
+        pump(self.a, self.b, now=T0 + 1)
+        deliver(self.b, first.msg_id, "unknown", now=T0 + 2)
+        pump(self.b, self.a, now=T0 + 2)
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        retried = authority.retry_task(self.a.store, self.a.ident, current, force=True, message=None, new_target=None,
+                                       rework_body=lambda *args: "重发", now=T0 + 3)
+        pump(self.a, self.b, now=T0 + 4)
+        deliver(self.b, retried.attempt.msg_id, "queued", now=T0 + 5)
+        self.b_report(task.task_id, retried.attempt.seq, "result", now=T0 + 6)
+        pump(self.b, self.a, now=T0 + 7)
+        review = next(item for item in self.a.store.attempts(DEV_A, task.task_id) if item.role == "review")
+        pump(self.a, self.b, now=T0 + 8)
+        deliver(self.b, review.msg_id, "queued", now=T0 + 9)
+        pump(self.b, self.a, now=T0 + 9)
+        states = {item.seq: (item.role, item.delivery.get("state"))
+                  for item in self.a.store.attempts(DEV_A, task.task_id) if item.role != "notice"}
+        self.assertEqual((states[first.seq], states[review.seq]), (("handoff", "unknown"), ("review", "queued")))
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        outcome = authority.finish(self.a.store, self.a.ident, current, state=ACCEPTED, reason=None, decider="owner",
+                                   sender=self.origin_actor(), sender_class="bypass", now=T0 + 20)
+        self.assertTrue(outcome.remote_unconfirmed, states)
+
+    def test_review_attempt_on_the_mirror_uses_the_same_rule(self) -> None:
+        # 复核在 B、实现在 A 本机：判据同样作用于复核角色的远端尝试
+        for state, prompt in (("queued", False), ("unknown", True)):
+            with self.subTest(state=state):
+                self.tearDown()
+                self.setUp()
+                local = self.a.bind(Provider.CLAUDE, CLAUDE_A2)
+                task, first = authority.create_task(
+                    self.a.store, self.a.ident, title="复核在 B", flow="review", body="实现 X", refs=[],
+                    origin=self.origin, origin_actor=self.origin_actor(), origin_class="bypass", target=local,
+                    reviewer=self.worker_remote, now=T0)
+                current = self.a.store.get_task(DEV_A, task.task_id)
+                assert current is not None
+                mirror.submit_report(self.a.store, self.a.ident, LocalReport(
+                    task=current, attempt=first, kind="result", note="实现完成", refs=[], commit=None,
+                    reporter=authority.actor_for(local, wire_token="claude@vm2"), reporter_class="bypass",
+                    source="agent"), now=T0 + 1)
+                review = next(item for item in self.a.store.attempts(DEV_A, task.task_id) if item.role == "review")
+                current = self.a.store.get_task(DEV_A, task.task_id)
+                assert current is not None
+                authority.apply_evidence(self.a.store, current, review.msg_id, 1, {"state": state, "at": T0 + 2},
+                                         delivery_device=DEV_B, now=T0 + 2)
+                current = self.a.store.get_task(DEV_A, task.task_id)
+                assert current is not None
+                outcome = authority.finish(self.a.store, self.a.ident, current, state=ACCEPTED, reason=None,
+                                           decider="owner", sender=self.origin_actor(), sender_class="bypass",
+                                           now=T0 + 10)
+                self.assertEqual(outcome.remote_unconfirmed, prompt)
+                self.assertIn([review.msg_id], [item.options.get("coversWorkMessageIds") for item in outcome.closures])
 
 
 class CapacityTests(FederationTestCase):

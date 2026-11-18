@@ -408,6 +408,13 @@ class WinApi:
             data.extend(buf.raw[:count.value])
         return bytes(data)
 
+    def read_at(self, handle: int, offset: int, limit: int) -> bytes:
+        """从文件开头算起的 offset 处有界读（§99.3 尾部分块回读）：先 SetFilePointerEx(FILE_BEGIN)，再同步读。"""
+        if offset < 0:
+            raise ValueError('windows_read_offset')
+        self.check(self.k.SetFilePointerEx(handle, offset, None, 0))
+        return self.read(handle, limit)
+
     def flush(self, handle: int) -> None:
         self.check(self.k.FlushFileBuffers(handle))
 

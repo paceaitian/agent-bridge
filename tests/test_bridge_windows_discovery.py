@@ -757,6 +757,8 @@ class AllDevicesPeersTests(unittest.TestCase):
         peers = self.claude()
         document['peers'] = list(document['peers']) + peers.document()
         document['claudeDiscovery'] = {'complete': peers.complete, 'reason': peers.reason}
+        # §99.3 只加的可选键：合成的 Claude 结果没有取名来源码，所以计数全为零
+        document['claudeTitles'] = {'found': 0, 'fallback': {}}
         return json.loads(json.dumps(document))
 
     def test_plain_peers_output_is_byte_for_byte_unchanged(self):
@@ -1399,6 +1401,132 @@ class WindowsClaudeRegistryStatusTests(unittest.TestCase):
                 [endpoint] = result.endpoints
                 self.assertEqual((endpoint.runtime.value, endpoint.runtime_source), (expected, 'claude_registry'))
                 self.assertEqual(result.document()[0]['runtime'], expected)
+
+
+
+class WindowsClaudeTitleTests(unittest.TestCase):
+    """§99 Windows：注册文件 → claude_discovery.discover → 会话记录标题作主名；共享读打开（READ|WRITE|DELETE）、
+    读完即关；打不开或是重解析点时退回注册名，发现完整性不变。夹具同 WindowsClaudeRegistryStatusTests（假内核、临时目录）。
+    """
+    PIPE = WindowsClaudeRegistryStatusTests.PIPE
+    SESSION = WindowsClaudeRegistryStatusTests.SESSION
+    BIRTH = WindowsClaudeRegistryStatusTests.BIRTH
+    setUp = WindowsClaudeRegistryStatusTests.setUp
+
+    def tearDown(self):
+        from agentstatus_bridge import claude_titles
+        claude_titles._MEMO.clear()
+
+    def registry(self, name='fixture-peer'):
+        (self.sessions / '200.json').write_text(json.dumps(
+            {'pid': 200, 'sessionId': self.SESSION, 'peerProtocol': 1, 'kind': 'interactive', 'status': 'idle',
+             'messagingSocketPath': self.PIPE, 'procStartFt': self.BIRTH, 'name': name}), encoding='utf-8')
+
+    def transcript(self, title='win-title'):
+        path = self.root / 'config' / 'projects' / 'C--work-repo' / f'{self.SESSION}.jsonl'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'type': 'user', 'sessionId': self.SESSION}) + '\n'
+                        + json.dumps({'type': 'ai-title', 'aiTitle': title, 'sessionId': self.SESSION},
+                                     separators=(',', ':')) + '\n', encoding='utf-8')
+        return path
+
+    def discovered(self):
+        from agentstatus_bridge.platforms.windows import claude_discovery
+        result = claude_discovery.discover(self.p.transport)
+        self.assertTrue(result.complete)
+        self.assertEqual(self.k.handles, {})  # 会话记录句柄读完即关
+        [endpoint] = result.endpoints
+        return result, endpoint
+
+    def test_discovery_uses_the_transcript_title(self):
+        from agentstatus_bridge.native_names import NameBook
+        self.registry()
+        self.transcript()
+        result, endpoint = self.discovered()
+        self.assertEqual((endpoint.name, endpoint.name_source, endpoint.name_origin),
+                         ('win-title', NameSource('named', 'win-title'), 'found_ai'))
+        self.assertEqual((endpoint.name_view.name, endpoint.name_view.verified), ('win-title', True))
+        self.assertEqual(NameBook.of(result.endpoints).local_wire(endpoint.ref), 'claude@win-title')
+        self.assertEqual(result.document()[0]['name'], 'win-title')
+
+    def test_the_title_is_addressable_through_windows_resolve(self):
+        from agentstatus_bridge.platforms.windows import commands
+        from agentstatus_bridge.transports.codex_native import NativeFailure as Failure
+        self.registry()
+        self.transcript()
+        self.assertEqual(commands.resolve('claude@win-title').ref.native_id, self.SESSION)
+        with self.assertRaises(Failure) as caught:
+            commands.resolve('claude@fixture-peer')
+        self.assertEqual(caught.exception.reason, 'target_not_found')
+        self.assertEqual(self.k.handles, {})
+
+    def test_the_shared_read_open_lets_claude_append_and_delete(self):
+        import ctypes as C
+        from agentstatus_bridge.platforms.windows import abi as A
+        path = self.transcript()
+        with self.p.files.open_shared_read(path) as reader:
+            [record] = [item for item in self.k.handles.values() if item.get('path') == str(path)]
+            self.assertEqual((record['sharing'], record['access'] & 0x40000001), (7, 0x1))  # 只读数据、三种共享
+            self.assertEqual(reader.read_at(reader.size - 3, 3)[-1:], b'\n')
+            with self.k.api.owned(self.k.api.open_file(str(path), write=True, sharing=7)):
+                pass  # Claude 追加写入
+            with self.k.api.private_attributes() as sa:
+                deleting = self.k.api.handle(self.k.CreateFileW(A.wide(str(path)), 0x10000, 7, C.byref(sa), 3,
+                                                                0x00200000 | 0x80, None))
+            self.k.api.close(deleting)  # 带 DELETE 访问的打开（替换、删除）不被拒绝
+        self.assertEqual(self.k.handles, {})
+
+    def test_an_unopenable_transcript_falls_back_and_discovery_stays_complete(self):
+        self.registry()
+        for reason, meta in (('unreadable', {'deny_data': True}), ('not_regular', {'reparse': True})):
+            with self.subTest(reason=reason):
+                from agentstatus_bridge import claude_titles
+                claude_titles._MEMO.clear()
+                path = self.transcript()
+                self.k.files[str(path)] = meta
+                _, endpoint = self.discovered()
+                self.assertEqual((endpoint.name, endpoint.name_source, endpoint.name_origin),
+                                 ('fixture-peer', NameSource('named', 'fixture-peer'), reason))
+                self.assertEqual((endpoint.name_view.name, endpoint.name_view.verified), ('fixture-peer', True))
+                del self.k.files[str(path)]
+
+    def test_the_shared_read_open_refuses_directories(self):
+        # 审计 Opus O11 / Fable W3：句柄属性带 FILE_ATTRIBUTE_DIRECTORY 时报 not_regular，句柄照样关闭
+        path = self.transcript()
+        info = SimpleNamespace(attributes=0x10, size_high=0, size_low=1)
+        with patch.object(self.k.api, 'file_info', return_value=info), self.assertRaises(OSError) as caught:
+            with self.p.files.open_shared_read(path):
+                pass
+        self.assertEqual(caught.exception.args, ('not_regular',))
+        self.assertEqual(self.k.handles, {})
+
+    def test_peers_json_counts_duplicate_sessions_too(self):
+        # 审计 Fable C1：计数包括按重复会话剔除出选择的端点
+        from agentstatus_bridge.model import Endpoint, EndpointRef
+        from agentstatus_bridge.platforms.windows import claude_discovery, commands
+        def duplicate(pid):
+            return Endpoint(EndpointRef(Provider.CLAUDE, self.SESSION, pid, 'win-filetime:1', data_root='c' * 64),
+                            name='t', name_origin='found_ai')
+        evidence = claude_discovery.Discovery((), True, 'complete', (duplicate(300), duplicate(301)))
+        out = io.StringIO()
+        with patch.object(D, 'discover', return_value=D.Discovery()), patch.dict(os.environ, {'AB_DEVICE': 'winbox'}), \
+                patch.object(commands, 'claude_evidence', return_value=evidence), \
+                patch.object(cli, '_refresh_summary', side_effect=AssertionError('no state writes')), \
+                patch.object(cli, '_revive_for_federation'), redirect_stdout(out):
+            self.assertEqual(cli.main(['peers', '--json']), 0)
+        self.assertEqual(json.loads(out.getvalue())['claudeTitles'], {'found': 2, 'fallback': {}})
+
+    def test_peers_json_counts_title_sources_only(self):
+        self.registry()
+        self.transcript()
+        out = io.StringIO()
+        with patch.object(D, 'discover', return_value=D.Discovery()), patch.dict(os.environ, {'AB_DEVICE': 'winbox'}), \
+                patch.object(cli, '_refresh_summary', side_effect=AssertionError('no state writes')), \
+                patch.object(cli, '_revive_for_federation'), redirect_stdout(out):
+            self.assertEqual(cli.main(['peers', '--json']), 0)
+        document = json.loads(out.getvalue())
+        self.assertEqual(document['claudeTitles'], {'found': 1, 'fallback': {}})
+        self.assertNotIn(str(self.root), json.dumps(document['claudeTitles']))
 
 
 if __name__=='__main__': unittest.main()

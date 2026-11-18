@@ -136,6 +136,7 @@ SDK = {
         'FlushFileBuffers': (I32, [H]),
         'WriteFile': (I32, [H, P, U32, P, P]),
         'ReadFile': (I32, [H, P, U32, P, P]),
+        'SetFilePointerEx': (I32, [H, C.c_int64, P, U32]),  # fileapi.h：LARGE_INTEGER 按值传，x64 为 64 位
         'MoveFileExW': (I32, [P, P, U32]),
         'DeleteFileW': (I32, [P]),
         'CreateEventW': (H, [P, I32, I32, P]),

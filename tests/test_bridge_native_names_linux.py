@@ -11,12 +11,12 @@ import unittest
 from unittest.mock import patch
 
 from bridge_support import FakeProc, endpoint, ref
-from agentstatus_bridge import cli, endpoints
+from agentstatus_bridge import claude_titles, cli, endpoints
 from agentstatus_bridge.caller_values import Caller
 from agentstatus_bridge.observer_dbus import ObserverView
 from agentstatus_bridge.endpoints import ResolveError, resolve_target
 from agentstatus_bridge.model import NameSource, Provider
-from agentstatus_bridge.native_names import NO_NAME, UNKNOWN_NAME, cwd_tail
+from agentstatus_bridge.native_names import NO_NAME, UNKNOWN_NAME, NameBook, cwd_tail
 from agentstatus_bridge.transports.codex_native import NativeBatch, ThreadMetadata, project_thread
 
 A = '019a0000-0000-7000-8000-00000000000a'
@@ -311,6 +311,109 @@ class WorkdirLinuxTests(unittest.TestCase):
         self.assertEqual({row['provider']: row['workdir'] for row in rows}, {'codex': 'repo-a', 'claude': 'a\\u202eb'})
         unknown = json.loads(self.peers(self.found(codex_cwd=None, claude_cwd=None), '--json'))['peers']
         self.assertEqual([row['workdir'] for row in unknown], [None, None])
+
+
+
+class ClaudeTitleLinuxTests(unittest.TestCase):
+    """§99 Linux：真实 discover 从 <配置根>/projects/ 的会话记录夹具取标题作 Claude 主名；退回不改 §91 完整性与核实。
+
+    借用 WorkdirLinuxTests 的夹具（配置根 = 注册目录 sessions 的父目录 = 临时根），会话记录全是临时文件。
+    """
+    THREAD, SESSION = WorkdirLinuxTests.THREAD, WorkdirLinuxTests.SESSION
+    setUp = WorkdirLinuxTests.setUp
+    found = WorkdirLinuxTests.found
+    peers = WorkdirLinuxTests.peers
+
+    def tearDown(self):
+        claude_titles._MEMO.clear()
+
+    def transcript(self, *records):
+        path = self.root / 'projects' / '-home-u-claude-proj' / f'{self.SESSION}.jsonl'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(''.join(json.dumps(item, ensure_ascii=False, separators=(',', ':')) + '\n' for item in records),
+                        encoding='utf-8')
+        return path
+
+    def claude(self, **found):
+        [item] = [item for item in endpoints.discover(self.found(**found)) if item.ref.provider is Provider.CLAUDE]
+        return item
+
+    def test_real_discovery_uses_the_title_as_the_native_name(self):
+        self.transcript({'type': 'user', 'sessionId': self.SESSION},
+                        {'type': 'ai-title', 'aiTitle': '修复登录', 'sessionId': self.SESSION})
+        item = self.claude()
+        self.assertEqual((item.name, item.name_source, item.name_origin), ('修复登录', NameSource('named', '修复登录'), 'found_ai'))
+        self.assertEqual((item.name_view.name, item.name_view.verified), ('修复登录', True))
+        self.assertEqual(item.round_incomplete, frozenset())
+
+    def test_fallbacks_keep_the_registry_name_and_completeness(self):
+        cases = {'no_record_file': lambda: None,
+                 'no_title_record': lambda: self.transcript({'type': 'user', 'sessionId': self.SESSION}),
+                 'unreadable': lambda: self.transcript({'type': 'ai-title', 'aiTitle': 'x', 'sessionId': self.SESSION}
+                                                       ).chmod(0)}
+        for reason, prepare in cases.items():
+            with self.subTest(reason=reason):
+                claude_titles._MEMO.clear()
+                prepare()
+                item = self.claude()
+                self.assertEqual((item.name, item.name_source, item.name_origin),
+                                 ('claude-proj', NameSource('named', 'claude-proj'), reason))
+                self.assertEqual((item.name_view.name, item.name_view.verified), ('claude-proj', True))
+                self.assertEqual(item.round_incomplete, frozenset())
+
+    def test_the_title_is_addressable_and_the_default_name_no_longer_is(self):
+        self.transcript({'type': 'custom-title', 'customTitle': 'lead', 'sessionId': self.SESSION},
+                        {'type': 'agent-name', 'agentName': 'lead', 'sessionId': self.SESSION})
+        found = endpoints.discover(self.found())
+        claude = next(item for item in found if item.ref.provider is Provider.CLAUDE)
+        self.assertIs(resolve_target('claude@lead', found), claude)
+        with self.assertRaises(ResolveError) as caught:
+            resolve_target('claude@claude-proj', found)
+        self.assertEqual(caught.exception.code, 'target_not_found')
+        # 消息头 from= 与 Claude 帧发送方名同走 local_wire：无空白的标题直接用名字，含空白的用完整 ID（§91）
+        self.assertEqual(NameBook.of(found).local_wire(claude.ref), 'claude@lead')
+        self.transcript({'type': 'ai-title', 'aiTitle': 'Fix login bug', 'sessionId': self.SESSION})
+        spaced = endpoints.discover(self.found())
+        self.assertEqual(NameBook.of(spaced).local_wire(claude.ref), 'claude@id:' + self.SESSION)
+
+    def test_peers_shows_the_title_and_json_counts_only_codes(self):
+        self.transcript({'type': 'ai-title', 'aiTitle': 'review-flow', 'sessionId': self.SESSION})
+        line = next(line for line in self.peers(self.found()).splitlines() if line.startswith('claude@'))
+        self.assertTrue(line.startswith('claude@review-flow〔0000000c〕'), line)
+        document = json.loads(self.peers(self.found(), '--json'))
+        self.assertEqual(document['claudeTitles'], {'found': 1, 'fallback': {}})
+        [row] = [row for row in document['peers'] if row['provider'] == 'claude']
+        self.assertEqual(row['name'], 'review-flow')
+        claude_titles._MEMO.clear()
+        (self.root / 'projects' / '-home-u-claude-proj' / f'{self.SESSION}.jsonl').unlink()
+        document = json.loads(self.peers(self.found(), '--json'))
+        self.assertEqual(document['claudeTitles'], {'found': 0, 'fallback': {'no_record_file': 1}})
+        self.assertNotIn(str(self.root), json.dumps(document['claudeTitles']))
+
+    def test_the_directory_publishes_the_title_only_when_names_are_published(self):
+        from types import SimpleNamespace
+        from agentstatus_bridge.federation import commands as fed_commands, directory
+        from agentstatus_bridge.federation.fedstore import FederatedStore
+        self.transcript({'type': 'ai-title', 'aiTitle': 'publish-me', 'sessionId': self.SESSION})
+        store = FederatedStore.create(self.root / 'fed')
+        self.addCleanup(store.close)
+        store.set_meta('deviceId', 'a' * 32)
+        for publish in (True, False):
+            with self.subTest(publish_names=publish):
+                runtime = SimpleNamespace(store=store, ident=SimpleNamespace(device_id='a' * 32),
+                                          config=SimpleNamespace(publish_names=publish))
+                with patch.object(fed_commands, 'DiscoverySources', return_value=self.found()), \
+                        patch.object(directory, 'root_binding', return_value='f' * 32):
+                    snapshot = fed_commands.directory_source(runtime)()
+                [row] = [item for item in snapshot['endpoints'] if item['provider'] == 'claude']
+                frame = json.dumps(snapshot, ensure_ascii=False)
+                if publish:
+                    self.assertEqual((row['name'], row['namesVerified']), ('publish-me', True))
+                    self.assertIn('publish-me', frame)
+                else:
+                    self.assertNotIn('name', row)
+                    self.assertNotIn('publish-me', frame)
+                    self.assertNotIn('claude-proj', frame)  # 注册名与目录末段同样不发
 
 
 if __name__ == '__main__':

@@ -153,7 +153,9 @@ class ReleaseTests(unittest.TestCase):
             # §95.5.7：send --fyi 的纯函数用例真跑，Linux CLI/账本/worker 夹具类按 POSIX-only 跳过
             'test_bridge_fyi',
             # §95.2：worker 取锁的时间预算（共用 retry_lock 与 Windows 假内核取锁）
-            'test_bridge_worker_lock'})
+            'test_bridge_worker_lock',
+            # §99：Claude 会话标题的规则/回读/定位/记忆/计数用例真跑，链接、FIFO 与 Linux 打开按 POSIX-only 跳过
+            'test_bridge_claude_titles'})
         for name in ci.MODULES:self.assertTrue((ROOT/'tests'/f'{name}.py').is_file())
         native=(ROOT/'tests/test_bridge_windows_native.py').read_text()
         self.assertIn('if api.token(api.k.GetCurrentProcess()).elevated:',native)
