@@ -1,13 +1,13 @@
 # agent-bridge
 
-在**同一台 Linux 机器**上，让本地 AI 编码 agent 之间互相交接任务：把活交给另一个会话、请它复核、把结果回传，全程有账本可查。
+让本地 AI 编码 agent 会话之间互相交接任务：把活交给另一个会话、请它复核、把结果回传，全程有账本可查。支持 **Linux** 与**原生 Windows**；可选的跨设备协作经一个只做存储转发的 hub（SSH）。
 
 目前支持 **Codex CLI**（原生队列投递）、**Claude Code**（会话 socket 投递）与 **Grok Build**（只读，可作为发起方，不能作为收件目标）。
 
 ```console
-$ agent-bridge send --to codex@impl -m "实现 X，完成后请复核" --review-by claude@review
+$ agent-bridge peers                    # 列出可投递的会话；每行的 target= 可直接照抄
+$ agent-bridge send --to codex@id:<完整ID> -m "实现 X，完成后请复核" --review-by claude@id:<完整ID>
 $ agent-bridge status <任务ID>
-$ agent-bridge peers
 ```
 
 ## 它做什么
@@ -40,7 +40,7 @@ $ ln -s ~/.local/bin/agent-bridge ~/.local/bin/ab
 
 ### 与 AgentStatus 集成版共存
 
-本项目的代码同时以**内容快照**的形式随 [AgentStatus](https://github.com/paceaitian/agentstatus) 发布，那边的安装器会在 `~/.local/bin/ab` 建一条指向它自己 release 的符号链接，并把账本根绑定到 `~/.local/state/agentstatus/bridge`。
+本项目的代码同时以**内容快照**的形式随 AgentStatus（作者的桌面状态面板项目，未公开）发布，那边的安装器会在 `~/.local/bin/ab` 建一条指向它自己 release 的符号链接，并把账本根绑定到 `~/.local/state/agentstatus/bridge`。
 
 如果你两边都装：
 
@@ -57,11 +57,11 @@ $ ln -s ~/.local/bin/agent-bridge ~/.local/bin/ab
 | `AB_DEVICE` | 消息头里的设备名；默认取主机名第一段 |
 | `CODEX_HOME` / `GROK_HOME` / `AB_CLAUDE_SESSIONS_DIR` | 各 provider 的只读发现位置 |
 
-账本（`bridge.sqlite3`）里**含任务正文**，目录与文件都是 owner-only。只支持本机、同一用户。
+账本（`bridge.sqlite3`）里**含任务正文**，目录与文件都是 owner-only，只供本机同一用户读写。跨设备任务由 relay 经 hub 存储转发，发起设备的账本是该任务的权威，其他设备只保留镜像。
 
 ## 已知边界
 
-- **两个上游接口是逆向得到并按版本固定的**：Claude Code 的会话注册表 `~/.claude/sessions/<pid>.json` 与 `peerProtocol 1` socket；Codex 的原生队列（带 CLI 版本前缀校验）。**上游变动可能让投递失效**——`doctor` 会显示版本核对结果，失效时表现为「找不到目标」或「不支持的协议版本」，不会静默乱投。
+- **依赖上游未正式承诺稳定的本机接口**：Claude Code 的会话注册记录与 `peerProtocol 1` socket；Codex 的原生队列与 app-server。**上游变动可能让投递失效**——`doctor` 会报告检测到的上游版本（只记录，不设精确版本门），遇到不认识的形状时报「找不到目标」或「不支持的协议版本」，不会静默乱投。
 - Grok Build 目前**没有收件通道**，只能作为发起方；把它设成目标会在发送前被拒（`target_no_inbox`）。
 - 面板/桌面通知等集成属于 AgentStatus，不在本项目内；没有它也能完整使用命令行。
 - 消息投递依赖对方会话仍在运行；对方退出后消息不会补投，`status` 会提示。
@@ -72,7 +72,7 @@ $ ln -s ~/.local/bin/agent-bridge ~/.local/bin/ab
 $ PYTHONPATH=src python3 -m unittest discover -s tests -t tests
 ```
 
-无需第三方依赖、无需 tmux、无需 GNOME、无需安装 AgentStatus。
+无需第三方依赖、无需 tmux、无需 GNOME、无需安装 AgentStatus。Windows 上跑选择集：`python -B scripts/verify-bridge-windows.py`。
 
 **关于注释里的文档引用**：源码与测试里的 `DESIGN §45.x`、`docs/…` 指的是**上游 AgentStatus 仓库**的设计文档与说明，不是本仓库的文件。这批代码是从那里逐字节导入的（来源提交见 [`docs/import-manifest.json`](docs/import-manifest.json)），保留这些引用是为了让两边的实现史可追溯。
 
@@ -80,4 +80,4 @@ $ PYTHONPATH=src python3 -m unittest discover -s tests -t tests
 
 ## 许可
 
-尚未选定。本仓库目前是私有仓，公开前会补 LICENSE 并重新审一遍对外可见的标识符。
+尚未选定许可证。在补上 LICENSE 之前按默认版权处理（保留所有权利），公开仓库仅供阅读与参考。
