@@ -225,7 +225,7 @@
     "tests/test_bridge_worker_lock.py": "a024b857ba2a184179c0d435323144a28ba31755709c49654f0714a42bf1eb4c"
   },
   "source": {
-    "commit": "3d9366f38c896d147a7f0092f7560e8b1e994f04",
+    "commit": "f9e8d512b04621dc9a3364de04bdb4f93b23d9b5",
     "repository": "agentstatus"
   }
 }
