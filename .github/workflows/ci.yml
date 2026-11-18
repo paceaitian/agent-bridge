@@ -2,8 +2,10 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # ci/** 是上游合入前的验证分支：从上游候选导出、只为在真实 Windows 上先跑一遍，不合进 main
+    branches: [main, 'ci/**']
   pull_request:
+  workflow_dispatch:
 
 jobs:
   tests:
