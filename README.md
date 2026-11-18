@@ -61,7 +61,7 @@ $ ln -s ~/.local/bin/agent-bridge ~/.local/bin/ab
 
 ## 已知边界
 
-- **依赖上游未正式承诺稳定的本机接口**：Claude Code 的会话注册记录与 `peerProtocol 1` socket；Codex 的原生队列与 app-server。**上游变动可能让投递失效**——`doctor` 会报告检测到的上游版本（只记录，不设精确版本门），遇到不认识的形状时报「找不到目标」或「不支持的协议版本」，不会静默乱投。
+- **依赖上游未正式承诺稳定的本机接口**：Claude Code 的会话注册记录与 `peerProtocol 1` socket；Codex 的原生队列与 app-server。**上游变动可能让投递失效**——Codex 不设精确版本门（`doctor` 只记录 Codex CLI 版本，是否支持按上游实际应答判定），Claude 只认 `peerProtocol 1`；遇到不认识的形状时报「找不到目标」或「不支持的协议版本」，不会静默乱投。
 - Grok Build 目前**没有收件通道**，只能作为发起方；把它设成目标会在发送前被拒（`target_no_inbox`）。
 - 面板/桌面通知等集成属于 AgentStatus，不在本项目内；没有它也能完整使用命令行。
 - 消息投递依赖对方会话仍在运行；对方退出后消息不会补投，`status` 会提示。
