@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import calendar
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import math
 import re
 import time
 from typing import Any
@@ -72,7 +74,26 @@ def _age(timestamp: float | None, now: float) -> str:
 
 
 def _clock(timestamp: float) -> str:
+    """本机时区（含 TZ 环境变量）下的时刻，不带偏移；单独出现时用 _clock_with_offset。"""
     return time.strftime("%m-%d %H:%M:%S", time.localtime(timestamp))
+
+
+def _utc_offset(timestamp: float) -> str:
+    """该时刻在本机时区下的 UTC 偏移（如 UTC+08:00），按该时刻自身算，夏令时前后各自正确（§100.2）。
+
+    直接由 localtime 的各字段反推（timegm(本地字段) − 时刻），与 _clock 显示的时刻必然一致——Windows 上 TZ 被
+    C 运行库按它自己的规则解释时也照实标出，不另外绕开 TZ。
+    """
+    seconds = calendar.timegm(time.localtime(timestamp)) - math.floor(timestamp)
+    hours, rest = divmod(abs(seconds), 3600)
+    minutes, extra = divmod(rest, 60)
+    text = f"UTC{'-' if seconds < 0 else '+'}{hours:02d}:{minutes:02d}"
+    return f"{text}:{extra:02d}" if extra else text
+
+
+def _clock_with_offset(timestamp: float) -> str:
+    """单独出现的时刻：本机时区时刻加该时刻自身的 UTC 偏移。"""
+    return f"{_clock(timestamp)} {_utc_offset(timestamp)}"
 
 
 def _ref_document(ref: EndpointRef | None, names: NameBook = NO_NAMES) -> dict[str, object] | None:
@@ -304,7 +325,7 @@ def _print_task(
                 print(f"      | {line}")
     if hint.stopped_at is not None and view.current is not None:
         print(
-            f"提示：{names.text(view.current.target)} 这一轮已在 {_clock(hint.stopped_at)} 结束，但还没有汇报"
+            f"提示：{names.text(view.current.target)} 这一轮已在 {_clock_with_offset(hint.stopped_at)} 结束，但还没有汇报"
             f"（可能忘了运行 {cmd} report，或在等人回复）；可去对方会话查看或请它补报；确需重发用 "
             f"{cmd} retry {short(task.id)} --force（对方可能已在执行），不再需要可 {cmd} close {short(task.id)}"
         )
@@ -333,35 +354,48 @@ def _print_task(
         print(f"  原生撤回：{reason_text('withdraw_store_unreadable')}")
     for operation in withdrawals["operations"]:
         print(f"  原生撤回 #{operation['attemptSeq']}：{operation['state']}（{operation['reason']}），"
-              f"{_clock(operation['finishedAt'] or operation['createdAt'])}；不证明未执行")
+              f"{_clock_with_offset(operation['finishedAt'] or operation['createdAt'])}；不证明未执行")
         if operation["ownerStatus"] == "gone":
             print("    执行者已不在，下次 withdraw 恢复；当前仅显示，不改账本")
         elif operation["ownerStatus"] == "namespace_unverified":
             print("    执行者 PID 命名空间不可核对，不判死、不恢复")
     if step:
         print(f"下一步：{step}")
-    events = store.events(task.id, limit=20)
-    if events:
-        print("时间线：")
-        for event in events:
-            kind = str(event["kind"])
-            label = EVENT_LABELS.get(kind)
-            if label is None and kind.startswith("delivery_"):
-                label = reason_text(kind)
-            if label is None and kind.startswith("consumption_"):
-                try:
-                    label = CONSUMPTION_LABELS[Consumption(kind.removeprefix("consumption_"))] or kind
-                except ValueError:
-                    label = kind
-            detail = event["detail"] if isinstance(event["detail"], dict) else {}
-            extra = detail.get("note") or detail.get("text") or reason_text(detail.get("reason"))
-            if kind == 'notification_skipped' and detail.get('reason') in CAPACITY_CODES:
-                extra = notification_capacity_hint(detail['reason'])
-            elif kind == 'review_skipped_capacity' and detail.get('reason') in CAPACITY_CODES:
-                extra = review_capacity_hint(detail['reason'])
-            suffix = f"：{str(extra)[:160]}" if extra else ""
-            seq = f" #{event['attemptSeq']}" if event["attemptSeq"] else ""
-            print(f"  {_clock(float(event['at']))}{seq} {label or kind}{suffix}")
+    for line in _timeline_lines(store.events(task.id, limit=20)):
+        print(line)
+
+
+def _timeline_lines(events: Sequence[Mapping[str, Any]]) -> list[str]:
+    """`ab status` 时间线的文字行（含标题）；没有事件时为空。
+
+    时刻按本机时区（含 TZ）显示：整条时间线偏移相同时只在标题标一次，跨夏令时等偏移不同时逐行标（§100.2）。
+    """
+    if not events:
+        return []
+    offsets = [_utc_offset(float(event["at"])) for event in events]
+    uniform = len(set(offsets)) == 1
+    rows = [f"时间线（{offsets[0]}）：" if uniform else "时间线："]
+    for event, offset in zip(events, offsets):
+        kind = str(event["kind"])
+        label = EVENT_LABELS.get(kind)
+        if label is None and kind.startswith("delivery_"):
+            label = reason_text(kind)
+        if label is None and kind.startswith("consumption_"):
+            try:
+                label = CONSUMPTION_LABELS[Consumption(kind.removeprefix("consumption_"))] or kind
+            except ValueError:
+                label = kind
+        detail = event["detail"] if isinstance(event["detail"], dict) else {}
+        extra = detail.get("note") or detail.get("text") or reason_text(detail.get("reason"))
+        if kind == 'notification_skipped' and detail.get('reason') in CAPACITY_CODES:
+            extra = notification_capacity_hint(detail['reason'])
+        elif kind == 'review_skipped_capacity' and detail.get('reason') in CAPACITY_CODES:
+            extra = review_capacity_hint(detail['reason'])
+        suffix = f"：{str(extra)[:160]}" if extra else ""
+        seq = f" #{event['attemptSeq']}" if event["attemptSeq"] else ""
+        stamp = _clock(float(event["at"])) if uniform else f"{_clock(float(event['at']))} {offset}"
+        rows.append(f"  {stamp}{seq} {label or kind}{suffix}")
+    return rows
 
 
 def _closure_document(outcome: ClosureOutcome, names: NameBook = NO_NAMES) -> dict[str, object]:

@@ -19,8 +19,11 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import bridge_support  # noqa: F401  导入即隔离宿主会话环境
 
@@ -38,6 +41,10 @@ from agentstatus_bridge.federation.transport import StreamTransport
 from agentstatus_bridge.ids import new_id
 
 T0 = 1_800_000_000_000
+# §100.1：计数与 GC 租约类用例的会话用「安静 tick」——用例期间会话不跑周期任务（fence 复核、GC 竞争），
+# commitCounter 与租约只由用例自己的动作决定。默认 0.05 秒 tick 下，负载把主线程拖过首个 tick 时周期 GC
+# 会提交一次并占租约（2026-11-13 CI 的 7 != 6）
+QUIET_TICK = 3600.0
 LEDGER_A = "1" * 32
 LEDGER_B = "2" * 32
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -174,11 +181,42 @@ class HubTestCase(unittest.TestCase):
         self.sessions.append((thread, client))
         return Client(client), result
 
-    def ready(self, name: str, key: str, ledger: str) -> Client:
-        client, _ = self.connect(name, key)
+    def ready(self, name: str, key: str, ledger: str, *, tick: float = 0.05) -> Client:
+        client, _ = self.connect(name, key, tick=tick)
         reply = client.handshake(ledger)
         self.assertEqual(reply["type"], "ready", reply)
         return client
+
+
+    @contextmanager
+    def periodic_window(self) -> Iterator[Callable[[], None]]:
+        """强制时序（§100.1）：返回的 pause() 让主线程在读起始计数（或首次自调 gc）处停最多 0.5 秒，等会话的周期任务；
+        窗口里只要有会话调过一次 _periodic 就判失败（安静 tick 下用例期间不应有任何周期任务）。
+
+        只看「窗口里有没有周期调用」而不看是否恰好提交：主线程在装 patch 之前就被拖过 0.05 秒时，首轮 GC 可能已在
+        读计数前提交，但默认 tick 的会话每 0.05 秒都会再调 _periodic，照样被这里抓到（§100 r1，两方审计 P3-1）。
+        第一次之外的周期调用挂起到窗口之后，免得失败时窗口里多次提交。"""
+        done, release, lock, claimed = threading.Event(), threading.Event(), threading.Lock(), []
+        original = HubSession._periodic
+
+        def periodic(session: HubSession) -> bool:
+            with lock:
+                first = not claimed
+                claimed.append(session)
+            if not first:
+                release.wait(1)  # 有上限：失败时也不拖住 tearDown
+            try:
+                return original(session)
+            finally:
+                done.set()
+        def pause() -> None:
+            if done.wait(0.5) or claimed:
+                self.fail("periodic ran during the test")
+        with patch.object(HubSession, "_periodic", periodic):
+            try:
+                yield pause
+            finally:
+                release.set()
 
 
 class AuthAndFenceTests(HubTestCase):
@@ -316,17 +354,6 @@ class MailboxTests(HubTestCase):
         self.assertEqual(len([f for f in frames if f["type"] == "item"]), 16)
         self.assertEqual((frames[-1]["scannedThrough"], frames[-1]["more"]), (16, True))
 
-    def test_commit_counter_one_per_write(self) -> None:
-        start = self.store.read_counter()
-        self.a.one("heartbeat")
-        self.assertEqual(self.store.read_counter(), start + 1)
-        reply = self.b.one("fetch", after=0)
-        self.assertEqual(reply["commitCounter"], start + 1)  # 读不递增，回复带同快照值
-        self.a.one("submit", envelope=envelope(self.dev_a, self.dev_b))
-        self.assertEqual(self.store.read_counter(), start + 2)
-        self.assertEqual(self.a.one("submit", envelope=envelope(self.dev_a, "9" * 32)).get("code"), "destination_unknown")
-        self.assertEqual(self.store.read_counter(), start + 2)  # 回滚的事务不计数
-
     def test_storage_full_no_l1(self) -> None:
         self.free = 1024
         msg = envelope(self.dev_a, self.dev_b)
@@ -361,11 +388,41 @@ class MailboxTests(HubTestCase):
         self.assertEqual((beat["directoryRevision"], beat["directoryDigest"]), (1, ack["digest"]))
 
 
+class CommitCounterTests(HubTestCase):
+    """commitCounter 每个写事务恰好加一；会话用安静 tick，计数只由用例自己的动作决定（§100.1）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.a = self.ready("vm", self.key_a, LEDGER_A, tick=QUIET_TICK)
+        self.b = self.ready("win", self.key_b, LEDGER_B, tick=QUIET_TICK)
+
+    def check_counter(self, pause: Callable[[], None] = lambda: None) -> None:
+        start = self.store.read_counter()
+        pause()
+        self.a.one("heartbeat")
+        self.assertEqual(self.store.read_counter(), start + 1)
+        reply = self.b.one("fetch", after=0)
+        self.assertEqual(reply["commitCounter"], start + 1)  # 读不递增，回复带同快照值
+        self.a.one("submit", envelope=envelope(self.dev_a, self.dev_b))
+        self.assertEqual(self.store.read_counter(), start + 2)
+        self.assertEqual(self.a.one("submit", envelope=envelope(self.dev_a, "9" * 32)).get("code"), "destination_unknown")
+        self.assertEqual(self.store.read_counter(), start + 2)  # 回滚的事务不计数
+
+    def test_commit_counter_one_per_write(self) -> None:
+        self.check_counter()
+
+    def test_commit_counter_holds_when_the_main_thread_stalls(self) -> None:
+        # 强制时序：读起始计数后主线程停住，直到会话跑完一次周期任务（默认 tick 下必然 7 != 6）
+        with self.periodic_window() as pause:
+            self.check_counter(pause)
+
+
 class BlobTests(HubTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.a = self.ready("vm", self.key_a, LEDGER_A)
-        self.b = self.ready("win", self.key_b, LEDGER_B)
+        # GC 类用例自己竞争租约：会话不得在用例中途抢租约或先回收（§100.1，同一窗口）
+        self.a = self.ready("vm", self.key_a, LEDGER_A, tick=QUIET_TICK)
+        self.b = self.ready("win", self.key_b, LEDGER_B, tick=QUIET_TICK)
 
     def upload(self, data: bytes) -> dict[str, Any]:
         sha = hashlib.sha256(data).hexdigest()
@@ -472,10 +529,19 @@ class BlobTests(HubTestCase):
         self.assertEqual(self.a.one("receipts_get", after=0).get("code"), "cursor_gap")
         self.assertTrue(self.b.request("fetch", after=0)[-1]["gap"])
 
-    def test_gc_lease(self) -> None:
+    def check_gc_lease(self, pause: Callable[[], None] = lambda: None) -> None:
+        pause()
         self.assertIsNotNone(self.store.gc(now=T0, owner="x"))
         self.assertIsNone(self.store.gc(now=T0 + 1, owner="y"))
         self.assertIsNotNone(self.store.gc(now=T0 + 200_000, owner="y"))
+
+    def test_gc_lease(self) -> None:
+        self.check_gc_lease()
+
+    def test_gc_lease_holds_when_the_main_thread_stalls(self) -> None:
+        # 强制时序：首次自调 gc 前主线程停住，直到会话跑完一次周期任务（默认 tick 下会话先占租约）
+        with self.periodic_window() as pause:
+            self.check_gc_lease(pause)
 
 
 class SchemaTests(HubTestCase):

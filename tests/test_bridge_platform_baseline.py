@@ -187,6 +187,7 @@ def record_linux():
         sent = json.loads(command('send', '--to', 'codex@id:' + THREAD, '--no-wait', '--json', '-m', 'synthetic'))
         task_id = sent['id']
         command('tasks'); command('tasks', '--json')
+        # §100.2 起时间线标题标出本机 UTC 偏移（夹具 TZ=UTC → UTC+00:00），按原样定点改进 golden（outputs[5]）
         command('status', task_id); command('status', task_id, '--json')
         command('summary', '--refresh', '--json')
         command('doctor'); command('doctor', '--json')

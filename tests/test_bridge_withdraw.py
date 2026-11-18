@@ -551,6 +551,8 @@ class WithdrawalLedgerTests(LedgerCase):
             with contextlib.redirect_stdout(output):
                 views._print_task(self.store, self.task, now=150, show_body=False)
             self.assertIn("执行者已不在，下次 withdraw 恢复", output.getvalue())
+            # §100.2：单独出现的时刻带该时刻自身的 UTC 偏移
+            self.assertRegex(output.getvalue(), r"原生撤回 #1：.*，\d\d-\d\d \d\d:\d\d:\d\d UTC[+-]\d\d:\d\d；不证明未执行")
             self.assertEqual(self.store.ledger_revision(), revision)
             self.assertEqual(rows[0]["state"], "prepared")
             with patch.object(cli, "_observations", return_value=([], cli.ObserverView())):

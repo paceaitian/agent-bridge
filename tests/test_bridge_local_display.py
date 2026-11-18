@@ -1,9 +1,19 @@
 """§85 本机显示与协议分开（§91.4.2 起名字统一经 NameView）；只用合成端点，不连接 provider。"""
+import calendar
 from contextlib import redirect_stdout
 from dataclasses import replace
 from io import StringIO
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import bridge_support
 from agentstatus_bridge import cli, envelope, reports, views
@@ -205,3 +215,150 @@ class LocalDisplayTests(unittest.TestCase):
         # EndpointRef 的 display/token 不全局改（§91.4.2）；只是新输出不再用它们
         self.assertEqual(ORIGIN.display(), 'codex@回复 W3-ONE')
         self.assertEqual(RECEIVER.token(), 'claude@vm-claude')
+
+
+ROOT = Path(__file__).resolve().parents[1]
+# 由显示的时刻与偏移反推 UTC：两者必须一致（§100.2「偏移与显示的时刻一致」）
+CLOCK = re.compile(r'(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d) UTC([+-])(\d\d):(\d\d)(?::(\d\d))?')
+NOV_12_16Z = 1794499200      # 2026-11-12T16:00:00Z
+JAN_15_12Z = 1768478400      # 2026-01-15T12:00:00Z（美国标准时间段，远离切换日）
+JUL_01_12Z = 1782907200      # 2026-07-01T12:00:00Z（美国夏令时段，远离切换日）
+DST_END = 1793523600         # 2026-11-01T09:00:00Z：美国太平洋时间 02:00 PDT 回拨到 01:00 PST
+
+
+def zoned(tz: str, *stamps: float) -> list[str]:
+    """在设了 TZ 的子进程里格式化（Windows 没有 time.tzset，进程内改 TZ 不生效，两平台统一用子进程）。"""
+    env = {key: value for key, value in os.environ.items() if key.upper() != 'TZ'}
+    env.update(TZ=tz, PYTHONPATH=str(ROOT / 'src'))
+    script = ('import json, sys; from agentstatus_bridge import views; '
+              'print(json.dumps([views._clock_with_offset(float(t)) for t in sys.argv[1:]]))')
+    done = subprocess.run([sys.executable, '-c', script, *map(str, stamps)], env=env, capture_output=True,
+                          text=True, timeout=60)
+    if done.returncode != 0:
+        raise AssertionError(done.stderr[-2000:])
+    return json.loads(done.stdout)
+
+
+def utc_of(shown: str, year: int) -> int:
+    """把「MM-DD HH:MM:SS UTC±HH:MM[:SS]」按偏移换回 UTC 秒。"""
+    match = CLOCK.fullmatch(shown)
+    if match is None:
+        raise AssertionError(f'unexpected clock text {shown!r}')
+    month, day, hour, minute, second, sign, off_h, off_m, off_s = match.groups()
+    local = calendar.timegm((year, int(month), int(day), int(hour), int(minute), int(second)))
+    offset = int(off_h) * 3600 + int(off_m) * 60 + int(off_s or 0)
+    return local - (offset if sign == '+' else -offset)
+
+
+class ClockOffsetTests(unittest.TestCase):
+    """§100.2：面向人的绝对时刻按本机时区（含 TZ）显示并标出该时刻自身的 UTC 偏移；--json 不受影响。
+
+    期望按平台写：Linux（glibc）认 POSIX 写法与 IANA 名（需 tzdata）；Windows 由 C 运行库按 `tzn[+|-]hh[:mm][dzn]`
+    解释 TZ（带夏令时名时按美国规则），不认 IANA 名——那时只断言偏移与显示的时刻一致，不断言具体偏移。
+    """
+
+    def assert_consistent(self, tz: str, stamps: tuple[float, ...], shown: list[str]) -> None:
+        for stamp, text in zip(stamps, shown):
+            with self.subTest(tz=tz, stamp=stamp):
+                self.assertEqual(utc_of(text, time.gmtime(stamp).tm_year), math.floor(stamp))
+
+    def test_portable_zones_show_the_offset_of_each_moment(self):
+        # 账本里的事件时刻是小数（events.at REAL）：带 .7、.75 的时刻显示与偏移都按向下取整的那一秒（§100 r1）
+        cases = {
+            'UTC': {NOV_12_16Z: '11-12 16:00:00 UTC+00:00'},
+            'UTC0': {NOV_12_16Z: '11-12 16:00:00 UTC+00:00'},
+            'CST-8': {NOV_12_16Z: '11-13 00:00:00 UTC+08:00', NOV_12_16Z + 0.7: '11-13 00:00:00 UTC+08:00'},
+            'IST-5:30': {NOV_12_16Z: '11-12 21:30:00 UTC+05:30'},
+            # 负的非整点偏移（纽芬兰）：符号与分钟要一起取（§100 r1，Opus P3-3）
+            'NST3:30': {NOV_12_16Z: '11-12 12:30:00 UTC-03:30', NOV_12_16Z + 0.7: '11-12 12:30:00 UTC-03:30'},
+            # 有夏令时的时区：偏移按该时刻自身算，同一进程里一月与七月各不相同
+            'PST8PDT': {JAN_15_12Z: '01-15 04:00:00 UTC-08:00', JUL_01_12Z + 0.75: '07-01 05:00:00 UTC-07:00'},
+        }
+        for tz, expected in cases.items():
+            stamps = tuple(expected)
+            shown = zoned(tz, *stamps)
+            with self.subTest(tz=tz):
+                self.assertEqual(shown, list(expected.values()))
+            self.assert_consistent(tz, stamps, shown)
+
+    def test_named_zones_and_the_exact_dst_boundary(self):
+        stamps = (NOV_12_16Z, DST_END - 1, DST_END, JUL_01_12Z)
+        if os.name == 'nt':
+            # Windows C 运行库不认 IANA 名（按自身规则解析成别的偏移）：只要求显示的偏移与时刻一致
+            for tz in ('Asia/Shanghai', 'America/Los_Angeles'):
+                self.assert_consistent(tz, stamps, zoned(tz, *stamps))
+            return
+        # POSIX 规则写法不依赖 tzdata：回拨前一秒仍是 PDT，回拨那一刻起是 PST
+        rule = zoned('PST8PDT,M3.2.0,M11.1.0', DST_END - 1, DST_END)
+        self.assertEqual(rule, ['11-01 01:59:59 UTC-07:00', '11-01 01:00:00 UTC-08:00'])
+        self.assert_consistent('PST8PDT,M3.2.0,M11.1.0', (DST_END - 1, DST_END), rule)
+        zoneinfo = Path('/usr/share/zoneinfo')
+        if not (zoneinfo / 'Asia' / 'Shanghai').is_file() or not (zoneinfo / 'America' / 'Los_Angeles').is_file():
+            self.skipTest('POSIX-only: 本机没有 tzdata，IANA 名用例跳过')
+        self.assertEqual(zoned('Asia/Shanghai', NOV_12_16Z), ['11-13 00:00:00 UTC+08:00'])
+        self.assertEqual(zoned('America/Los_Angeles', *stamps), [
+            '11-12 08:00:00 UTC-08:00', '11-01 01:59:59 UTC-07:00', '11-01 01:00:00 UTC-08:00',
+            '07-01 05:00:00 UTC-07:00'])
+
+    @staticmethod
+    def fake_zone(switch: float, before: int, after: int):
+        """进程内假时区：switch 之前偏移 before 秒、之后 after 秒（两平台一致，不依赖 TZ）。"""
+        def localtime(value: float | None = None) -> time.struct_time:
+            stamp = time.time() if value is None else value
+            return time.gmtime(math.floor(stamp) + (before if stamp < switch else after))
+        return localtime
+
+    @staticmethod
+    def fake_window(start: float, end: float, inside: int, outside: int):
+        """进程内假时区：[start, end) 之内偏移 inside 秒、之外 outside 秒（用来造 A-B-A 偏移序列）。"""
+        def localtime(value: float | None = None) -> time.struct_time:
+            stamp = time.time() if value is None else value
+            return time.gmtime(math.floor(stamp) + (inside if start <= stamp < end else outside))
+        return localtime
+
+    def events(self, *stamps: float) -> list[dict[str, object]]:
+        return [{'attemptSeq': index + 1, 'at': stamp, 'kind': 'created' if index == 0 else 'progress',
+                 'detail': {}} for index, stamp in enumerate(stamps)]
+
+    def test_timeline_marks_one_offset_in_the_title(self):
+        with patch.object(views.time, 'localtime', self.fake_zone(0, 8 * 3600, 8 * 3600)):
+            lines = views._timeline_lines(self.events(NOV_12_16Z + 0.75, NOV_12_16Z + 61.75))
+        self.assertEqual(lines, ['时间线（UTC+08:00）：', '  11-13 00:00:00 #1 创建任务', '  11-13 00:01:01 #2 进展'])
+
+    def test_timeline_across_a_dst_change_marks_each_row(self):
+        with patch.object(views.time, 'localtime', self.fake_zone(DST_END, -7 * 3600, -8 * 3600)):
+            lines = views._timeline_lines(self.events(DST_END - 0.25, DST_END + 0.75))
+        self.assertEqual(lines, ['时间线：', '  11-01 01:59:59 UTC-07:00 #1 创建任务', '  11-01 01:00:00 UTC-08:00 #2 进展'])
+        self.assertEqual(views._timeline_lines([]), [])
+
+    def test_timeline_with_offsets_a_b_a_marks_each_row(self):
+        # 首尾偏移相同、中间不同（例如两次切换之间）：仍逐行标，不能只比首尾（§100 r1，Fable A4）
+        with patch.object(views.time, 'localtime', self.fake_window(DST_END, DST_END + 7200, -8 * 3600, -7 * 3600)):
+            lines = views._timeline_lines(self.events(DST_END - 1, DST_END, DST_END + 7200))
+        self.assertEqual(lines, ['时间线：', '  11-01 01:59:59 UTC-07:00 #1 创建任务', '  11-01 01:00:00 UTC-08:00 #2 进展',
+                                 '  11-01 04:00:00 UTC-07:00 #3 进展'])
+
+    def test_single_moments_carry_their_own_offset(self):
+        with patch.object(views.time, 'localtime', self.fake_zone(DST_END, -7 * 3600, -8 * 3600)):
+            self.assertEqual(views._clock_with_offset(DST_END - 0.25), '11-01 01:59:59 UTC-07:00')
+            self.assertEqual(views._clock_with_offset(DST_END + 3600.75), '11-01 02:00:00 UTC-08:00')
+            self.assertEqual(views._utc_offset(DST_END - 0.75), 'UTC-07:00')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX-only: 用 Linux 临时账本渲染 ab status 文字')
+    def test_status_text_marks_the_stopped_hint_and_the_timeline(self):
+        from tempfile import TemporaryDirectory
+        from agentstatus_bridge.store import Store
+        with TemporaryDirectory() as temporary, Store.open(Path(temporary) / 'bridge') as store:
+            task, _ = store.create_task(title='fixture', flow=Flow.HANDOFF, origin=None, origin_class=None, reviewer=None,
+                                        target=RECEIVER, body='synthetic', refs=[], now=NOV_12_16Z)
+            out = StringIO()
+            with patch.object(views.time, 'localtime', self.fake_zone(0, 8 * 3600, 8 * 3600)), redirect_stdout(out):
+                views._print_task(store, task, now=NOV_12_16Z + 600, show_body=False,
+                                  hint=views._TargetHint(stopped_at=NOV_12_16Z + 300, missing=False))
+            text = out.getvalue()
+            self.assertIn('这一轮已在 11-13 00:05:00 UTC+08:00 结束', text)
+            self.assertIn('\n时间线（UTC+08:00）：\n  11-13 00:00:00 #1 ', text)
+            out = StringIO()
+            with redirect_stdout(out):
+                print(json.dumps(views._task_document(store, task), sort_keys=True))
+            self.assertNotIn('UTC+', out.getvalue())  # --json 文档不变：仍是原有的 epoch 字段
