@@ -11,18 +11,21 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from ..transports.codex_rpc import STEER_PATHS, STEER_REJECTED_CODES
+from ..native_names import UUID_SHAPE, copyable, remote_display
 from ..model import (
     Attempt,
     Consumption,
     Delivery,
     EndpointRef,
     Flow,
+    NameSource,
     ReportKind,
     Role,
     Task,
     Verdict,
     Work,
 )
+from .codec import is_slug
 from .fedstore import FedAttempt, FedTask, notice_options
 from .refs import TargetRef
 
@@ -49,13 +52,20 @@ def remote_text(target: TargetRef, device: str) -> str:
     """跨设备目标的人读文本（§91.4.2）：`<设备> 上的 provider@id:<完整ID>`；有对端已核实主名时写成
     `<设备> 上的 provider@名字 target=--device <设备> --to provider@id:<完整ID>`——名字只作旁注，可复制的是全限定 target。
 
-    `device` 须是可复制的设备引用（登记 slug，没有就是完整 deviceId）。不用 8 位短 ID：这里没有对端完整候选全集。
+    `device` 是 commands.device_name 的值（登记 slug，没有就是完整 deviceId）。不用 8 位短 ID：这里没有对端完整候选全集。
+    设备名、会话 ID 与对端主名都来自远端，与 peers 文字行同一套处理（§101.1）：设备名与 `provider@id:<ID>` 经
+    remote_display 转义；target 只在 ID 是 UUID 形状时给出，--device 不是 slug 时改用完整 deviceId；主名过不了 copyable
+    （含会被改动的字符等）就不作旁注，只写完整 ID。
     """
     remote = target.remote
-    full = f"{remote.provider.value}@id:{remote.native_id}"
-    if remote.display_label:
-        return f"{device} 上的 {remote.provider.value}@{remote.display_label} target=--device {device} --to {full}"
-    return f"{device} 上的 {full}"
+    token = f"{remote.provider.value}@id:{remote.native_id}"
+    full = remote_display(token) or token
+    shown = remote_display(device) or remote.device_id
+    label = remote.display_label
+    if label and copyable(NameSource("named", label)) and UUID_SHAPE.fullmatch(remote.native_id):
+        reference = device if is_slug(device) else remote.device_id
+        return f"{shown} 上的 {remote.provider.value}@{label} target=--device {reference} --to {full}"
+    return f"{shown} 上的 {full}"
 
 
 def is_display_only(ref: EndpointRef) -> bool:

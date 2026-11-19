@@ -283,6 +283,8 @@ def _observations() -> tuple[list[Endpoint], ObserverView]:
 
 
 def cmd_peers(args: argparse.Namespace) -> int:
+    # 显式空的 --device 不静默列出本机（§101.2，与 send/retry 同一拒绝）
+    _reject_blank_selectors(args, ("device",))
     # Windows 的不带参数与 --all-devices 都在 _run_command 的 Windows 分支里处理（§94.6），到不了这里
     if args.device:
         return _fed_peers(args)
@@ -533,19 +535,42 @@ def _read_body(args: argparse.Namespace) -> str:
             raise CliError("file_unreadable") from error
         if data is None:
             raise CliError("message_too_large")
-        if get_platform().name == 'windows':
-            return _windows_body(data)
-        return data.decode("utf-8", errors="replace")
+        return _strict_body(data)
     if args.message == "-" or (args.message is None and not sys.stdin.isatty()):
-        if get_platform().name == 'windows':
-            return _windows_body(sys.stdin.buffer.read(MAX_BODY_BYTES + 1))
-        return sys.stdin.read(MAX_BODY_BYTES + 1)
+        return _strict_body(sys.stdin.buffer.read(MAX_BODY_BYTES + 1))
     if args.message is None:
         raise CliError("empty_message")
-    return args.message
+    return args.message  # 编码不成 UTF-8 的 -m 文本已在 _main 的统一参数检查里拒绝（§101.2）
 
 
-def _windows_body(data: bytes) -> str:
+def _utf8_encodable(text: str) -> bool:
+    try:
+        text.encode('utf-8')
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _unencodable_argument(args: argparse.Namespace) -> str | None:
+    """命令行参数的统一 UTF-8 检查（§101.2）：解析后、任何读写之前，找出编码不成 UTF-8 的 str 参数（Linux argv 里的
+    非法字节经 surrogateescape、Windows 命令行的孤立代理），否则它们会在写账本或输出时抛 UnicodeEncodeError。
+    正文 -m 报 message_invalid_utf8，其余参数报 argument_invalid_utf8，退出码都是 3；没有返回 None。
+    例外：send/note 的 --file 只是正文来源路径，只交给文件系统打开、不保存不显示，非 UTF-8 文件名照常可用。
+    """
+    values = vars(args)
+    for key in ('message', *sorted(name for name in values if name != 'message')):
+        value: object = values.get(key)
+        if key == 'file' and isinstance(value, str):
+            continue
+        items: list[object] = list(value) if isinstance(value, list) else [value]  # pyright: ignore[reportUnknownArgumentType]
+        if any(isinstance(item, str) and not _utf8_encodable(item) for item in items):
+            return 'message_invalid_utf8' if key == 'message' else 'argument_invalid_utf8'
+    return None
+
+
+def _strict_body(data: bytes) -> str:
+    """正文按原始字节严格 UTF-8 解码，两平台同一判定（§77.14、§101.2）：超过 MAX_BODY_BYTES 报 message_too_large，
+    非法 UTF-8 报 message_invalid_utf8，都退出 3、都在落账前；不按本机编码猜、不替换字符，BOM 保留为 U+FEFF。"""
     if len(data) > MAX_BODY_BYTES:
         raise CliError('message_too_large')
     try:
@@ -575,7 +600,19 @@ def _delivery_exit(delivery: Delivery) -> int:
     return EXIT_OK
 
 
+def _reject_blank_selectors(args: argparse.Namespace, names: tuple[str, ...]) -> None:
+    """显式给出空串或只有空白的目标类参数与 `--to ""` 同一拒绝（§101.2）：报 target_explicit_required/2，不静默当作
+    没给（例如 --review-by "" 降为 handoff、--device "" 变成本机任务、retry --to "" 变成不改派）；两平台同码同退出码，
+    调用方放在其他参数检查、读正文与任何读写之前。"""
+    for name in names:
+        value = getattr(args, name, None)
+        if isinstance(value, str) and not value.strip():
+            raise CliError("target_explicit_required", EXIT_TARGET)
+
+
 def cmd_send(args: argparse.Namespace) -> int:
+    # --review-by/--device/--review-device 显式空值不静默忽略（Windows 的 --review-by 由命令作用域先拒、同码同退出码）
+    _reject_blank_selectors(args, ("review_by", "device", "review_device"))
     # 一句话告知只建立即关闭的单向消息：只对工作有意义的参数一律互斥，任何写入之前拒绝（§95.5.7）
     if getattr(args, "fyi", False) and (args.review_by or args.review_device or args.no_notify):
         raise CliError("fyi_conflict", EXIT_TARGET)
@@ -1385,6 +1422,7 @@ def _rework_body(first: Attempt, current: Attempt, task: Task, extra: str | None
 
 
 def cmd_retry(args: argparse.Namespace) -> int:
+    _reject_blank_selectors(args, ("to", "device"))  # retry --to "" 不再静默变成不改派（§101.2）
     found = _fed_lookup(args, write=True)
     if found is not None:
         return _fed_retry(args, *found)
@@ -1889,16 +1927,17 @@ def _fed_task_list(include_finished: bool, now: float,
             target = "-"
             if view.current is not None:
                 row = next((item for item in document["attempts"] if item["seq"] == view.current.seq), None)
-                where = f"{row['targetDeviceName']}:" if row is not None else ""
-                target = where + NO_NAMES.text(view.current.target)  # 跨设备：设备名 + 完整 ID，不用对端名字（§91.4.2）
-            role = "本机发起" if task.is_authority else f"发起设备 {document['authorityDeviceName']}"
+                where = f"{fed.device_text(row['targetDeviceName'])}:" if row is not None else ""
+                # 跨设备：设备名 + 完整 ID，不用对端名字（§91.4.2）；ID 可能来自远端，同 peers 文字行转义（§101.1）
+                target = where + fed.target_text(NO_NAMES.text(view.current.target))
+            role = "本机发起" if task.is_authority else f"发起设备 {fed.device_text(document['authorityDeviceName'])}"
             flag = "，需处理：远端离线/传输未恢复" if document["stalled"] else ""
             phase, reason = PHASE_LABELS[view.phase], fed.reason_label(rt, task, view)
             rows = document["attempts"]
             if task.is_fyi and isinstance(rows, list) and rows:
                 # 一句话告知（§95.5.7）：阶段列写「告知」，目标取那条告知，原因写投递状态
                 first = rows[0]
-                target = f"{first['targetDeviceName']}:{first['target']}"
+                target = f"{fed.device_text(first['targetDeviceName'])}:{fed.target_text(first['target'])}"
                 phase, reason = FYI_LABEL, f"投递 {first['delivery']}"
             lines.append(f"{short(task.task_id)}  {phase:<4} {target:<28} {task.title[:40]}"
                          f"  （跨设备·{role}，{reason}{flag}，{_age(task.last_sync_at / 1000, now)}）")
@@ -2428,6 +2467,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
     _worker_ensured = False
     raw = list(sys.argv[1:] if argv is None else argv)
     args = build_parser(include_alias=bool(raw and raw[0] == 'alias')).parse_args(raw)
+    invalid = _unencodable_argument(args)
+    if invalid is not None:
+        # 先于平台解析、Windows 命令作用域、发现与任何读写（§101.2）
+        _report_error(args, invalid)
+        return EXIT_REJECTED
     try:
         platform = get_platform()
     except ValueError as error:

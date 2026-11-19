@@ -423,6 +423,22 @@ class MirrorPhaseTests(_MirrorCase):
         a_doc = document(self.a, self.root, task.task_id, T0 + 10)
         self.assertEqual(a_doc["attempts"][-1]["role"], "review")  # A 侧照旧按自己的尝试判
 
+    def test_hostile_origin_device_name_is_escaped_in_status_text(self) -> None:
+        # §101.1：登记名来自远端（hub 盖章或目录帧，relay 入库不校验）；status 文字里的发起设备名与「当前由 … 处理」
+        # 与 peers 文字行同一套转义，伪造不出新行；JSON 照给原值
+        task = self.review_elsewhere()
+        honest = lines(self.b, self.root, task.task_id, T0 + 10).splitlines()
+        hostile = "v\n设备 forged〔ffffffff〕：在线\x1b[2K\u202e\u200bm"
+        self.b.store.put_device_state(device_id=DEV_A, name=hostile, revision=0, snapshot={}, last_seen=None,
+                                      state="unknown")
+        text = lines(self.b, self.root, task.task_id, T0 + 10)
+        self.assertEqual(len(text.splitlines()), len(honest), text)
+        self.assertFalse(any(char in text for char in "\x1b\u202e\u200b"), text)
+        escaped = "v\\u000a设备 forged〔ffffffff〕：在线\\u001b[2K\\u202e\\u200bm"
+        self.assertIn(f"镜像（发起设备 {escaped}）", text)
+        self.assertIn(f"当前由 {escaped} 处理，完整状态以发起设备为准", text)
+        self.assertEqual(document(self.b, self.root, task.task_id, T0 + 10)["authorityDeviceName"], hostile)
+
     def test_p1_review_on_a_then_accepted_shows_done_on_mirror(self) -> None:
         # Opus 审计 P1：已结束的任务不套镜像规则。复核方在 A、A 验收后镜像显示 done/accepted，wait 返回 0
         task = self.review_elsewhere()

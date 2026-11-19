@@ -24,7 +24,7 @@ from ..ids import short
 from ..labels import FYI_LABEL, FYI_STATUS_LABEL, NOTE_LABEL, reason_text
 from ..model import PHASE_LABELS, Attempt, EndpointRef, Phase, Provider, ReportKind, Task, TaskView
 from ..naming import command_name
-from ..native_names import full_id_token
+from ..native_names import UUID_SHAPE, full_id_token, remote_display
 from ..platforms import process as procfs
 from ..platforms.factory import get_platform
 from ..platforms.types import Capability
@@ -42,7 +42,7 @@ from ..worker import ensure_worker
 from . import attachments, authority, budget, config as fed_config, directory, mirror
 from .attachments import AttachmentError, Frozen
 from .authority import Identity
-from .codec import is_hex32
+from .codec import is_hex32, is_slug
 from .errors import FedCliError
 from .fedstore import FED_DB_NAME, FederatedStore, FedAttempt, FedTask, load_dict, now_ms
 from .refs import TargetRef, WireActor
@@ -170,15 +170,30 @@ def remote_target(rt: Runtime, device: str, selector: str, *, now: int | None = 
         raise FedCliError(error.code, 2, hint=_candidate_hint(device, error.candidates, flags)) from error
 
 
+_PROVIDER_VALUES = frozenset(provider.value for provider in Provider)
+
+
+def _copyable_full_id(item: str) -> bool:
+    """候选 `provider@id:<ID>` 能否照抄：provider 属枚举、ID 是 UUID 形状（与 peers 文字行的 target= 同一判据，§101.1）。"""
+    provider, _, native = item.partition("@id:")
+    return provider in _PROVIDER_VALUES and UUID_SHAPE.fullmatch(native) is not None
+
+
 def _candidate_hint(device: str, candidates: tuple[str, ...], flags: tuple[str, str]) -> str | None:
     """名字未核实/不唯一时把候选给成可照抄的完整写法（§91.2.2「提示 peers --device 及全 ID」）；
-    设备引用不唯一时候选是完整 deviceId。参数名取调用方给的那一对，不固定写执行方的。"""
+    设备引用不唯一时候选是完整 deviceId。参数名取调用方给的那一对，不固定写执行方的。
+
+    候选来自远端目录（provider、nativeId）或缓存的 deviceId，与 peers 文字行同一口径（§101.1）：判得过的给照抄写法，
+    判不过的（provider 不在枚举、ID 不是 UUID、deviceId 不是 32 位十六进制）经 remote_display 转义、只作展示。"""
     if not candidates:
         return None
     device_flag, target_flag = flags
     if all("@id:" in item for item in candidates):
-        return "可选目标：" + "、".join(f"{device_flag} {device} {target_flag} {item}" for item in candidates)
-    return "可选设备：" + "、".join(f"{device_flag} {item}" for item in candidates)
+        return "可选目标：" + "、".join(
+            f"{device_flag} {device} {target_flag} {item}" if _copyable_full_id(item)
+            else f"{remote_display(item) or ''}（仅展示，不能作目标）" for item in candidates)
+    return "可选设备：" + "、".join(f"{device_flag} {item}" if is_hex32(item)
+                                 else f"{remote_display(item) or ''}（仅展示）" for item in candidates)
 
 
 def _actor(rt: Runtime, ref: EndpointRef) -> WireActor:
@@ -484,6 +499,17 @@ def device_name(rt: Runtime, device_id: str) -> str:
     return device_id  # 这个值会进 --origin-device/--device 等可复制命令：8 位前缀解析不了，用完整 deviceId
 
 
+def device_text(name: object) -> str:
+    """人读文字里的设备名（§101.1）：登记名来自远端，与 peers 文字行同一套转义；JSON 字段与 device_row 匹配仍用原值。"""
+    return remote_display(name) or ""
+
+
+def target_text(token: str) -> str:
+    """人读文字里由会话 ID 拼成的 `provider@id:<ID>`（§101.1）：远端 ID 只过了 refs 的空白/控制字符校验，RLO、零宽等
+    格式字符仍可能带进来，与 peers 文字行同一套转义；正常 UUID 原样不变，JSON 的 target 照给原值。"""
+    return remote_display(token) or token
+
+
 def display_attempts(rt: Runtime, task: FedTask) -> list[FedAttempt]:
     """显示与 `ab wait` 用的尝试：镜像上本机工作尝试的 work 改读读时推导值，权威端原样（§97.2 第 3 条）。"""
     return mirror.display_attempts(rt.store, task, device_id=rt.ident.device_id)
@@ -499,7 +525,7 @@ def reason_label(rt: Runtime, task: FedTask, view: TaskView) -> str:
     if view.reason == mirror.HANDLED_ON_OTHER_DEVICE:
         definition = mirror.current_definition(task)
         if definition is not None:
-            return f"当前由 {device_name(rt, definition.target.device_id)} 处理，完整状态以发起设备为准"
+            return f"当前由 {device_text(device_name(rt, definition.target.device_id))} 处理，完整状态以发起设备为准"
     return reason_text(view.reason)
 
 
@@ -635,7 +661,8 @@ def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False)
     """status 文本：权威/镜像、同步时间、网络 L0–L2、投递 L3、报告与 A 采纳 L4、附件逐项状态。"""
     document = task_document(rt, task, now=now, include_body=show_body)
     view = view_of(rt, task)
-    role = "本机发起（权威）" if task.is_authority else f"镜像（发起设备 {document['authorityDeviceName']}）"
+    origin = device_text(document["authorityDeviceName"])
+    role = "本机发起（权威）" if task.is_authority else f"镜像（发起设备 {origin}）"
     age = max(0, (now - task.last_sync_at) // 1000)
     flags = ("；需同步" if task.sync_required else "") + ("；仅本机已归档" if task.local_archived else "")
     state = (f"{FYI_STATUS_LABEL}（{_fyi_delivery(document)}）" if task.is_fyi
@@ -656,7 +683,7 @@ def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False)
         cause = f"（{'；'.join(causes)}）" if causes else ""
         label = (f"{NOTE_LABEL} #{row['seq']}" if row.get("noticeKind") == "note"
                  else f"{FYI_LABEL} #{row['seq']}" if row.get("noticeKind") == "fyi" else f"#{row['seq']} {row['role']}")
-        lines.append(f"  {label} → {row['targetDeviceName']} {row['target']}"
+        lines.append(f"  {label} → {device_text(row['targetDeviceName'])} {target_text(row['target'])}"
                      f"  网络 {network}  投递 {row['delivery']}{cause}{reported}")
         for item in row["attachments"]:
             where = f" {item['path']}" if "path" in item else ""
@@ -674,8 +701,10 @@ def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False)
         # 页脚只在本机当前尝试真能汇报时打印，判定与 B 端受理条件共用，命令按角色给（§98.2）；
         # 联邦页脚带 --origin-device：CLI 只据本机索引找发起设备，不读正文里的远端路径（§88.8）
         choices = (REVIEW_REPORT_CHOICES if target.role == "review" else HANDOFF_REPORT_CHOICES)
-        lines.append(f"汇报：{command_name()} report {short(task.task_id)} --origin-device "
-                     f"{document['authorityDeviceName']} {choices}")
+        # 页脚是可照抄的命令：登记名不是 slug 时改用完整 deviceId（--origin-device 两者都认），与 peers 的 target= 同口径（§101.1）
+        name = document["authorityDeviceName"]
+        reference = name if is_slug(name) else task.authority_device
+        lines.append(f"汇报：{command_name()} report {short(task.task_id)} --origin-device {reference} {choices}")
     return lines
 
 

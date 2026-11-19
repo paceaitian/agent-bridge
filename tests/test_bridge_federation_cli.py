@@ -640,6 +640,58 @@ class BoundaryTests(FedCliCase):
         self.assertEqual(code, cli.EXIT_TARGET, err)
         self.assertIn(f"可选设备：--review-device {DEV_C}、--review-device {'e' * 32}", err)
 
+    def test_remote_candidates_in_hints_are_escaped_and_only_valid_ones_are_copyable(self) -> None:
+        # §101.1 r1（opus2 P2-1）：候选来自远端目录，提示里与 peers 文字行同一口径——判得过的给照抄写法，provider 不在枚举、
+        # ID 不是 UUID、deviceId 不是 32 位十六进制的经转义只作展示；伪造不出新行、不带终端控制或倒排字符
+        forged = "\n设备 forged〔ffffffff〕：在线\x1b[2K\u202e\u200b"
+        escaped = "\\u000a设备 forged〔ffffffff〕：在线\\u001b[2K\\u202e\\u200b"
+        good, other = "019a0000-1111-7222-8333-44445555cccc", "019a0000-1111-7222-8333-44445555dddd"
+
+        def row(provider: str, native: str, *, verified: bool) -> dict[str, object]:
+            return {"provider": provider, "nativeId": native, "endpointId": native[:8].encode().hex().ljust(32, "0")[:32],
+                    "endpointRevision": 1, "inbox": True, "eligible": True, "namesVerified": verified, "name": "dup"}
+
+        def put(device_id: str, rows: list[dict[str, object]], providers: dict[str, bool]) -> None:
+            with self.store("vm") as store:
+                store.put_device_state(device_id=device_id, name="wsl", revision=1, snapshot={
+                    "endpoints": rows, "complete": True, "providers": providers, "namePolicy": "agent-native-v1"},
+                    last_seen=now_ms(), state="online")
+
+        def check(err: str) -> None:
+            self.assertFalse(any(char in err for char in "\x1b\u202e\u200b"), err)
+            self.assertFalse(any(line.startswith("设备 forged") for line in err.splitlines()), err)
+
+        put(DEV_C, [row("codex", good, verified=True), row("codex", good[:-4] + forged, verified=False)], {"codex": True})
+        code, _, err = self.run_on("vm", "send", "--device", "wsl", "--to", "codex@dup", "-m", "X", caller=as_agent(ORIGIN))
+        self.assertEqual(code, cli.EXIT_TARGET, err)
+        check(err)
+        self.assertIn(f"可选目标：--device wsl --to codex@id:{good}、codex@id:{good[:-4]}{escaped}（仅展示，不能作目标）", err)
+        # 完整 UUID 后接伪造尾巴：可照抄判定必须看整串（fullmatch），只看开头会把原始字符当可照抄写法打出（opus2 r1 P3）
+        put(DEV_C, [row("codex", other, verified=True), row("codex", good + forged, verified=False)], {"codex": True})
+        code, _, err = self.run_on("vm", "send", "--device", "wsl", "--to", "codex@dup", "-m", "X", caller=as_agent(ORIGIN))
+        self.assertEqual(code, cli.EXIT_TARGET, err)
+        check(err)
+        self.assertIn(f"codex@id:{good}{escaped}（仅展示，不能作目标）", err)
+        self.assertNotIn(f"--to codex@id:{good}\\u000a", err)
+        # provider 不在枚举的候选（新版对端）同样只作展示
+        put(DEV_C, [row("codex", good, verified=True), row("gemini" + forged, other, verified=True)],
+            {"codex": True, "gemini" + forged: True})
+        code, _, err = self.run_on("vm", "send", "--device", "wsl", "--to", "id:019a0000", "-m", "X", caller=as_agent(ORIGIN))
+        self.assertEqual(code, cli.EXIT_TARGET, err)
+        self.assertIn("target_ambiguous", err)
+        check(err)
+        self.assertIn(f"--device wsl --to codex@id:{good}", err)
+        self.assertIn(f"gemini{escaped}@id:{other}（仅展示，不能作目标）", err)
+        # 设备候选：不是 32 位十六进制的 deviceId 只作展示
+        put("e" * 31 + forged, [], {"codex": True})
+        code, _, err = self.run_on("vm", "send", "--device", "wsl", "--to", "codex@dup", "-m", "X", caller=as_agent(ORIGIN))
+        self.assertEqual(code, cli.EXIT_TARGET, err)
+        check(err)
+        self.assertIn("可选设备：", err)
+        self.assertIn(f"--device {DEV_C}", err)  # 候选顺序取决于缓存行序，不逐位比
+        self.assertIn(f"{'e' * 31}{escaped}（仅展示）", err)
+        self.assertNotIn(f"--device {'e' * 31}", err)
+
     def test_reviewer_defaults_to_origin_device_and_third_device_is_refused_before_write(self) -> None:
         code, out, err = self.run_on("vm", "send", "--device", "win", "--to", "codex@impl", "--review-by",
                                      "codex@review", "-m", "X", "--json", caller=as_agent(ORIGIN))
@@ -975,6 +1027,12 @@ class ListingTests(FedCliCase):
         code, out, _ = self.run_on("vm", "peers", "--device", "win", "--json")
         [device] = json.loads(out)["devices"]
         self.assertEqual((device["device"], device["peers"][0]["scope"]), ("win", "remote"))
+        # 显式空的 --device 与 send/retry 同一拒绝，不静默列出本机（§101.2，Opus r1 附注）
+        for blank in ("", " ", "\u3000"):
+            code, out, err = self.run_on("vm", "peers", "--device", blank)
+            self.assertEqual(code, cli.EXIT_TARGET, err)
+            self.assertIn("target_explicit_required", err)
+            self.assertEqual(out, "")
         self.assertNotIn("pid", device["peers"][0]["remoteRef"])
         code, out, err = self.run_on("vm", "peers", "--all-devices")
         self.assertEqual(code, 0, err)
@@ -995,6 +1053,130 @@ class ListingTests(FedCliCase):
         self.assertTrue(plain_document["peers"] and remote)
         self.assertEqual(text, "设备 vmbox（本机）：\n" + plain + "".join(line + "\n" for line in remote))
         self.assertEqual(document, {**plain_document, "devices": json.loads(json.dumps(devices))})
+
+    def test_hostile_remote_device_and_label_are_escaped_in_send_status_and_tasks(self) -> None:
+        # §101.1：远端设备名与对端主名进 send/status/tasks 文字前与 peers 文字行同一套转义；主名过不了 copyable 就不作旁注；
+        # target 的 --device 不是 slug 时改用完整 deviceId；JSON 照给原值
+        forged = "\n设备 forged〔ffffffff〕：在线\x1b[2K\u202e\u200b"
+        escaped = "\\u000a设备 forged〔ffffffff〕：在线\\u001b[2K\\u202e\\u200b"
+        with self.store("vm") as store:
+            [row] = store.device_states()
+            snapshot = dict(row["snapshot"])
+            snapshot["endpoints"] = [{**snapshot["endpoints"][0], "name": "im" + forged, "namesVerified": True}]
+            store.put_device_state(device_id=DEV_B, name="w" + forged, revision=2, snapshot=snapshot,
+                                   last_seen=now_ms(), state="online")
+        code, out, err = self.run_on("vm", "send", "--device", DEV_B, "--to", f"codex@id:{THREAD_B}", "-m", "X",
+                                     caller=as_agent(ORIGIN))
+        self.assertEqual(code, 0, err)
+        task_id = re.search(r"跨设备任务 (\S+) 已记录", out).group(1)  # type: ignore[union-attr]
+        self.assertIn(f"交给 w{escaped} 上的 codex@id:{THREAD_B}：", out)  # 主名含会被改动的字符：不作旁注
+        for argv in (("send-output",), ("status", task_id), ("tasks",)):
+            text = out if argv == ("send-output",) else self.run_on("vm", *argv)[1]
+            with self.subTest(argv=argv):
+                self.assertFalse(any(char in text for char in "\x1b\u202e\u200b"), text)
+                self.assertFalse(any(line.startswith("设备 forged") for line in text.splitlines()), text)
+                self.assertNotIn("im\n", text)
+        self.assertIn(f"→ w{escaped} codex@id:{THREAD_B}", self.run_on("vm", "status", task_id)[1])
+        self.assertIn(f"w{escaped}:codex@id:{THREAD_B}", self.run_on("vm", "tasks")[1])
+        document = json.loads(self.run_on("vm", "status", task_id, "--json")[1])
+        self.assertEqual(document["attempts"][0]["targetDeviceName"], "w" + forged)  # JSON 照给原值
+        # 主名是正常可复制名字、只有设备名异常：旁注照写，target 的 --device 退回完整 deviceId
+        with self.store("vm") as store:
+            snapshot["endpoints"] = [{**snapshot["endpoints"][0], "name": "impl", "namesVerified": True}]
+            store.put_device_state(device_id=DEV_B, name="w" + forged, revision=3, snapshot=snapshot,
+                                   last_seen=now_ms(), state="online")
+        code, out, err = self.run_on("vm", "send", "--device", DEV_B, "--to", f"codex@id:{THREAD_B}", "-m", "Y",
+                                     caller=as_agent(ORIGIN))
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"交给 w{escaped} 上的 codex@impl target=--device {DEV_B} --to codex@id:{THREAD_B}：", out)
+
+    def test_hostile_device_names_on_mirror_tasks_report_footer_and_fyi_rows(self) -> None:
+        # §101.1：B 侧镜像 tasks 的「发起设备 …」、status 汇报页脚的 --origin-device，与 A 侧 tasks 的告知行设备名
+        forged = "\n设备 forged〔ffffffff〕：在线\x1b[2K\u202e\u200b"
+        escaped = "\\u000a设备 forged〔ffffffff〕：在线\\u001b[2K\\u202e\\u200b"
+        task_id = self.delivered_task()
+        with self.store("win") as store:
+            store.put_device_state(device_id=DEV_A, name="v" + forged, revision=0, snapshot={}, last_seen=None,
+                                   state="unknown")
+        for argv in (("status", task_id), ("tasks",)):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_on("win", *argv, caller=as_agent(WORKER))
+                self.assertEqual(code, 0, err)
+                self.assertFalse(any(char in out for char in "\x1b\u202e\u200b"), out)
+                self.assertFalse(any(line.startswith("设备 forged") for line in out.splitlines()), out)
+                if argv[0] == "status":
+                    # 页脚是可照抄的命令：登记名不是 slug 时改用完整 deviceId（r1，opus2 P3-2）
+                    self.assertIn(f"report {task_id[:8]} --origin-device {DEV_A} ", out)
+                    self.assertIn(f"镜像（发起设备 v{escaped}）", out)
+                else:
+                    self.assertIn(f"跨设备·发起设备 v{escaped}，", out)
+        # 照抄页脚里的 --origin-device：解析端接受完整 deviceId
+        code, out, err = self.run_on("win", "report", task_id, "--origin-device", DEV_A, "--result", "--note", "完成",
+                                     caller=as_agent(WORKER))
+        self.assertEqual(code, 0, err)
+        with self.store("vm") as store:
+            [row] = store.device_states()
+            store.put_device_state(device_id=DEV_B, name="w" + forged, revision=2, snapshot=row["snapshot"],
+                                   last_seen=now_ms(), state="online")
+        code, out, err = self.run_on("vm", "send", "--device", DEV_B, "--to", f"codex@id:{THREAD_B}", "--fyi", "-m",
+                                     "Z", "--json", caller=as_agent(ORIGIN))
+        self.assertEqual(code, 0, err)
+        fyi = json.loads(out)["id"]
+        code, out, err = self.run_on("vm", "tasks", "--all")
+        self.assertEqual(code, 0, err)
+        [line] = [item for item in out.splitlines() if item.startswith(fyi[:8])]
+        self.assertIn(f"w{escaped}:codex@id:{THREAD_B}", line)
+        self.assertFalse(any(char in out for char in "\x1b\u202e\u200b"), out)
+
+    def test_remote_native_ids_are_escaped_in_send_status_and_tasks(self) -> None:
+        # §101.1：远端会话 ID 只过了 refs 的空白/控制字符校验，RLO、零宽、DEL 等可经名字解析带进任务；
+        # send 回显、status、tasks 文字里的 provider@id:<ID> 同一套转义，非 UUID 形状不给 target=；JSON 照给原值
+        hostile = THREAD_B + "\u202e\u200b\x7fx"
+        escaped = THREAD_B + "\\u202e\\u200b\\u007fx"
+        with self.store("vm") as store:
+            [row] = store.device_states()
+            snapshot = dict(row["snapshot"])
+            snapshot["endpoints"] = [{**snapshot["endpoints"][0], "nativeId": hostile}]
+            store.put_device_state(device_id=DEV_B, name="win", revision=2, snapshot=snapshot, last_seen=now_ms(),
+                                   state="online")
+        code, out, err = self.run_on("vm", "send", "--device", "win", "--to", "codex@impl", "-m", "X",
+                                     caller=as_agent(ORIGIN))
+        self.assertEqual(code, 0, err)
+        task_id = re.search(r"跨设备任务 (\S+) 已记录", out).group(1)  # type: ignore[union-attr]
+        self.assertIn(f"交给 win 上的 codex@id:{escaped}：", out)  # ID 不是 UUID 形状：不作旁注、不给 target=
+        status, tasks = self.run_on("vm", "status", task_id)[1], self.run_on("vm", "tasks")[1]
+        for text in (out, status, tasks):
+            self.assertFalse(any(char in text for char in "\u202e\u200b\x7f"), text)
+        self.assertIn(f"→ win codex@id:{escaped}", status)
+        self.assertIn(f"win:codex@id:{escaped}", tasks)
+        document = json.loads(self.run_on("vm", "status", task_id, "--json")[1])
+        self.assertEqual(document["attempts"][0]["target"], f"codex@id:{hostile}")  # JSON 照给原值
+        # 告知行（tasks --all 的 fyi 行取那条告知的 target）同样转义
+        code, out, err = self.run_on("vm", "send", "--device", "win", "--to", "codex@impl", "--fyi", "-m", "Y", "--json",
+                                     caller=as_agent(ORIGIN))
+        self.assertEqual(code, 0, err)
+        fyi = json.loads(out)["id"]
+        tasks = self.run_on("vm", "tasks", "--all")[1]
+        [line] = [item for item in tasks.splitlines() if item.startswith(fyi[:8])]
+        self.assertIn(f"win:codex@id:{escaped}", line)
+        self.assertFalse(any(char in tasks for char in "\u202e\u200b\x7f"), tasks)
+
+    def test_peers_target_with_the_device_id_fallback_is_accepted_by_send(self) -> None:
+        # §101.1：登记名不是 slug 时，文字行 target= 的 --device 退回 32 位十六进制 deviceId；把这段原样交给 send，
+        # 解析端（device_row 认登记名或完整 deviceId）接受并选中同一端点
+        with self.store("vm") as store:
+            [row] = store.device_states()
+            store.put_device_state(device_id=DEV_B, name="w\nin", revision=2, snapshot=row["snapshot"],
+                                   last_seen=now_ms(), state="online")
+        code, out, err = self.run_on("vm", "peers", "--device", DEV_B)
+        self.assertEqual(code, 0, err)
+        [line] = [item for item in out.splitlines() if "target=" in item]
+        target = line.split("target=", 1)[1].split("  ", 1)[0]
+        self.assertEqual(target, f"--device {DEV_B} --to codex@id:{THREAD_B}")
+        code, out, err = self.run_on("vm", "send", *target.split(), "-m", "X", "--json", caller=as_agent(ORIGIN))
+        self.assertEqual(code, 0, err)
+        [attempt] = json.loads(out)["attempts"]
+        self.assertEqual((attempt["targetDevice"], attempt["target"]), (DEV_B, f"codex@id:{THREAD_B}"))
 
     def test_tasks_merges_federation_and_survives_unreadable_federation_store(self) -> None:
         task_id = self.send()

@@ -25,6 +25,7 @@ from agentstatus_bridge.federation.fedstore import FED_DB_NAME, FederatedStore
 from agentstatus_bridge.federation.mirror import LocalReport
 from agentstatus_bridge.federation.refs import RemoteEndpointRef, TargetRef, WireActor
 from agentstatus_bridge.model import EndpointRef, Provider
+from agentstatus_bridge.native_names import text_id_token
 from agentstatus_bridge.store import StoreError
 
 DEV_A = "a" * 32
@@ -195,6 +196,50 @@ class StoreTests(FederationTestCase):
         self.assertEqual(first[0], again[0])
         self.assertEqual((moved[0], moved[1]), (first[0], first[1] + 1))
         self.assertNotEqual(other_root[0], first[0])
+
+
+class HostileRemoteIdBodyTests(FederationTestCase):
+    """§101.1：A 自动生成的正文（结果通知、复核请求）里的远端会话 ID：合法 UUID 原样，其余与文字行同一套转义。
+
+    远端 ID 过了 refs 的校验（不含空白与 0x20 以下控制字符），仍可能带 DEL、C1 控制（CSI）、RLO、零宽字符。"""
+
+    HOSTILE = CODEX_B + "\u202e\u200b\x7f\x9bx"
+    ESCAPED = CODEX_B + "\\u202e\\u200b\\u007f\\u009bx"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.worker = self.b.bind(Provider.CODEX, self.HOSTILE)
+        self.worker_remote = TargetRef(remote=self.worker.remote)
+
+    def bodies_after_result(self, *, flow: str) -> list[str]:
+        reviewer = self.a.bind(Provider.CLAUDE, CLAUDE_A2) if flow == "review" else None
+        task, first = self.create(flow=flow, reviewer=reviewer)
+        pump(self.a, self.b, now=T0 + 1)
+        deliver(self.b, first.msg_id, "queued", now=T0 + 2)
+        self.b_report(task.task_id, 1, "result", note="已修复", now=T0 + 3)
+        pump(self.b, self.a, now=T0 + 4)
+        bodies = [item.body for item in self.a.store.attempts(DEV_A, task.task_id) if item.seq > 1]
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertFalse(any(char in bodies[0] for char in "\u202e\u200b\x7f\x9b"), bodies[0])
+        return bodies[0].splitlines()
+
+    def test_review_request_escapes_a_non_uuid_executor_id(self) -> None:
+        self.assertEqual(self.bodies_after_result(flow="review")[0], f"请复核 codex@id:{self.ESCAPED} 完成的这项工作。")
+
+    def test_result_notice_escapes_a_non_uuid_executor_id(self) -> None:
+        first = self.bodies_after_result(flow="handoff")[0]
+        self.assertTrue(first.startswith("你发起的任务「跨设备任务」") and first.endswith(f"（codex@id:{self.ESCAPED}）。"),
+                        first)
+
+    def test_uuid_ids_are_unchanged_and_line_breaks_cannot_be_forged(self) -> None:
+        self.assertEqual(text_id_token(Provider.CODEX, CODEX_B), f"codex@id:{CODEX_B}")  # 合法 UUID 原样
+        for char in "\n\x85\u2028\x1e":
+            with self.subTest(char=repr(char)):
+                # 换行类字符在 refs 入口就被拒；helper 自身也不让它们原样进正文
+                with self.assertRaises(CodecError):
+                    WireActor.from_dict({"deviceId": DEV_B, "provider": "codex", "nativeId": CODEX_B + char,
+                                         "wireToken": "codex@x"})
+                self.assertEqual(len(text_id_token(Provider.CODEX, CODEX_B + char + "y").splitlines()), 1)
 
 
 class HandoffFlowTests(FederationTestCase):

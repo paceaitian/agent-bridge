@@ -191,9 +191,14 @@ class CliTests(unittest.TestCase):
         self.assertIn('codex@impl〔', lines[short(live)])
         self.assertIn('codex@id:impl-thread', lines[short(finished)])
 
-    def test_linux_empty_reviewer_and_local_controls_keep_legacy_behavior(self) -> None:
+    def test_linux_empty_reviewer_is_rejected_and_local_controls_keep_legacy_behavior(self) -> None:
+        # §101.2：空 --review-by 不再静默降为 handoff，与 Windows 同报 target_explicit_required/2 且不落账
         code,out,err=self.run_cli('send','--to','codex@impl','--review-by','',
                                   '-m','fixture','--no-wait','--json')
+        self.assertEqual((code,out),(cli.EXIT_TARGET,''))
+        self.assertIn('[target_explicit_required]',err)
+        self.assertFalse((self.state/'bridge.sqlite3').exists())
+        code,out,err=self.run_cli('send','--to','codex@impl','-m','fixture','--no-wait','--json')
         self.assertEqual(code,0,err)
         task_id=json.loads(out)['id']
         with self.store() as store:
@@ -210,25 +215,133 @@ class CliTests(unittest.TestCase):
             self.assertTrue(store.get_task(task_id).paused)
             self.assertIs(store.attempts(task_id)[0].delivery,Delivery.CANCELLED)
 
-    def test_linux_file_replaces_invalid_utf8_before_ledger(self) -> None:
+    def body_sources(self, raw: bytes) -> list[tuple[str, list[str], bytes]]:
+        """同一份原始字节的三种正文来源：-m -、不给 -m 的重定向 stdin、--file（§101.2 两平台同一判定）。"""
         path = self.state.parent / 'body-utf8.txt'
-        path.write_bytes(b'hello\xff\xe9')
+        path.write_bytes(raw)
+        return [('stdin-dash', ['-m', '-'], raw), ('stdin-implicit', [], raw), ('file', ['--file', str(path)], b'')]
+
+    def send_with_stdin(self, stdin: bytes, *argv: str) -> tuple[int, str, str]:
+        from io import BytesIO, TextIOWrapper
+        # 文字层故意用 cp1252：字节与文字两层解码结果不同，证明读的是原始字节
+        with TextIOWrapper(BytesIO(stdin), encoding='cp1252') as stream, patch.object(sys, 'stdin', stream):
+            return self.run_cli(*argv)
+
+    def test_linux_body_is_strict_utf8_from_raw_bytes(self) -> None:
+        # §101.2：Linux 与 Windows 同码同退出码——按原始字节严格 UTF-8 解码，BOM 保留为 U+FEFF
+        for raw in ('中文😀 café'.encode('utf-8'), b'\xef\xbb\xbfhello'):
+            for name, options, stdin in self.body_sources(raw):
+                with self.subTest(raw=raw, source=name):
+                    code, out, err = self.send_with_stdin(stdin, 'send', '--to', 'codex@impl', *options,
+                                                          '--no-wait', '--json')
+                    self.assertEqual(code, 0, err)
+                    with self.store() as store:
+                        self.assertEqual(store.attempts(json.loads(out)['id'])[0].body, raw.decode('utf-8'))
+
+    def test_linux_invalid_utf8_body_is_rejected_before_ledger(self) -> None:
+        # 旧行为是 stdin 按文字层解码（cp1252 会读成 café）、--file 替换成 U+FFFD；现在都报 message_invalid_utf8/3 且不落账
+        for name, options, stdin in self.body_sources(b'caf\xe9 hello\xff'):
+            with self.subTest(source=name):
+                code, out, err = self.send_with_stdin(stdin, 'send', '--to', 'codex@impl', *options, '--no-wait')
+                self.assertEqual((code, out), (cli.EXIT_REJECTED, ''))
+                self.assertIn('[message_invalid_utf8]', err)
+                self.assertNotIn('Traceback', err)
+                self.assertFalse((self.state / 'bridge.sqlite3').exists())  # 落账前拒绝：连账本都没建
+
+    def test_linux_arguments_with_invalid_utf8_bytes_are_rejected_before_anything(self) -> None:
+        # §101.2：argv 里的非法 UTF-8 字节经 surrogateescape 成为孤立代理字符。解析后统一检查：正文 -m 报
+        # message_invalid_utf8，其余参数报 argument_invalid_utf8，都退出 3，先于发现、读正文与任何读写，
+        # 不再在写账本或输出时抛 UnicodeEncodeError
+        bad = os.fsdecode(b'x\xff')
+        ref = self.state.parent / f'ref-{bad}.txt'
+        ref.parent.mkdir(parents=True, exist_ok=True)
+        ref.write_text('ref', encoding='utf-8')
+        cases = [
+            (('send', '--to', 'codex@impl', '-m', bad, '--no-wait'), 'message_invalid_utf8'),
+            (('note', 'ffffffff', '-m', bad), 'message_invalid_utf8'),
+            (('send', '--to', 'codex@impl', '-m', 'ok', '--title', bad, '--no-wait'), 'argument_invalid_utf8'),
+            (('send', '--to', f'codex@{bad}', '-m', 'ok', '--no-wait'), 'argument_invalid_utf8'),
+            (('send', '--to', 'codex@impl', '-m', 'ok', '--ref', str(ref), '--no-wait'), 'argument_invalid_utf8'),
+            (('report', 'ffffffff', '--result', '--note', bad), 'argument_invalid_utf8'),
+            # report 的 --file 是结果文件列表（记 sha256 与路径），不在 send/note --file 的例外里（r1，Opus P3-1）
+            (('report', 'ffffffff', '--result', '--file', str(ref)), 'argument_invalid_utf8'),
+            (('tasks', '--grep', bad), 'argument_invalid_utf8'),
+            (('status', bad), 'argument_invalid_utf8'),
+        ]
+        for argv, code_name in cases:
+            with self.subTest(argv=argv[:2], code=code_name), \
+                    patch.object(cli, '_refresh_summary') as refreshed:
+                try:
+                    code, out, err = self.run_cli(*argv)
+                except UnicodeError as error:
+                    self.fail(f"{argv[0]} raised {type(error).__name__}")
+                self.assertEqual(refreshed.call_count, 0)  # 先于命令前的摘要刷新（r1，opus2 o16）
+                self.assertEqual((code, out), (cli.EXIT_REJECTED, ''))
+                self.assertIn(f'[{code_name}]', err)
+                self.assertEqual(self.discovered, [])  # 先于发现
+                self.assertFalse((self.state / 'bridge.sqlite3').exists())  # 先于任何读写
+        # 成功与失败都输出 JSON 的命令：失败文档照常给出新原因码
+        code, out, err = self.run_cli('pause', bad, '--json')
+        self.assertEqual(code, cli.EXIT_REJECTED)
+        self.assertEqual((json.loads(out)['ok'], json.loads(out)['code']), (False, 'argument_invalid_utf8'))
+
+    def test_linux_body_file_with_a_non_utf8_name_still_works(self) -> None:
+        # send/note 的 --file 只是正文来源路径：只交给文件系统打开、不保存不显示，非 UTF-8 文件名照常可用（统一检查的例外）
+        path = self.state.parent / os.fsdecode(b'body-\xff.txt')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('来自非 UTF-8 文件名的正文', encoding='utf-8')
         code, out, err = self.run_cli('send', '--to', 'codex@impl', '--file', str(path), '--no-wait', '--json')
         self.assertEqual(code, 0, err)
         with self.store() as store:
-            self.assertEqual(store.attempts(json.loads(out)['id'])[0].body, 'hello\ufffd\ufffd')
-        self.assertNotIn('message_invalid_utf8', err)
+            self.assertEqual(store.attempts(json.loads(out)['id'])[0].body, '来自非 UTF-8 文件名的正文')
 
-    def test_linux_stdin_reads_text_not_raw_buffer(self) -> None:
-        from io import BytesIO, TextIOWrapper
-        # Text and bytes intentionally disagree; Linux follows stdin's decoder.
-        for options in (['-m', '-'], []):
-            with TextIOWrapper(BytesIO(b'caf\xe9'), encoding='cp1252') as stream, patch.object(sys, 'stdin', stream):
-                code, out, err = self.run_cli('send', '--to', 'codex@impl', *options, '--no-wait', '--json')
-            self.assertEqual(code, 0, err)
-            with self.store() as store:
-                self.assertEqual(store.attempts(json.loads(out)['id'])[0].body, 'café')
-            self.assertNotIn('message_invalid_utf8', err)
+    def test_linux_oversized_stdin_is_measured_in_bytes(self) -> None:
+        # 上限按字节量（与 Windows 同一 MAX_BODY_BYTES 判定）：恰好上限可发，多一个字节报 message_too_large/3
+        from agentstatus_bridge.store import MAX_BODY_BYTES
+        code, out, err = self.send_with_stdin(b'x' * (MAX_BODY_BYTES + 1), 'send', '--to', 'codex@impl', '-m', '-',
+                                              '--no-wait')
+        self.assertEqual((code, out), (cli.EXIT_REJECTED, ''))
+        self.assertIn('[message_too_large]', err)
+        self.assertFalse((self.state / 'bridge.sqlite3').exists())
+        code, out, err = self.send_with_stdin(b'x' * MAX_BODY_BYTES, 'send', '--to', 'codex@impl', '-m', '-',
+                                              '--no-wait', '--json')
+        self.assertEqual(code, 0, err)
+
+    def test_linux_blank_review_by_is_rejected_like_an_empty_to(self) -> None:
+        # §101.2：显式空串或只有空白的 --review-by 与 --to "" 同码同退出码（target_explicit_required/2），
+        # 不再静默降为 handoff；先于 --fyi/--review-device 的参数检查、先于读 stdin，任何写入之前
+        code, _, err = self.run_cli('send', '--to', '', '-m', 'x', '--no-wait')
+        self.assertEqual(code, cli.EXIT_TARGET)
+        self.assertIn('[target_explicit_required]', err)
+        for blank in ('', ' ', '\t', '\u3000'):
+            for extra in ([], ['--fyi'], ['--review-device', 'win']):
+                with self.subTest(blank=blank, extra=extra):
+                    # stdin 是非法 UTF-8：若先读了正文，报的会是 message_invalid_utf8
+                    code, out, err = self.send_with_stdin(b'\xff', 'send', '--to', 'codex@impl', '--review-by', blank,
+                                                          *extra, '-m', '-', '--no-wait')
+                    self.assertEqual((code, out), (cli.EXIT_TARGET, ''))
+                    self.assertIn('[target_explicit_required]', err)
+                    self.assertFalse((self.state / 'bridge.sqlite3').exists())
+        # 同类空值一并拒绝（r1，opus2 P3-4）：send --device ""/--review-device ""、retry --to ""/--device ""，
+        # 不再静默变成本机任务或不改派；先于读正文、联邦查找与任何读写
+        task_id = self.send()
+        for argv in (('send', '--to', 'codex@impl', '--device', '', '-m', '-', '--no-wait'),
+                     ('send', '--to', 'codex@impl', '--review-device', ' ', '-m', '-', '--no-wait'),
+                     ('retry', task_id, '--to', ''), ('retry', task_id, '--device', '\u3000')):
+            with self.subTest(argv=argv):
+                code, out, err = self.send_with_stdin(b'\xff', *argv)
+                self.assertEqual((code, out), (cli.EXIT_TARGET, ''))
+                self.assertIn('[target_explicit_required]', err)
+                with self.store() as store:
+                    self.assertEqual((len(store.list_tasks()), len(store.attempts(task_id))), (1, 1))  # 什么也没记
+        # 非空的 --review-by 照旧建复核任务（只给 --review-device 的既有规则见 test_bridge_federation_cli）
+        code, out, err = self.run_cli('send', '--to', 'codex@impl', '--review-by', 'claude@review', '-m', 'x',
+                                      '--no-wait', '--json')
+        self.assertEqual(code, 0, err)
+        with self.store() as store:
+            task = store.get_task(json.loads(out)['id'])
+            assert task is not None
+            self.assertIs(task.flow, Flow.REVIEW)
 
     def setUp(self) -> None:
         self._tmp = TemporaryDirectory()

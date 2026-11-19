@@ -29,6 +29,7 @@ from agentstatus_bridge.federation import attachments, directory
 from agentstatus_bridge.federation.attachments import AttachmentError, freeze, land
 from agentstatus_bridge.federation.relay import RelayPaths
 from agentstatus_bridge.model import Provider
+from agentstatus_bridge.native_names import text_id_token
 from agentstatus_bridge.platforms.factory import using_platform
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -142,6 +143,37 @@ class WindowsModelTests(unittest.TestCase):
         self.assertIsNotNone(bindings[0])
         self.assertEqual(bindings[0], bindings[1])
         self.assertNotEqual(bindings[0], bindings[2])  # 换根即换绑定：投递按换根拒绝，不投到别的根
+
+    def test_remote_peer_text_escapes_hostile_fields_without_a_store(self) -> None:
+        # §101.1 在 Windows 选择集里跑：peers --all-devices 的远端部分只读缓存行（假 store，不建联邦库）
+        native = "019a0000-1111-7222-8333-44445555bbbb"
+        forged = "\n设备 forged〔ffffffff〕：在线\x1b[2K\u202e\u200b"
+        item = {"provider": "codex", "nativeId": native, "endpointId": "e" * 32, "endpointRevision": 1, "inbox": True,
+                "eligible": True, "namesVerified": True, "name": "a" + forged, "displayName": "b" + forged}
+        bad = {**item, "nativeId": native[:-1] + forged, "name": "c", "displayName": None}
+        state = {"device_id": "b" * 32, "name": "w" + forged, "state": "online", "last_seen": 1_000,
+                 "snapshot": {"endpoints": [item, bad], "complete": True, "providers": {"codex": True},
+                              "namePolicy": directory.NAME_POLICY}}
+        store = cast(Any, SimpleNamespace(device_states=lambda: [state]))
+        lines = directory.peer_lines(store, None, now=1_000)
+        physical = "\n".join(lines).splitlines()
+        self.assertEqual(len(physical), 3, physical)
+        self.assertFalse(any(char in "\n".join(physical) for char in "\x1b\u202e\u200b"), physical)
+        self.assertEqual([line.startswith("设备 ") for line in physical], [True, False, False])
+        self.assertIn(f" target=--device {'b' * 32} --to codex@id:{native}", physical[1])  # 设备名不是 slug：退回完整设备 ID
+        self.assertIn("名称=b\\u000a设备 forged", physical[1])
+        self.assertNotIn("target=", physical[2])
+        self.assertTrue(physical[2].endswith("  （ID 无效）"), physical[2])
+        [device] = directory.peer_devices(store, None, now=1_000)
+        self.assertEqual((device["device"], device["peers"][0]["name"]), ("w" + forged, "a" + forged))  # --json 照给原值
+
+
+    def test_generated_body_ids_keep_uuids_and_escape_the_rest(self) -> None:
+        # §101.1 在 Windows 选择集里跑：自动生成正文里的会话标识，合法 UUID 原样，其余同文字行转义
+        native = "019a0000-1111-7222-8333-44445555bbbb"
+        self.assertEqual(text_id_token(Provider.CODEX, native), f"codex@id:{native}")
+        self.assertEqual(text_id_token(Provider.CLAUDE, native + "\u202e\x9bx"),
+                         f"claude@id:{native}\\u202e\\u009bx")
 
 
 class SelectionTests(unittest.TestCase):

@@ -129,6 +129,8 @@ REASON_TEXTS: dict[str, str] = {
     "task_ambiguous": "任务 ID 前缀不唯一，请多写几位",
     "file_unreadable": "文件不存在或不可读",
     "message_invalid_utf8": "正文必须是合法 UTF-8；尚未写入账本",
+    # 正文以外的命令行参数（--title、--note、--to、--ref 等）含编码不成 UTF-8 的字符（§101.2）
+    "argument_invalid_utf8": "命令行参数必须是合法 UTF-8（终端或脚本传入了非法字节）；未执行任何操作",
     "file_too_large": "文件过大（上限 256 MiB）",
     "too_many_files": f"文件过多（上限 {MAX_FILES} 个）",
     "commit_invalid": "提交号格式不对",
@@ -211,8 +213,9 @@ REASON_TEXTS: dict[str, str] = {
     "remote_unconfirmed": "对方设备尚未确认最新状态：还没发出的由对方按最新状态投递或抑制，已交出的消息与工作不能撤回",
     "retry_may_duplicate": "上一条消息可能已送达，对方可能重复执行",
     # send --follows（DESIGN §93.3）：与 task_not_found 同类，退出 2
-    "follows_not_found": "找不到 --follows 指定的旧任务：本机账本没有，联邦库里也没有"
-                         "（联邦库读不了时只查了本机账本，可用 {command} federation status 查看）",
+    # 联邦库读不了时没查成，不把「读不了」说成「没有」（§101.3）
+    "follows_not_found": "找不到 --follows 指定的旧任务：本机账本没有；联邦库里也没有，或联邦库读不了"
+                         "（读不了时只查了本机账本，可用 {command} federation status 查看）",
     "follows_ambiguous": "--follows 指定的旧任务不唯一（本机账本与联邦库里命中不止一个），请多写几位或用完整 ID",
     "worker_not_running": "后台 worker 未运行（可运行 {command} worker 查看原因）",
     "interrupted_during_send": "发送过程中断，是否送达不明",

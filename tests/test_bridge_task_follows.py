@@ -222,8 +222,9 @@ class BrokenFederationFollowsTests(FedCliCase):
                                          caller=fed_agent(ORIGIN))
         self.assertEqual((code, out), (cli.EXIT_TARGET, ""))
         self.assertIn("[follows_not_found]", err)
-        # 说明里写明联邦库读不了时只查了本机账本，不只说「两边都没有」（§94.2 第 2 条）
-        self.assertIn("联邦库读不了时只查了本机账本", err)
+        # 说明里写明联邦库读不了时只查了本机账本，不只说「两边都没有」（§94.2 第 2 条）；主句也不把「读不了」说成
+        # 「没有」（§101.3）
+        self.assertIn("本机账本没有；联邦库里也没有，或联邦库读不了（读不了时只查了本机账本", err)
         with Store.open(self.states["vm"]) as store:
             task = store.get_task(new)
             assert task is not None
@@ -247,10 +248,17 @@ class BrokenFederationFollowsTests(FedCliCase):
             connection.execute("DROP TABLE fed_tasks")  # 能只读打开（版本号仍对），查询时才失败
         finally:
             connection.close()
-        code, out, err = self.run_on("vm", "status", new)
-        self.assertEqual(code, 0, err)
-        self.assertIn(f"承接任务 {short(old)}（已不在账本）", out)
-        self.assertEqual(json.loads(self.run_on("vm", "status", new, "--json")[1])["follows"], old)
+        # 兜底被删或收窄时查询异常会冒出 cli.main：按断言失败记（§101.3，变异只把断言失败算杀死），不当成用例出错
+        for argv in (("status", new), ("status", new, "--json")):
+            try:
+                code, out, err = self.run_on("vm", *argv)
+            except Exception as error:  # noqa: BLE001 - 把未接住的异常转成断言失败
+                self.fail(f"{' '.join(argv[:1] + argv[2:])} raised {type(error).__name__}: {error}")
+            self.assertEqual(code, 0, err)
+            if "--json" in argv:
+                self.assertEqual(json.loads(out)["follows"], old)
+            else:
+                self.assertIn(f"承接任务 {short(old)}（已不在账本）", out)
 
 
 class StateRootFollowsTests(FedCliCase):

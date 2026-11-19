@@ -930,6 +930,19 @@ class AuditTests(unittest.TestCase):
                 self.assertFalse((self.state/'bridge.sqlite3').exists())
                 self.assertEqual(self.adds(),[])
 
+    def test_arguments_with_lone_surrogates_are_rejected_before_the_command_scope(self):
+        # §101.2：Windows 命令行可能带孤立代理字符；与 Linux 同一处统一检查，-m 报 message_invalid_utf8，其余参数报
+        # argument_invalid_utf8，都退出 3，先于命令作用域（调用方采样、发现）与任何读写
+        from agentstatus_bridge.platforms.windows import commands as windows_commands
+        with (self.scope(),patch.object(windows_commands,'scope',side_effect=AssertionError('command scope entered'))):
+            for argv,expected in ((('-m','bad\ud800'),'message_invalid_utf8'),
+                                  (('-m','ok','--title','t\udc00'),'argument_invalid_utf8')):
+                code,out,err=self.run_cli('send','--to',uuid(1),*argv,'--no-wait')
+                self.assertEqual((code,out),(3,''),err)
+                self.assertIn(expected,err)
+            self.assertFalse((self.state/'bridge.sqlite3').exists())
+            self.assertEqual(self.adds(),[])
+
     def test_unattributed_command_scope_fails_before_sampling_without_wait(self):
         from agentstatus_bridge.caller_values import Caller
         from agentstatus_bridge.platforms.windows import caller
@@ -1004,6 +1017,25 @@ class AuditTests(unittest.TestCase):
                         self.assertIn(expected,err)
                         self.assertFalse((self.state/'bridge.sqlite3').exists())
                         self.assertEqual(self.adds(),[])
+
+    def test_blank_device_and_retry_selectors_are_rejected_like_an_empty_to(self):
+        # r1（opus2 P3-4）：send --device ""/--review-device ""、retry --to ""/--device "" 与 --to "" 同报
+        # target_explicit_required/2，不静默变成本机任务或不改派；与 Linux 同一处检查
+        from agentstatus_bridge.caller_values import Caller
+        self.k.loaded=[uuid(1)]
+        self.k.metadata={uuid(1):{'id':uuid(1),'source':'cli','name':'origin','cwd':'C:\\project-0'}}
+        env=self.chain()
+        with (self.scope(),patch.dict(os.environ,env),
+              patch('agentstatus_bridge.platforms.windows.caller.identify',return_value=Caller(None,None,'windows-terminal',False)),
+              patch.object(cli,'_start_worker',return_value=False),patch.object(cli,'_worker_up',return_value=False)):
+            for argv in (('send','--to',uuid(1),'--device','','-m','fixture','--no-wait'),
+                         ('send','--to',uuid(1),'--review-device',' ','-m','fixture','--no-wait'),
+                         ('retry','ffffffff','--to',''),('retry','ffffffff','--device','\u3000')):
+                code,out,err=self.run_cli(*argv)
+                self.assertEqual((code,out),(2,''),(argv,err))
+                self.assertIn('[target_explicit_required]',err)
+                self.assertFalse((self.state/'bridge.sqlite3').exists())
+                self.assertEqual(self.adds(),[])
 
     def test_name_union_independently_rejects_empty_and_peers_roundtrip(self):
         rows=tuple(D.Candidate(uuid(i+1),'root',name=name,cwd_label='',names_verified=True)

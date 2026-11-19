@@ -176,6 +176,13 @@ def workdir_text(tail: str | None) -> str | None:
     return display_text(NameSource('named', tail)) if tail else None
 
 
+def remote_display(value: object) -> str | None:
+    """对端给的字符串在本机人读文字里的写法（§101.1）：与本机名字同一套转义与 120 字符限长（display_text），换行、ESC、
+    RLO、零宽字符写成 \\uXXXX，伪造不出新行、也倒排不了同行的 target=；非字符串、空串或只有空白为 None。
+    只用于文字行，--json 照给原值（JSON 自己转义控制字符）；对诚实写方已转义过的 displayName 幂等。"""
+    return display_text(NameSource('named', value)) if isinstance(value, str) else None
+
+
 def remote_workdir(value: object) -> str | None:
     """对端快照里的 workdir（§95.3）：只认字符串；去掉会被消费者改动的字符（控制、格式、行/段分隔符，含 RLO 与
     零宽字符，同 copyable 的拒绝集合），再按 120 字符限长；去完为空或只剩空白为 None。正常写方已转义，这里只防
@@ -369,6 +376,14 @@ def sender_display(token: str, device: str) -> str:
     if budget >= 2:
         return f'{token}（{device[:budget - 1]}…）'
     return token
+
+
+def text_id_token(provider: Provider, native_id: str) -> str:
+    """自动生成的人读正文里的会话标识（§101.1）：合法 UUID 照 id_token 原样；其余（只可能是远端 ID，过了 refs 的空白与
+    控制字符校验，仍可能带 DEL、C1 控制、RLO、零宽等）走与文字行同一套转义，造不出新行、倒排不了同行文字。
+    消息头 from=、随事实保存与转发的 wireToken 仍用 id_token/full_id_token，不经这里。"""
+    token = id_token(provider, native_id)
+    return token if UUID_SHAPE.fullmatch(native_id) else (remote_display(token) or token)
 
 
 def full_id_token(ref: EndpointRef) -> str:

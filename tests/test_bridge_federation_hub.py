@@ -32,6 +32,7 @@ from agentstatus_bridge.federation.codec import CodecError
 from agentstatus_bridge.federation.hub import HubSession
 from agentstatus_bridge.federation.hubstore import (
     DAY_MS,
+    GC_LEASE_MS,
     HubStore,
     auth_fingerprint,
     openssh_fingerprint,
@@ -542,6 +543,75 @@ class BlobTests(HubTestCase):
         # 强制时序：首次自调 gc 前主线程停住，直到会话跑完一次周期任务（默认 tick 下会话先占租约）
         with self.periodic_window() as pause:
             self.check_gc_lease(pause)
+
+
+class PeriodicGcTests(HubTestCase):
+    """周期 GC（§101.4）：默认 tick 的会话按测试时钟每 60 秒竞争一次租约做小批回收。
+
+    负向断言（门控期内不回收）以「门控期内已观察到的 tick 次数」为判据，正向断言用有上限的条件等待；都不靠固定延时，
+    超时一律 self.fail（删掉周期 GC 调用或 60 秒门控的变异都以断言失败暴露）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._ticks = 0
+        self._tick_done = threading.Condition()
+        original = HubSession._periodic
+
+        def periodic(session: HubSession) -> bool:
+            try:
+                return original(session)
+            finally:
+                with self._tick_done:
+                    self._ticks += 1
+                    self._tick_done.notify_all()
+
+        counting = patch.object(HubSession, "_periodic", periodic)
+        counting.start()
+        self.addCleanup(counting.stop)
+
+    def wait_until(self, what: str, predicate: Callable[[], bool], *, ticks: int = 0) -> None:
+        """至少再等会话完成 ticks 次周期任务，且 predicate 为真；每个 tick 后复查，上限 5 秒，超时判失败。"""
+        deadline = time.monotonic() + 5
+        with self._tick_done:
+            target = self._ticks + ticks
+            while self._ticks < target or not predicate():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    self.fail(f"periodic gc: {what} (ticks={self._ticks}, wanted>={target})")
+                self._tick_done.wait(min(left, 0.2))
+
+    def lease(self) -> str | None:
+        with sqlite3.connect(self.root / "hub" / "hub.sqlite3") as conn:
+            row = conn.execute("SELECT value FROM hub_meta WHERE key='gcLease'").fetchone()
+        return None if row is None else str(row[0])
+
+    def outcome(self, msg_id: str) -> str:
+        with sqlite3.connect(self.root / "hub" / "hub.sqlite3") as conn:
+            return str(conn.execute("SELECT outcome FROM hub_messages WHERE msg_id=?", (msg_id,)).fetchone()[0])
+
+    def test_periodic_gc_runs_on_the_sixty_second_gate(self) -> None:
+        GATE_MS = 60_000  # 设计值写成字面量而不是导入常量：常量被改小时用例要变红（r1，opus2 o12）
+        a = self.ready("vm", self.key_a, LEDGER_A)  # 默认 tick
+        # 1. 会话的首轮周期任务就做 GC（_last_gc 初值 0）：租约出现，到期点按当时的测试时钟算
+        self.wait_until("first lease", lambda: self.lease() is not None)
+        first = self.lease()
+        assert first is not None
+        self.assertEqual(first.rpartition(":")[2], str(T0 + GC_LEASE_MS))
+        lapsing = envelope(self.dev_a, self.dev_b)
+        lapsing["expiresAt"] = T0 + 1_000
+        self.assertEqual(a.one("submit", envelope=lapsing)["type"], "accepted")
+        # 2. 拨过消息到期点、但距上次 GC 不足 60 秒：再完成 3 个 tick（至少 2 个整轮读到新时钟）也不回收、不续租
+        self.clock.now = T0 + GATE_MS - 1
+        self.wait_until("ticks inside the gate", lambda: True, ticks=3)
+        self.assertEqual((self.lease(), self.outcome(lapsing["msg_id"])), (first, "queued"))
+        # 3. 满 60 秒：下一轮周期任务回收过期消息、写 expired 收据并续租
+        self.clock.now = T0 + GATE_MS
+        self.wait_until("expiry after the gate", lambda: self.outcome(lapsing["msg_id"]) == "expired")
+        renewed = self.lease()
+        assert renewed is not None
+        self.assertEqual(renewed, first.rpartition(":")[0] + f":{T0 + GATE_MS + GC_LEASE_MS}")
+        page = a.one("receipts_get", after=0)
+        self.assertEqual([item["state"] for item in page["items"]], ["accepted", "expired"])
 
 
 class SchemaTests(HubTestCase):

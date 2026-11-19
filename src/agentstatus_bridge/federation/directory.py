@@ -19,12 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from ..endpoints import ADAPTERS, Endpoint
-from ..model import EndpointRef, Provider
-from ..native_names import (TARGET_ID_UNVERIFIED, TARGET_PROVIDER_REQUIRED, SelectorError, id_prefixes, parse_selector,
-                            remote_workdir, workdir_suffix, workdir_text)
+from ..model import UNRESOLVED_NATIVE_ID, EndpointRef, NameSource, Provider
+from ..native_names import (TARGET_ID_UNVERIFIED, TARGET_PROVIDER_REQUIRED, UUID_SHAPE, SelectorError, copyable,
+                            id_prefixes, parse_selector, remote_display, remote_workdir, workdir_suffix, workdir_text)
 from ..paths import claude_sessions_dirs, codex_home, grok_home
 from ..platforms.factory import get_platform
-from .codec import canonical_bytes
+from .codec import canonical_bytes, is_hex32, is_slug
 from .fedstore import FederatedStore
 from .refs import RemoteEndpointRef, TargetRef
 
@@ -356,35 +356,68 @@ def _completeness_text(device: Mapping[str, Any]) -> str:
     if not shown:
         return "完整"
     names = "、".join(shown)
-    return f"部分完整（{names} 未核全：{names} 与不带 provider 的名字/前缀不可用，只能用完整 ID）"
+    # 远端裸名本来就报 target_provider_required，与完整性无关；这里只列因未核全而不可用的写法（§101.1）
+    return f"部分完整（{names} 未核全：{names} 的名字/前缀与不带 provider 的前缀不可用，只能用完整 ID）"
+
+
+def _copyable_device(device: Mapping[str, Any]) -> str | None:
+    """文字行 target= 里的 --device：登记 slug；不是 slug 就退回 32 位十六进制 deviceId（device_row 两者都认），都不是则无。"""
+    if is_slug(device["device"]):
+        return str(device["device"])
+    return str(device["deviceId"]) if is_hex32(device["deviceId"]) else None
 
 
 def peer_lines(store: FederatedStore, device_reference: str | None, *, now: int) -> list[str]:
-    """文字版：按设备展示缓存目录，附可直接复制的完整目标。"""
+    """文字版：按设备展示缓存目录，附可直接复制的完整目标。
+
+    对端给的字符串（设备名、deviceId、provider、nativeId、名字、展示名）一律经 remote_display 转义后才进文字（§101.1）；
+    工作目录末段已由 remote_workdir 去掉同一类字符（§95.3）。target= 只由已校验的值拼成：provider 在枚举内、nativeId 是
+    UUID 形状（选择器能照抄的唯一完整 ID 形状），--device 取 _copyable_device；判不过的行不给 target=、标出原因：
+    「provider 未知」「ID 无效」「设备引用无效」。合法行不得被标成无效：各 provider 的会话 ID 都是 UUID（Claude/Codex
+    含子代理与 daemon 线程、Grok 只读行），对端未解析的会话（nativeId 为「-」）照旧显示与旗标，只是没有可照抄的
+    完整 ID、不给 target=。--json（peer_devices）不经这里，照给原值。
+    """
     lines: list[str] = []
     rows = {str(row["device_id"]): row for row in (store.device_states() if device_reference is None
                                                    else [device_row(store, device_reference)])}
     for device in peer_devices(store, device_reference, now=now):
         shown_ids = _shown_ids(rows.get(str(device["deviceId"])) or {}, now=now)
         state = {"online": "在线", "revoked": "已撤销"}.get(device["state"], "离线或未知")
-        lines.append(f"设备 {device['device']}〔{str(device['deviceId'])[:8]}〕：{state}，目录{_completeness_text(device)}")
-        where = device["device"] or device["deviceId"]
+        device_id = str(device["deviceId"])
+        name_text = remote_display(device["device"]) or ""
+        lines.append(f"设备 {name_text}〔{remote_display(device_id[:8]) or ''}〕：{state}，目录{_completeness_text(device)}")
+        where = name_text or remote_display(device_id) or ""
+        reference = _copyable_device(device)
         for peer in device["peers"]:
             ref = peer["remoteRef"]
+            provider, native = str(ref["provider"]), str(ref["nativeId"])
+            known = provider in _PROVIDER_KEYS
+            valid = known and UUID_SHAPE.fullmatch(native) is not None
+            provider_text = remote_display(provider) or ""
+            short_id = shown_ids.get((provider, native), native) if valid else (remote_display(native) or "")
             # 名字只作带设备的人读旁注：已核实写「provider@名字〔ID〕」，否则「provider@id:<ID> 名称=…（仅展示）」；
-            # 可复制的永远是 target 里的完整 ID 与 --device（§91.4.2）
-            short_id = shown_ids.get((str(ref["provider"]), str(ref["nativeId"])), str(ref["nativeId"]))
-            if peer["namesVerified"] and isinstance(peer["name"], str):
-                shown = f"{ref['provider']}@{peer['name']}〔{short_id}〕"
-                name = peer["name"]
+            # 可复制的永远是 target 里的完整 ID 与 --device（§91.4.2）。对端自称已核实、名字却过不了 copyable
+            # （含会被改动的字符、首尾空白、id: 开头或 UUID 形状）或超过 120 字符（§91 上限，诚实写方不发布更长的）
+            # 时按未核实只作展示（由 remote_display 转义并截断），不写成 provider@名字
+            name = peer["name"]
+            if (peer["namesVerified"] and isinstance(name, str) and len(name) <= MAX_LABEL_CHARS
+                    and copyable(NameSource("named", name))):
+                shown = f"{provider_text}@{name}〔{short_id}〕"
+                shown_name: str | None = name
             else:
-                display = peer["displayName"] or peer["name"]
-                shown = f"{ref['provider']}@id:{short_id}" + (f" 名称={display}（仅展示）" if display else "")
-                name = display
+                shown_name = remote_display(peer["displayName"]) or remote_display(name)
+                shown = f"{provider_text}@id:{short_id}" + (f" 名称={shown_name}（仅展示）" if shown_name else "")
             flags = [] if peer["inbox"] else ["只读"]
             if not peer["eligible"]:
                 flags.append("暂不可投")
+            if not known:
+                flags.append("provider 未知")
+            elif not valid and native != UNRESOLVED_NATIVE_ID:
+                flags.append("ID 无效")  # 只留给真正不合法的值；未解析的「-」是合法行，沿用原有旗标
+            elif valid and reference is None:
+                flags.append("设备引用无效")
             suffix = f"  （{'、'.join(flags)}）" if flags else ""
-            workdir = workdir_suffix(peer["workdir"], name if isinstance(name, str) else None)
-            lines.append(f"  {shown} device={where} target={peer['target']}{suffix}{workdir}")
+            target = f" target=--device {reference} --to {provider}@id:{native}" if valid and reference else ""
+            workdir = workdir_suffix(peer["workdir"], shown_name)
+            lines.append(f"  {shown} device={where}{target}{suffix}{workdir}")
     return lines

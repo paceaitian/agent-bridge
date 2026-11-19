@@ -252,8 +252,9 @@ class PeerCompletenessTests(DirectoryCase):
         self.snapshot(complete=True, providers={"codex": True, "claude": True})
         self.assertEqual(self.device_line(), f"设备 win〔{DEV_B[:8]}〕：在线，目录完整")
         self.snapshot(complete=True, providers={"codex": False, "claude": True, "grok": False})
+        # §101.1：远端裸名本来就报 target_provider_required，文案只列因未核全而不可用的写法
         self.assertEqual(self.device_line(), f"设备 win〔{DEV_B[:8]}〕：在线，目录部分完整（codex、grok 未核全：codex、grok"
-                                             " 与不带 provider 的名字/前缀不可用，只能用完整 ID）")
+                                             " 的名字/前缀与不带 provider 的前缀不可用，只能用完整 ID）")
         # 部分完整时 Codex 行的〔ID〕回到完整 ID（同一 _relevant_complete 判据），Claude 行仍取最短唯一前缀
         text = "\n".join(directory.peer_lines(self.store, "win", now=NOW))
         self.assertIn(f"codex@impl〔{DA_CODEX}〕", text)
@@ -306,6 +307,153 @@ class PeerCompletenessTests(DirectoryCase):
         self.snapshot(complete=True, providers=None)  # 历史快照没有 providers：空表，不猜
         [device] = directory.peer_devices(self.store, "win", now=NOW)
         self.assertEqual(device["providers"], {})
+
+
+class HostilePeerTextTests(DirectoryCase):
+    """§101.1：peers 文字行里一切来自远端的字符串与本机名字同一套转义；target= 只由已校验的值拼成；--json 照给原值。"""
+
+    FIRST, SECOND = "019a0000-1111-7222-8333-44445555bbbb", "019a0000-2222-7222-8333-44445555cccc"
+    # 换行、ESC、RLO、零宽空格各自单测（转义写法同 native_names.display_text），外加一条能伪造整行设备行的串
+    HOSTILE = (("\n", "\\u000a"), ("\x1b", "\\u001b"), ("\u202e", "\\u202e"), ("\u200b", "\\u200b"),
+               ("\n设备 forged〔ffffffff〕：在线，目录完整", "\\u000a设备 forged〔ffffffff〕：在线，目录完整"))
+
+    def put_raw(self, *items: dict[str, object], device_id: str = DEV_B, name: str = "win") -> None:
+        self.store.put_device_state(device_id=device_id, name=name, revision=1, snapshot={
+            "endpoints": list(items), "complete": True, "providers": {"codex": True}, "namePolicy": directory.NAME_POLICY},
+            last_seen=NOW, state="online")
+
+    def text(self, peers: int) -> list[str]:
+        """全部设备的文字行，并断言没被伪造出新行：按 splitlines 量（列表长度量不到元素内的换行）。"""
+        lines = directory.peer_lines(self.store, None, now=NOW)
+        physical = "\n".join(lines).splitlines()
+        self.assertEqual(len(physical), 1 + peers, physical)
+        self.assertEqual(sum(line.startswith("设备 ") for line in physical), 1, physical)
+        self.assertFalse(any(line.startswith("设备 forged") for line in physical), physical)
+        self.assertFalse(any(char in "".join(physical) for char in "\x1b\u202e\u200b"), physical)
+        return lines
+
+    def raw_peer(self) -> dict[str, object]:
+        [device] = directory.peer_devices(self.store, None, now=NOW)
+        return device["peers"][0]
+
+    def test_names_and_display_names_are_escaped(self) -> None:
+        good = f"target=--device win --to codex@id:{self.FIRST}"
+        for char, escaped in self.HOSTILE:
+            hostile = f"a{char}b"
+            cases = {
+                # 对端自称已核实但名字过不了 copyable：不写成 provider@名字，只作「名称=…（仅展示）」
+                "verified-name": row(self.FIRST, hostile, verified=True),
+                "unverified-name": row(self.FIRST, hostile, verified=False),
+                "display-name": {**row(self.FIRST, "impl", verified=False), "displayName": hostile},
+            }
+            for field, item in cases.items():
+                with self.subTest(char=repr(char), field=field):
+                    self.put_raw(item)
+                    line = self.text(1)[1]
+                    self.assertIn(f"codex@id:019a0000 名称=a{escaped}b（仅展示） device=win ", line)
+                    self.assertIn(good, line)
+                    self.assertNotIn(f"codex@a{char}", line)
+                    key = "displayName" if field == "display-name" else "name"
+                    self.assertEqual(self.raw_peer()[key], hostile)  # --json 照给原值
+
+    def test_verified_names_over_the_label_limit_are_only_displayed_and_truncated(self) -> None:
+        # 长度上限照 §91（120 字符）：对端自称已核实的超长名字不整段写成 provider@名字，改作展示并按 120 截断
+        self.put_raw(row(self.FIRST, "n" * 120), row(self.SECOND, "m" * 121))
+        lines = self.text(2)
+        self.assertIn(f"codex@{'n' * 120}〔019a0000-1〕 device=win", lines[1])
+        self.assertIn(f"codex@id:019a0000-2 名称={'m' * 119}…（仅展示） device=win target=--device win", lines[2])
+
+    def test_device_name_and_id_are_escaped_and_target_falls_back_to_the_full_device_id(self) -> None:
+        for char, escaped in self.HOSTILE:
+            hostile = f"w{char}in"
+            with self.subTest(char=repr(char)):
+                self.put_raw(row(self.FIRST, "impl"), name=hostile)
+                lines = self.text(1)
+                self.assertTrue(lines[0].startswith(f"设备 w{escaped}in〔{DEV_B[:8]}〕："), lines[0])
+                self.assertIn(f" device=w{escaped}in target=--device {DEV_B} --to codex@id:{self.FIRST}", lines[1])
+                [device] = directory.peer_devices(self.store, None, now=NOW)
+                self.assertEqual(device["device"], hostile)  # --json 照给原值
+                self.assertEqual(device["peers"][0]["target"], f"--device {hostile} --to codex@id:{self.FIRST}")
+        self.store.connection.execute("DELETE FROM fed_device_state")
+        # deviceId 也不是 32 位十六进制：设备行与 device= 照样转义，没有可照抄的 --device，不给 target=
+        forged_id = "\n设备 forged" + "f" * 30
+        self.put_raw(row(self.FIRST, "impl"), device_id=forged_id, name="w\nin")
+        lines = self.text(1)
+        # 首尾空白（这里截出的 8 位以换行开头）照 display_text 用引号标出
+        self.assertTrue(lines[0].startswith('设备 w\\u000ain〔"\\u000a设备 forg"〕：'), lines[0])
+        self.assertNotIn("target=", lines[1])
+        self.assertTrue(lines[1].endswith("  （设备引用无效）"), lines[1])
+        # 没有登记名：device= 退回 deviceId，同样转义
+        self.store.connection.execute("DELETE FROM fed_device_state")
+        self.put_raw(row(self.FIRST, "impl"), device_id=forged_id, name="")
+        lines = self.text(1)
+        self.assertTrue(lines[0].startswith('设备 〔"\\u000a设备 forg"〕：'), lines[0])
+        self.assertIn(' device="\\u000a设备 forged' + "f" * 30 + '"  （设备引用无效）', lines[1])
+
+    def test_invalid_provider_or_native_id_rows_get_no_target(self) -> None:
+        # 已核实与未核实两条显示分支都要转义（r1，opus2 o14：未核实分支的 provider 曾无断言）
+        for char, escaped in self.HOSTILE:
+            for field, name in (("provider", "impl"), ("provider", None), ("nativeId", "impl"), ("nativeId", None)):
+                with self.subTest(char=repr(char), field=field, named=name is not None):
+                    item = row(self.FIRST, name)
+                    item[field] = f"{item[field]}{char}x"
+                    self.put_raw(item, row(self.SECOND, "lead"))
+                    lines = self.text(2)
+                    bad = lines[1]
+                    self.assertIn(f"{escaped}x", bad)
+                    self.assertNotIn("target=", bad)
+                    flag = "provider 未知" if field == "provider" else "ID 无效"
+                    self.assertTrue(bad.endswith(f"  （{flag}）"), bad)
+                    # 同设备的正常行照旧可照抄
+                    self.assertIn(f"target=--device win --to codex@id:{self.SECOND}", "\n".join(lines))
+                    self.assertEqual(self.raw_peer()["remoteRef"][field], item[field])  # --json 照给原值
+
+    def test_unknown_provider_and_invalid_ids_are_flagged_separately(self) -> None:
+        # 原因分开写（team-lead §101 答复）：新版对端的未知 provider 不算 ID 无效；只有不合法的 ID 值才写「ID 无效」
+        future = {**row(self.FIRST), "provider": "gemini"}
+        bad_id = row("not-a-uuid", "x")
+        self.put_raw(future, bad_id, row(self.SECOND, "lead"))
+        lines = self.text(3)
+        self.assertEqual(lines[1], f"  gemini@id:{self.FIRST} device=win  （provider 未知）")
+        self.assertEqual(lines[2], "  codex@x〔not-a-uuid〕 device=win  （ID 无效）")  # 名字照常作旁注，只是没有 target=
+
+    def test_legit_rows_of_every_provider_keep_their_display(self) -> None:
+        # 真实发布方造各 provider 的合法行：Codex 命名、无名的子代理/daemon 类线程、未解析「-」，Claude，Grok 只读。
+        # 与改前（2b11bc5）逐行比对只差一处：「-」行不再给照抄也会报 target_id_invalid 的 target=，旗标照旧；
+        # 合法行一律不得出现「ID 无效」「provider 未知」「设备引用无效」
+        items = [
+            endpoint(ref(Provider.CODEX, DA_CODEX, pid=4242, pane="%1"), name="impl"),
+            endpoint(ref(Provider.CODEX, DA_HIDDEN, pid=4242, pane=None, label=None), issues=("title_shows_subagent",),
+                     native_name=None),
+            endpoint(ref(Provider.CODEX, UNRESOLVED_NATIVE_ID, pid=4343, pane=None, label=None),
+                     issues=("title_thread_missing",), native_name=None),
+            endpoint(ref(Provider.CLAUDE, DA_CLAUDE, pid=4444, pane="%2", label="lead"), name="lead"),
+            endpoint(ref(Provider.GROK, self.SECOND, pid=4545, pane="%3", label="grok")),
+        ]
+        with patch.object(directory, "root_binding", return_value="f" * 32):
+            frame = directory.snapshot(self.store, DEV_B, with_name_views(items),
+                                       provider_complete={"codex": True, "claude": True, "grok": True})
+        self.store.put_device_state(device_id=DEV_B, name="win", revision=1, snapshot=frame, last_seen=NOW,
+                                    state="online")
+        target = "device=win target=--device win --to"
+        self.assertEqual(self.text(5), [
+            f"设备 win〔{DEV_B[:8]}〕：在线，目录完整",
+            f"  codex@id:019a1234-0 名称=impl（仅展示） {target} codex@id:{DA_CODEX}",
+            f"  codex@id:019a1234-1 {target} codex@id:{DA_HIDDEN}  （暂不可投）",
+            "  codex@id:- device=win  （暂不可投）",
+            f"  claude@lead〔019a7777〕 {target} claude@id:{DA_CLAUDE}",
+            f"  grok@id:019a0000 {target} grok@id:{self.SECOND}  （只读）"])
+
+    def test_honest_frames_are_unchanged(self) -> None:
+        # 诚实写方发布的 displayName 已经转义过（反斜杠是普通字符）：再转义一遍逐字节不变
+        published = directory.remote_display("a\u202eb")
+        self.assertEqual(published, "a\\u202eb")
+        item = {**row(self.FIRST, "impl", verified=False), "displayName": published}
+        self.put_raw(item, row(self.SECOND, "lead"))
+        self.assertEqual(self.text(2), [
+            f"设备 win〔{DEV_B[:8]}〕：在线，目录完整",
+            f"  codex@id:019a0000-1 名称=a\\u202eb（仅展示） device=win target=--device win --to codex@id:{self.FIRST}",
+            f"  codex@lead〔019a0000-2〕 device=win target=--device win --to codex@id:{self.SECOND}"])
 
 
 class CompletenessTests(DirectoryCase):
