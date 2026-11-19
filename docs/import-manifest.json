@@ -112,7 +112,7 @@
     "src/agentstatus_bridge/platforms/windows/target_aliases.py": "cc07d8f3c8fa874f56d57187ee8b1bd1032bf4e1c28acbe85705dfdb8eaf964f",
     "src/agentstatus_bridge/platforms/windows/thread_names.py": "5fa966f773e1647cacda62f105221862e3ef59c463f747ddf7424f29ea986c87",
     "src/agentstatus_bridge/platforms/windows/worker_identity.py": "2d94ff0d0adcf3b4bdd67cbd3d9a4f03c6e7a36b5c379dffe82d269410d8d083",
-    "src/agentstatus_bridge/registration.py": "aacef5cb7db57533c1506adc8d00306b1168f37bf0a687cae636042bc1bbbee8",
+    "src/agentstatus_bridge/registration.py": "87143954257989aca5f2b85a5dae60fe77fc9f37f403adb59f8f73de7d3f2b7f",
     "src/agentstatus_bridge/reminders.py": "a43e5db2cc52b948a1d26a915472797030ece817dace4ebb0a166c7d35672186",
     "src/agentstatus_bridge/reports.py": "61343762c2abdb270cc7a3d2ff76f8262c100dce98b64c5ca334ea89b3f83934",
     "src/agentstatus_bridge/store.py": "806dcb8a016a0760a7f383a56e054dae2cd01c8fac277837dcc17c4d7c10e4d9",
@@ -190,7 +190,7 @@
     "tests/test_bridge_platform_guard.py": "8ae49747e865dc02aef049efc7b433af4b61cc2048764d87d16faa57e46ff351",
     "tests/test_bridge_platform_wiring.py": "3346cc629b7d9e7bcf7ca13e67e80f5bc94e029bfa5b4f49b6e59a861152bf56",
     "tests/test_bridge_platforms.py": "42097ddf427139727c3b3f71a564bce9d682deff9dc1c98de28241d083e56928",
-    "tests/test_bridge_registration.py": "9adadef22bdc68f89b5453b5b47e4e9ef312bc165da5c5939cc353fef9abd14b",
+    "tests/test_bridge_registration.py": "b8b5d7ce6d79fd2c0bdcfe4f3e7c03fd17abcb224b2fb46cf26f8b8639e6fbf8",
     "tests/test_bridge_release.py": "6a9dd94253ed2988b2427e7263734c2e61ff394c86b00995275e63af7437c6ff",
     "tests/test_bridge_reminders.py": "5823f4cd1faa051872d076e60cd9c3e61b8d8c801da517a807d45e2e1d5f3341",
     "tests/test_bridge_reports.py": "44f8221fc393d8b9aa081acc6e12ca0df6373c9c6cb601fe4fc0ea429b9a2aa6",
@@ -225,7 +225,7 @@
     "tests/test_bridge_worker_lock.py": "a024b857ba2a184179c0d435323144a28ba31755709c49654f0714a42bf1eb4c"
   },
   "source": {
-    "commit": "877db31e62f6e2f11f538841087dc3be521fea98",
+    "commit": "2dce9f7028044c5d5a5abd33bc33b9b8fa78175c",
     "repository": "agentstatus"
   }
 }

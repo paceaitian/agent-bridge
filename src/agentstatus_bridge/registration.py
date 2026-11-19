@@ -26,6 +26,8 @@ LIMIT = 256
 MAX_RECORD = 4096
 MAX_INPUT = 65536
 GRACE = 86400
+# 写入、清理、退役各自的总时限（秒）：hook 路径必须快速放弃；测试在慢 CI runner 上调大它
+BUDGET = 1.0
 FIELDS = frozenset({'schema','provider','sessionId','agentProcess','ownerRole','source','sourceVersion',
                     'attribution','reason','candidateCount','sessionKind','observedAt','writer'})
 
@@ -142,7 +144,7 @@ class Registry:
               proof: Proof | None = None, fixture: bool = False, deadline: float | None = None) -> str:
         if not self.enabled:
             return 'disabled'
-        deadline = deadline if deadline is not None else time.monotonic()+1
+        deadline = deadline if deadline is not None else time.monotonic()+BUDGET
         if (not isinstance(payload,dict) or payload.get('hook_event_name') != 'SessionStart'
                 or provider not in ('claude','codex','grok') or session_id(payload.get('session_id')) is None):
             return 'invalid_input'
@@ -247,14 +249,14 @@ class Registry:
     def cleanup(self, *, now: float) -> int:
         if not self.enabled:
             return 0
-        deadline=time.monotonic()+1
+        deadline=time.monotonic()+BUDGET
         with self.lock(deadline):
             return self._cleanup_locked(now,deadline)
 
     def retire_exact(self, provider: str, session: str, owner: ProcessIdentity) -> int:
         if not self.enabled:
             return 0
-        with self.lock(time.monotonic()+1):
+        with self.lock(time.monotonic()+BUDGET):
             paths,_=self._paths()
             removed=0
             for path in paths[:LIMIT]:
@@ -271,7 +273,8 @@ def main() -> int:
         return 0  # disabled on Linux, no stdin/directory work
     # Hard fail-open budget, also bounds a blocking stdin/antivirus/WinAPI call.
     # Atomic temp+replace means termination cannot truncate the previous record.
-    watchdog=threading.Timer(1.0,lambda: os._exit(0))
+    # 与写入时限同一常量（产品值 1 秒）：测试调大 BUDGET 时看门狗不会提前以 0 退出整个测试进程
+    watchdog=threading.Timer(BUDGET,lambda: os._exit(0))
     watchdog.daemon=True
     watchdog.start()
     try:

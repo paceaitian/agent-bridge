@@ -16,6 +16,7 @@ import bridge_support
 from bridge_winapi import Kernel
 from bridge_winapi_sdk import assert_file_layout
 from agentstatus_bridge.platforms.windows import abi as A
+from agentstatus_bridge import registration
 from agentstatus_bridge.registration import Registry, Proof, MAX_RECORD, FIELDS, main, key
 from agentstatus_bridge.platforms.factory import make_platform, using_platform
 from agentstatus_bridge.platforms.types import Presence, ProcessIdentity
@@ -24,6 +25,9 @@ from agentstatus_bridge.platforms.types import Presence, ProcessIdentity
 class RegistrationTests(unittest.TestCase):
     def setUp(self):
         assert_file_layout(self,A.FILE_INFORMATION)
+        # 夹具锁无竞争；产品 1 秒时限在慢 CI runner 上会被建目录与开锁文件用完（2026-11-18 公开镜像 Windows CI
+        # 首跑 registration_deadline），写入、清理、退役都改给宽裕时限；专测过期的用例自己传入已过去的 deadline
+        budget=patch.object(registration,'BUDGET',30.0);budget.start();self.addCleanup(budget.stop)
         self.tmp=TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.k=Kernel(self.root)
         self.p=make_platform('windows',win_api=self.k.api)
