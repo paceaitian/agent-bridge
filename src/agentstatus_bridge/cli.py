@@ -2535,7 +2535,8 @@ def _run_command(args: argparse.Namespace) -> int:
             return error.exit_code
     if get_platform().name == 'windows':
         # main's Windows scope has already checked capability and attribution.
-        if args.command == 'peers' and not args.device:
+        # 只有真的没给 --device 才走本机列表；显式空串交给 cmd_peers 与 send/retry 同一拒绝（§102，原先 `not` 把 "" 当没给）
+        if args.command == 'peers' and args.device is None:
             return _windows_peers(args)  # 不带参数与 --all-devices：本机列表共用一个函数（§94.6）
     # 任一调用前后补查摘要：提交后未发布（进程被杀、锁超时）的窗口由下一次调用收敛；worker 与 summary 自行处理。
     # federation status/relay 前后都不补（DESIGN §90.6）：status 是维护判停的只读查询，不连主账本、不写摘要、不拉 worker；

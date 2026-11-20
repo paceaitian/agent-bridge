@@ -1037,6 +1037,27 @@ class AuditTests(unittest.TestCase):
                 self.assertFalse((self.state/'bridge.sqlite3').exists())
                 self.assertEqual(self.adds(),[])
 
+    def test_blank_peers_device_is_rejected_like_linux(self):
+        # §102：Windows 的 peers 分发原先用 `not args.device`，精确空串被当成没给、列出本机并退出 0；
+        # 改为只认 None 后，""、" "、全角空格都与 Linux 同报 target_explicit_required/2，什么也不列、不建账本
+        from agentstatus_bridge.caller_values import Caller
+        self.k.loaded=[uuid(1)]
+        self.k.metadata={uuid(1):{'id':uuid(1),'source':'cli','name':'origin','cwd':'C:\\project-0'}}
+        env=self.chain()
+        with (self.scope(),patch.dict(os.environ,env),
+              patch('agentstatus_bridge.platforms.windows.caller.identify',return_value=Caller(None,None,'windows-terminal',False)),
+              patch.object(cli,'_start_worker',return_value=False),patch.object(cli,'_worker_up',return_value=False),
+              patch.object(cli,'_revive_for_federation',return_value=None)):
+            for blank in ('',' ','\u3000'):
+                code,out,err=self.run_cli('peers','--device',blank)
+                self.assertEqual((code,out),(2,''),(blank,err))
+                self.assertIn('[target_explicit_required]',err)
+                self.assertFalse((self.state/'bridge.sqlite3').exists())
+            # 对照：不给 --device 仍列出本机（分发没有被改成一律走 cmd_peers）
+            code,out,err=self.run_cli('peers')
+            self.assertEqual(code,0,err)
+            self.assertIn(uuid(1)[:8],out)
+
     def test_name_union_independently_rejects_empty_and_peers_roundtrip(self):
         rows=tuple(D.Candidate(uuid(i+1),'root',name=name,cwd_label='',names_verified=True)
                    for i,name in enumerate(('', 'named')))
