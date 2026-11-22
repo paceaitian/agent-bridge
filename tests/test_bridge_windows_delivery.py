@@ -1037,6 +1037,33 @@ class AuditTests(unittest.TestCase):
                 self.assertFalse((self.state/'bridge.sqlite3').exists())
                 self.assertEqual(self.adds(),[])
 
+    def test_blank_peers_device_is_rejected_like_linux(self):
+        # §102：Windows 的 peers 分发原先用 `not args.device`，精确空串被当成没给、列出本机并退出 0；
+        # 改为只认 None 后，""、" "、全角空格（单独或与 --all-devices 同给）都与 Linux 同报 target_explicit_required/2，
+        # 什么也不列、不建账本，也不进 Windows 本机列表函数
+        from agentstatus_bridge.caller_values import Caller
+        self.k.loaded=[uuid(1)]
+        self.k.metadata={uuid(1):{'id':uuid(1),'source':'cli','name':'origin','cwd':'C:\\project-0'}}
+        env=self.chain()
+        with (self.scope(),patch.dict(os.environ,env),
+              patch('agentstatus_bridge.platforms.windows.caller.identify',return_value=Caller(None,None,'windows-terminal',False)),
+              patch.object(cli,'_start_worker',return_value=False),patch.object(cli,'_worker_up',return_value=False),
+              patch.object(cli,'_revive_for_federation',return_value=None),
+              patch.object(cli,'_windows_peers',wraps=cli._windows_peers) as local_list):
+            # W3.18 审计：--all-devices 与空 --device 同给也要拒绝（`or args.all_devices` 的变异由这一项杀死）
+            for argv in (('peers','--device',''),('peers','--device',' '),('peers','--device','\u3000'),
+                         ('peers','--all-devices','--device','')):
+                code,out,err=self.run_cli(*argv)
+                self.assertEqual((code,out),(2,''),(argv,err))
+                self.assertIn('[target_explicit_required]',err)
+                self.assertFalse((self.state/'bridge.sqlite3').exists())
+                self.assertFalse(local_list.called,argv)
+            # 对照：不给 --device 仍走 Windows 本机列表函数并列出本机（只改了判断条件，没有改成一律走 cmd_peers）
+            code,out,err=self.run_cli('peers')
+            self.assertEqual(code,0,err)
+            self.assertIn(uuid(1)[:8],out)
+            self.assertEqual(local_list.call_count,1)
+
     def test_name_union_independently_rejects_empty_and_peers_roundtrip(self):
         rows=tuple(D.Candidate(uuid(i+1),'root',name=name,cwd_label='',names_verified=True)
                    for i,name in enumerate(('', 'named')))
