@@ -15,7 +15,7 @@ import time
 from types import FrameType
 
 from .platforms.factory import get_platform
-from . import summary
+from . import nudges, summary
 from .dispatch import Dispatcher, LogFn
 from .codex_metadata import MetadataCache
 from .endpoints import ADAPTERS, DiscoverySources, discover
@@ -161,6 +161,9 @@ def _publish_summary(store: Store, directory: Path, log: LogFn, *, force: bool) 
         return None
     if result.status == "written":
         log("summary_published", {"revision": result.revision})
+        if result.skipped or result.duplicates:
+            # 并入的联邦任务里有坏记录被跳过、或与本机账本重复 ID（本机优先）：只记条数（§103.7）
+            log("summary_federation_items", {"skipped": result.skipped, "duplicates": result.duplicates})
     return result
 
 
@@ -345,6 +348,8 @@ def run_worker(
             # 水位取实际发布的快照：发布之后才提交的修订不能记作已发布（3A-F03）
             summary_seen = None if started is None else (started.ledger_id, started.revision)
             summary_failures = 1 if summary_pending else 0
+            # 最早的未到期定时项：到点时账本修订不变，但摘要里「定时发出」要改成等待写法，再发布一次（§104.11 P3）
+            summary_refresh_at = None if started is None else started.refresh_at
             sources = None if platform.name == 'windows' else DiscoverySources(native_metadata=MetadataCache())
             attempt_queue_state = None
             empty_complete = None
@@ -377,6 +382,10 @@ def run_worker(
                 reply_address=inbox.address if inbox is not None else None,
                 command=command_name(),
                 log=log,
+                # 催执行方只在 Linux 默认发现下接入（§104.9 一）：Windows 量不了轮次结束与后台任务；注入的发现函数
+                # （测试）不带 observer，同样不催
+                observe=(lambda: nudges.observations(sources.native_metadata))
+                if sources is not None and selected_discover is None else None,
             )
             if sources is not None and selected_discover is None:
                 # Linux 默认发现带本轮完整性：联邦作业据此判「完整的空结果」（目标已退出）；本机 Dispatcher 维持原口径
@@ -459,17 +468,20 @@ def run_worker(
                             mark = None
                         if not summary_pending and mark != summary_seen:
                             summary_failures = 0  # 账本有新变化：重新开始计数
-                        if summary_pending or mark != summary_seen:
+                        refresh_due = summary_refresh_at is not None and time.time() >= summary_refresh_at
+                        if summary_pending or mark != summary_seen or refresh_due:
                             published = _publish_summary(store, directory, log, force=False)
                             if published is not None:
                                 summary_seen = (published.ledger_id, published.revision)
                                 summary_pending, summary_failures = False, 0
+                                summary_refresh_at = published.refresh_at
                             else:
                                 summary_failures += 1
                                 # 有界重试：连续失败达到上限后不再为摘要驻留，下次任一 ab 调用或启动时补写
                                 summary_pending = summary_failures < MAX_CONSECUTIVE_FAILURES
                                 if not summary_pending:
                                     summary_seen = mark  # 放弃这一修订的补写，账本再变化时重试
+                                    summary_refresh_at = None  # 到期刷新同样放弃，不每轮重试
                         live = live or summary_pending
                         failures = 0
                     except Exception as error:  # 单轮失败不让 worker 静默退出

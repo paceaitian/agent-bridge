@@ -124,7 +124,7 @@ class ObserverView:
     `rows` 里的 pane 键不分 provider、会借到同 pane 别家的行，只留给 `states`（doctor 判可读）与诊断；
     凡是按 pane 判定（等待用户、Codex/Grok 的忙闲）一律用 `pane_row`，它从按 `(pane, agent)` 分开的
     `panes` 里只取同 provider 的行（DESIGN §62 ④）。「对方已停下未汇报」提示更严，按目标的 observer 键取行
-    （`cli._target_state`，§62 ⑤）。
+    （`nudges.target_pane_state`，§62 ⑤）。
     """
 
     rows: Mapping[str, ObserverRow] = field(default_factory=dict)

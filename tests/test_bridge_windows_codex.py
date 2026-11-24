@@ -434,11 +434,24 @@ class WindowsCodexTests(unittest.TestCase):
                 if case == 'shape': self.assertEqual(result['reason'], 'initialize_failed')
 
     def test_absolute_deadline_and_receive_cap(self):
-        with patch.object(local_transport.time, 'monotonic', side_effect=[10, 10, 10.7]):
-            stream = local_transport.DaemonStream(self.p.transport)
+        with patch.object(local_transport.time, 'monotonic', side_effect=[10, 10, 10.7, 11]):
+            stream = local_transport.DaemonStream(self.p.transport)  # 总预算 10 + 5
             stream.settimeout(.5)
-            stream.settimeout(1)
             self.assertEqual(stream.deadline, 10.5)
+            # 一步的短时限只管这一步，不粘在整条流上（§103.1 steer 预算缺陷）；但之后的 settimeout 从不续总预算
+            stream.settimeout(1)
+            self.assertEqual(stream.deadline, 11.7)
+            stream.settimeout(600)
+            self.assertEqual(stream.deadline, 15)
+            self.assertEqual(stream.budget_deadline, 15)
+        with patch.object(local_transport.time, 'monotonic', return_value=511.871):
+            stream = local_transport.DaemonStream(self.p.transport)
+            # 同一 tick 内「600 秒总截止 - now」可能比 600 多一个 ulp：截到总截止，不抛（§103.1）
+            stream.settimeout(600 + 1e-9)
+            self.assertEqual(stream.deadline, stream.budget_deadline)
+            for bad in (0, -1, float('nan')):
+                with self.assertRaises(TimeoutError):
+                    stream.settimeout(bad)
         self.assertEqual(codex_native.READ_SECONDS, 1.0)
         self.assertEqual(codex_native.MAX_RECEIVE_BYTES, 4*1024*1024)
         with patch.object(local_transport.DaemonStream, 'settimeout', side_effect=TimeoutError):

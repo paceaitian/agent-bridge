@@ -519,6 +519,72 @@ class WindowsSteerTests(unittest.TestCase):
         self.assertEqual(listing["params"], {"threadId": THREAD_W(), "limit": 1, "sortDirection": "desc",
                                              "itemsView": "notLoaded"})
 
+    def test_read_step_deadline_does_not_shrink_the_whole_stream(self) -> None:
+        # §103.1：turns/list 的 30 秒步骤时限只管这一步；它之后再过 40 秒（总预算 600 秒内）steer 仍应送达，
+        # 不能被永久写进整条流而变成 UNKNOWN codex_steer_timeout
+        from agentstatus_bridge.platforms.windows import codex_delivery as T, local_transport as LT
+        now = [1000.0]
+        remaining: list[float] = []
+        original_turn, original_send = T.in_progress_turn, LT.DaemonStream.sendall
+
+        def turn(result: object) -> Any:
+            now[0] += 40.0
+            return original_turn(result)
+
+        def sendall(stream: Any, data: bytes) -> None:
+            remaining.append(stream.deadline - now[0])
+            original_send(stream, data)
+
+        with self.scope():
+            target = self.target()
+            with patch.object(T.time, "monotonic", side_effect=lambda: now[0]), \
+                    patch.object(T, "in_progress_turn", turn), patch.object(LT.DaemonStream, "sendall", sendall):
+                result = self.deliver(target)
+        self.assertEqual((result.delivery, result.reason), (Delivery.DELIVERED, "codex_steered"))
+        # turns/list 那一帧受 30 秒步骤时限；之后的 steer 帧回到总预算（1600 - 1040）
+        self.assertIn(30.0, remaining)
+        self.assertGreater(remaining[remaining.index(30.0) + 1], 500.0)
+
+    def test_read_steps_never_outlive_the_total_deadline(self) -> None:
+        # §103.8 修 3（Opus2 W4）：剩余总预算短于步骤时限（这里 10 秒 < 15/30 秒）时，只读步骤的时限取总截止，
+        # 不取「现在 + 步骤秒数」；去掉 codex_delivery 里那处 min 就会把步骤时限推到总截止之后
+        from agentstatus_bridge.platforms.windows import codex_delivery as T
+        from agentstatus_bridge.transports.codex_native import BoundedConnection
+        for case in ("turns_only", "read_and_turns"):
+            with self.subTest(case=case):
+                self.rebuild()
+                if case == "read_and_turns":
+                    self.base.sql(self, [(THREAD_W(), "cli")])  # type: ignore[arg-type]  SQL 已分类：补充消息自己读状态
+                now = [1000.0]
+                total = now[0] + T.TOTAL_SECONDS
+                steps: dict[str, float] = {}
+                real_response, real_classes = BoundedConnection.response, T.read_classes
+                kernel = self.k
+
+                def classes(*args: Any, **kwargs: Any) -> Any:
+                    found = real_classes(*args, **kwargs)
+                    now[0] = total - 10.0  # 分类之后只剩 10 秒总预算
+                    return found
+
+                def response(client: Any, expected: int, deadline: float, *, stale: Sequence[int] = ()) -> Any:
+                    method = kernel.messages[-1]["method"] if kernel.messages else ""
+                    if now[0] > 1000.0 and method in ("thread/read", "thread/turns/list"):
+                        steps[method] = deadline
+                    return real_response(client, expected, deadline, stale=stale)
+
+                with self.scope():
+                    target = self.target()
+                    self.k.messages.clear()
+                    with patch.object(T.time, "monotonic", side_effect=lambda: now[0]), \
+                            patch.object(T, "read_classes", classes), \
+                            patch.object(BoundedConnection, "response", response):
+                        result = self.deliver(target)
+                self.assertEqual((result.delivery, result.reason), (Delivery.DELIVERED, "codex_steered"))
+                # turns_only 的 thread/read 是分类那一步（本来就用总截止），也一并记下、同样核对
+                self.assertEqual(set(steps), {"thread/read", "thread/turns/list"})
+                for method, deadline in steps.items():
+                    self.assertEqual(deadline, total, method)
+
     def test_sql_classified_target_still_reads_status_once(self) -> None:
         # SQL 已答分类时分类步骤不发 thread/read；补充消息自己补一次 metadata-only 读取
         self.base.sql(self, [(THREAD_W(), "cli")])  # type: ignore[arg-type]

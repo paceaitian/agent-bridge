@@ -28,6 +28,7 @@ import uuid
 from .platforms import process as procfs
 from .ids import is_id_prefix, new_id
 from .model import (
+    AUTO_RETRY_OPTION,
     CLOSURE_KIND,
     FYI_KIND,
     FYI_OPTION,
@@ -35,6 +36,7 @@ from .model import (
     HANDED_OVER,
     NOTE_KIND,
     NOTICE_KIND_OPTION,
+    REMIND_OPTION,
     REMINDER_OPTION,
     Attempt,
     Consumption,
@@ -46,6 +48,8 @@ from .model import (
     Task,
     Verdict,
     Work,
+    auto_retry_final_detail,
+    pre_send_subset,
 )
 from .paths import ensure_private_dir, state_dir
 from .transports.codex_native import native_id
@@ -183,6 +187,18 @@ class StoreError(Exception):
 
 def _dump(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _send_allowed(row: sqlite3.Row, *, allow_paused: bool = False) -> bool:
+    """begin_send 与 requeue_for_retry 共用的发送谓词：任务仍活跃、未关闭、未验收。
+
+    结束回执本来就是任务结束后才生成的、告知的任务建立即关闭，暂停也不挡它们（DESIGN §45.31.5、§95.5.7）。
+    allow_paused：重排只挡关闭与验收——暂停的照常回到 PENDING，resume 后到期由 begin_send 放行（§103.8 修 6）。
+    """
+    after_finish = row["role"] == Role.NOTICE.value and _load_dict(row["options"]).get(NOTICE_KIND_OPTION) in (
+        CLOSURE_KIND, FYI_KIND)
+    active = row["control"] == "active" or allow_paused
+    return after_finish or (active and row["closed_at"] is None and row["accepted_at"] is None)
 
 
 def _load_dict(raw: object) -> dict[str, Any]:
@@ -580,10 +596,13 @@ class Store:
         now: float,
         task_options: dict[str, Any] | None = None,
         attempt_options: dict[str, Any] | None = None,
+        bridge_sender: bool = False,
     ) -> tuple[Task, Attempt]:
         """一句话告知（DESIGN §95.5.7）：同一写事务里建任务并立即关闭，唯一一条 seq 1 的 notice（noticeKind=fyi）。
 
         已关闭的任务不占进行中任务容量；全局 PENDING 上限照常计入。没有工作尝试，所以没有提醒、结束回执与验收。
+        bridge_sender：`ab remind` 的定时提醒由桥替调用方发给它自己（§104.9 二），消息不以发起会话的名义发出（from=user），
+        任务 origin 仍是调用方，取消与 --list 照常按它认。
         """
         check_body(body)
         with self._transaction() as conn:
@@ -613,7 +632,7 @@ class Store:
                 body=body,
                 refs=refs,
                 now=now,
-                sender=origin,
+                sender=None if bridge_sender else origin,
                 sender_class=origin_class,
                 options={**(attempt_options or {}), NOTICE_KIND_OPTION: FYI_KIND},
             )
@@ -831,8 +850,11 @@ class Store:
             }
             # 结束回执与补充消息单独标出 kind：扩展据此静默它们触发的那一轮，普通结果回执与提醒照常通知
             # （DESIGN §45.31.7、§95.5.3；kind 是可选开放字符串，键集与 summary v1 合同不变）
-            kind = _load_dict(row["options"]).get(NOTICE_KIND_OPTION)
-            if item["role"] == Role.NOTICE.value and kind in QUIET_NOTICE_KINDS:
+            options = _load_dict(row["options"])
+            kind = options.get(NOTICE_KIND_OPTION)
+            # ab remind 的定时提醒（§104.9 二）是 fyi 但叫醒的那一轮不静默：不标 kind，扩展照常通知
+            if item["role"] == Role.NOTICE.value and kind in QUIET_NOTICE_KINDS and not (
+                    kind == FYI_KIND and options.get(REMIND_OPTION) is True):
                 item["kind"] = kind
             deliveries.append((float(row["delivery_at"]), item))
         return deliveries
@@ -931,14 +953,7 @@ class Store:
                 " JOIN tasks t ON t.id = a.task_id WHERE a.id = ? AND a.delivery = 'pending'",
                 (attempt_id,),
             ).fetchone()
-            if row is None:
-                return False
-            # 结束回执本来就是任务结束后才生成的、告知的任务建立即关闭，暂停也不挡它们（DESIGN §45.31.5、§95.5.7）
-            after_finish = row["role"] == Role.NOTICE.value and _load_dict(row["options"]).get(NOTICE_KIND_OPTION) in (
-                CLOSURE_KIND, FYI_KIND)
-            if not after_finish and (
-                row["control"] != "active" or row["closed_at"] is not None or row["accepted_at"] is not None
-            ):
+            if row is None or not _send_allowed(row):
                 return False
             conn.execute(
                 "UPDATE attempts SET delivery = 'sending', delivery_reason = NULL,"
@@ -960,8 +975,16 @@ class Store:
         now: float,
         native_root: str | None = None,
     ) -> bool:
-        """sending→原生结果；只接受仍处于 sending 的记录。"""
+        """sending→原生结果；只接受仍处于 sending 的记录。
+
+        这条尝试自动重试过（options.autoRetry，DESIGN §103.1）时，最终 detail 另记 autoRetried、首次原因码
+        firstReason 与首次写前诊断 firstPreSend*（闭集码与数值，只在本机）。
+        """
         with self._transaction() as conn:
+            row = conn.execute("SELECT options FROM attempts WHERE id = ?", (attempt_id,)).fetchone()
+            extra = auto_retry_final_detail(_load_dict(row[0])) if row is not None else {}
+            if extra:
+                detail = {**detail, **extra}
             changed = self.transition_delivery(
                 attempt_id, expected=(Delivery.SENDING,), new=delivery, reason=reason,
                 now=now, provider_ref=provider_ref, detail=detail,
@@ -972,6 +995,64 @@ class Store:
                 options["codexDataRoot"] = native_root
                 conn.execute("UPDATE attempts SET options=? WHERE id=?", (_dump(options), attempt_id))
             return changed
+
+    def requeue_for_retry(self, attempt_id: str, *, due: float, first: str,
+                          first_detail: dict[str, Any] | None = None) -> bool:
+        """发送前瞬时失败（DESIGN §103.1）：sending→pending，等到 due 再自动重试一次；已重试过或已不是 sending 时返回 False。
+
+        回到首发前的形状——reason、delivery_at、provider_ref 置空，detail 置 {}——并且**不写** `delivery_*` 事件：
+        中间那次失败对 status、时间线与 `--json` 都不可见。标记放 options.autoRetry（begin_send 会覆盖 detail），
+        同一消息 ID 不变。不改任务 updated_at。
+
+        外调期间任务被关闭或验收时不重排（与 begin_send 同一谓词、同一事务，§103.8 修 6）：返回 False，
+        调用方照常落 FAILED——否则回到 PENDING 后 begin_send 永远不再领取，尝试永久停在「排队中」。
+        暂停不在此列：照常重排，resume 后到期即发。
+        """
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT a.role, a.options, t.control, t.closed_at, t.accepted_at FROM attempts a"
+                " JOIN tasks t ON t.id = a.task_id WHERE a.id = ? AND a.delivery = 'sending'",
+                (attempt_id,),
+            ).fetchone()
+            if row is None or not _send_allowed(row, allow_paused=True):
+                return False
+            options = _load_dict(row["options"])
+            if AUTO_RETRY_OPTION in options:
+                return False  # 最多一次：标记在 options，回滚到旧版再升级回来也认得
+            marker: dict[str, Any] = {"due": due, "first": first}
+            saved = pre_send_subset(first_detail or {})
+            if saved:
+                marker["detail"] = saved  # 首次卡在哪一步：重试成功时最终 detail 只能从这里带出
+            options[AUTO_RETRY_OPTION] = marker
+            conn.execute(
+                "UPDATE attempts SET delivery = 'pending', delivery_reason = NULL, delivery_at = NULL,"
+                " provider_ref = NULL, delivery_detail = '{}', options = ? WHERE id = ?",
+                (_dump(options), attempt_id),
+            )
+        return True
+
+    def set_attempt_option(self, attempt_id: str, key: str, value: object) -> None:
+        """写尝试 options 里的一个本机键（`--ask` 记问题，DESIGN §104.9 五）；不改投递、工作状态与修订以外的字段。"""
+        with self._transaction() as conn:
+            row = conn.execute("SELECT options FROM attempts WHERE id = ?", (attempt_id,)).fetchone()
+            if row is None:
+                raise StoreError("attempt_not_found")
+            options = _load_dict(row["options"])
+            options[key] = value
+            conn.execute("UPDATE attempts SET options = ? WHERE id = ?", (_dump(options), attempt_id))
+
+    def clear_attempt_option(self, attempt_id: str, key: str) -> bool:
+        """删掉尝试 options 里的一个本机键（`ab send` 清 originWatch 用）；没有这个键时不写库、返回 False。"""
+        with self._transaction() as conn:
+            row = conn.execute("SELECT options FROM attempts WHERE id = ?", (attempt_id,)).fetchone()
+            if row is None:
+                return False
+            options = _load_dict(row["options"])
+            if key not in options:
+                return False
+            del options[key]
+            conn.execute("UPDATE attempts SET options = ? WHERE id = ?", (_dump(options), attempt_id))
+        return True
 
     def prepare_withdrawal(self, task_id: str, seq: int, *, root_identity: str, now: float,
                            pid: int, start: str, again: bool = False) -> tuple[dict[str, Any], bool]:
@@ -1192,6 +1273,14 @@ class Store:
         with self._transaction() as conn:
             self._event(conn, task_id, kind, now, attempt_seq=attempt_seq, detail=detail)
 
+    def last_event_id(self, task_id: str, *, attempt_seq: int, kind: str) -> int | None:
+        """某尝试上某类事件最近一条的单调序号（events.id 自增，不复用）；没有为 None（§104.13 第 5 条）。"""
+        row = self._conn.execute(
+            "SELECT MAX(id) AS id FROM events WHERE task_id = ? AND attempt_seq = ? AND kind = ?",
+            (task_id, attempt_seq, kind),
+        ).fetchone()
+        return None if row is None or row["id"] is None else int(row["id"])
+
     def events(self, task_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT attempt_seq, at, kind, detail FROM events WHERE task_id = ? ORDER BY id DESC LIMIT ?",
@@ -1291,17 +1380,31 @@ class Store:
         return int(row["value"]) if row is not None and str(row["value"]).isdigit() else 0
 
     def prune(self, *, now: float) -> int:
-        """删除超过保留期或数量上限的已结束任务；未结束任务从不自动删除。"""
+        """删除超过保留期或数量上限的已结束任务；未结束任务从不自动删除。
+
+        已结束但还有可投递或正在投递的尝试的任务也不删、不计入数量上限（§104.12 第 5 条）：`ab remind`、`--fyi --after`
+        这类建好就关闭的定时项、结束后才排的结束回执，要等投递落定后才进入清理。「可投递」只认结束后仍会发的
+        告知与结束回执（Attempt.delivers_after_finish）的 PENDING，加上任何 SENDING；结束时 close/accept 已作废普通
+        PENDING，残留的普通 PENDING 不会再发，不能让它把任务永远留住。
+        """
         cutoff = now - FINISHED_RETENTION_SECONDS
+        # 与 _deliverable 的 after_finish 同口径（notice 且 noticeKind 为结束回执/告知）；json_extract 遇坏 JSON 会让整条
+        # 清理报错，先用 CASE 判 json_valid（与 followers 等同一写法）
+        settled = (" AND NOT EXISTS (SELECT 1 FROM attempts WHERE attempts.task_id = tasks.id AND ("
+                   "attempts.delivery = 'sending' OR (attempts.delivery = 'pending'"
+                   f" AND attempts.role = '{Role.NOTICE.value}'"
+                   " AND CASE WHEN json_valid(attempts.options)"
+                   f" THEN json_extract(attempts.options, '$.{NOTICE_KIND_OPTION}') END"
+                   f" IN ('{CLOSURE_KIND}', '{FYI_KIND}'))))")
         with self._transaction() as conn:
             expired = conn.execute(
                 "DELETE FROM tasks WHERE COALESCE(closed_at, accepted_at) IS NOT NULL"
-                " AND COALESCE(closed_at, accepted_at) < ?",
+                " AND COALESCE(closed_at, accepted_at) < ?" + settled,
                 (cutoff,),
             ).rowcount
             overflow = conn.execute(
                 "DELETE FROM tasks WHERE id IN (SELECT id FROM tasks"
-                " WHERE COALESCE(closed_at, accepted_at) IS NOT NULL"
+                " WHERE COALESCE(closed_at, accepted_at) IS NOT NULL" + settled +
                 " ORDER BY COALESCE(closed_at, accepted_at) DESC LIMIT -1 OFFSET ?)",
                 (MAX_FINISHED_TASKS,),
             ).rowcount

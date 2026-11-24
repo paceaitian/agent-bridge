@@ -2,9 +2,28 @@
 
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass
+import math
+import time
 
-from .model import Attempt, Consumption, Delivery, Phase, Role, Runtime, Task, Work, describe
+from collections.abc import Mapping
+from typing import Any
+
+from .model import (
+    AUTO_RETRY_OPTION,
+    Attempt,
+    Consumption,
+    Delivery,
+    Phase,
+    Role,
+    Runtime,
+    Task,
+    TaskView,
+    Work,
+    defer_time,
+    describe,
+)
 from .naming import command_name
 from .store import MAX_BODY_BYTES, MAX_FILES, attempt_limit
 from .transports.codex_queue import READABLE_REASONS
@@ -48,6 +67,9 @@ NOTE_LABEL = "补充"
 # 一句话告知（DESIGN §95.5.7）：role 是 notice，任务建立即关闭；状态行写「已告知（关闭）」
 FYI_LABEL = "告知"
 FYI_STATUS_LABEL = "已告知（关闭）"
+# 催执行方与定时提醒（DESIGN §104.9 一、二）：role 都是 notice，催促发给执行方，定时提醒发给调用方自己
+NUDGE_LABEL = "催促"
+REMIND_LABEL = "定时提醒"
 RUNTIME_LABELS: dict[Runtime, str] = {
     Runtime.IDLE: "空闲",
     Runtime.BACKGROUND: "后台",
@@ -133,15 +155,18 @@ REASON_TEXTS: dict[str, str] = {
     "argument_invalid_utf8": "命令行参数必须是合法 UTF-8（终端或脚本传入了非法字节）；未执行任何操作",
     "file_too_large": "文件过大（上限 256 MiB）",
     "too_many_files": f"文件过多（上限 {MAX_FILES} 个）",
+    # 跨设备 retry 继承的附件与新附件合计超过单条消息 32 MiB（§104.11 第 5 条；信封校验的闭集码）
+    "attachment_too_large": "附件合计过大（单条消息上限 32 MiB），请减少 --ref 后重试",
     "commit_invalid": "提交号格式不对",
     "empty_message": "任务内容为空",
     "message_and_file_conflict": "-m 与 --file 只能二选一",
     "message_too_large": f"任务内容过长（上限 {MAX_BODY_BYTES // 1024} KiB），请改用 --ref 引用文件",
     "capacity_active_tasks": "进行中的任务过多（上限 100），请先验收或关闭一些",
     "capacity_pending": "排队中的消息过多，请稍后再试",
-    "capacity_attempts": "这项任务的交接次数已达上限；请 {command} close 旧任务，再 {command} send 新任务（可加 --follows <旧ID> 关联）",
-    "attempts_near_limit": "接近交接上限，长迭代建议 {command} close 旧任务、{command} send 新任务（可加 --follows <旧ID> 关联）",
-    "report_attempts_near_limit": "接近交接上限，后续由发起方决定 {command} close 本任务、{command} send 新任务（可加 --follows <旧ID> 关联）",
+    # 占位写成带引号的中文（§104.11 P3）：<旧ID> 照抄进 shell 是重定向
+    "capacity_attempts": "这项任务的交接次数已达上限；请 {command} close 旧任务，再 {command} send 新任务（可加 --follows \"旧任务ID\" 关联）",
+    "attempts_near_limit": "接近交接上限，长迭代建议 {command} close 旧任务、{command} send 新任务（可加 --follows \"旧任务ID\" 关联）",
+    "report_attempts_near_limit": "接近交接上限，后续由发起方决定 {command} close 本任务、{command} send 新任务（可加 --follows \"旧任务ID\" 关联）",
     "notification_attempts_report": "汇报已提交，通知未能排队（交接次数已达上限），发起方需 {command} status 查看；不要重复汇报",
     "notification_pending_report": "汇报已提交，通知未能排队（全局待投递容量已满），发起方需 {command} status 查看；不要重复汇报。队列腾空后，若本任务还有提醒名额且仍符合提醒条件，提醒会照常叫醒发起方",
     "notification_attempts_status": "对方汇报已提交，通知因交接次数已达上限未排队；请查看本任务结果并决定 {command} close 后新开任务",
@@ -176,7 +201,9 @@ REASON_TEXTS: dict[str, str] = {
     "target_root_changed": "Codex 数据根与原任务不一致，未投递",
     "target_not_loaded": "目标已离开 loaded 集，未投递",
     "target_generation_changed": "Codex daemon 代际已改变，未投递",
-    "codex_deadline_before_send": "投递预算已用尽，尚未发送 add 帧",
+    "daemon_changed": "Codex daemon 在连接期间换了（可能正在重启），消息确定没有送出",
+    "boundary_store_busy": "本机账本正忙，发送前停下，消息确定没有送出",
+    "codex_deadline_before_send": "发送前等待 Codex 超时，消息确定没有送出",
     "codex_preflight_failed": "Windows Codex 写前核验失败，未发送 add 帧",
     "alias_store_unverified": "本地别名库无法安全读取，未改写",
     "alias_store_busy": "本地别名库正忙，请重试",
@@ -202,7 +229,7 @@ REASON_TEXTS: dict[str, str] = {
     "note_not_authority": "跨设备任务只能在发起设备上补充（本机是镜像）",
     # ab send --fyi（DESIGN §95.5.7）
     "fyi": "一句话告知，建立即关闭；只需对方读到，不汇报、不验收",
-    "fyi_conflict": "--fyi 只发一句话告知，不能与 --review-by、--review-device、--no-notify 同用",
+    "fyi_conflict": "--fyi 只发一句话告知，不能与 --review-by、--review-device、--no-notify、--expect 同用",
     "fyi_remote_unsupported": "对方设备的协作桥版本还不支持跨设备告知（--fyi）；请对方升级后再发，或改用普通任务",
     # tasks 筛选（DESIGN §93.1）
     "mine_requires_session": "--mine 按会话 ID 匹配，需要在认得出的 agent 会话里运行；用户终端或 /clear 后的新会话请用不带 --mine 的 {command} tasks",
@@ -278,6 +305,8 @@ REASON_TEXTS: dict[str, str] = {
     "stop_controller_failed": "relay 的停止控制线程意外退出，relay 已停止；服务管理器会重新拉起",
     "relay_elevated": "relay 不能在管理员（提权）令牌下运行",
     "remote_endpoint_unresolved": "对方设备的目录里没有这个会话；先用 peers --device 查看，再用 provider@id:<完整ID> 指定",
+    "target_remote_invalid": "对方目录里这个会话的记录不合法（ID 含空白或控制字符、过长，或 provider 未知等），不能作目标；"
+                             "用 {command} peers --device 核对，或等对方设备刷新目录后重试",
     "device_unknown": "未知设备：本机目录里没有这个设备名或设备 ID",
     "mirror_archived": "本机镜像已归档，不再投递或汇报",
     "task_cancelled": "发起设备已请求取消",
@@ -304,12 +333,50 @@ REASON_TEXTS: dict[str, str] = {
     "device_storage_full": "本机联邦内容已到预算上限（storageBudgetBytes）：等过期内容回收或调高预算后再试",
     "federation_rebuild_same_hub": "新 hubId 与当前相同；灾难换 hub 必须使用新的 hubId",
     "federation_rebuild_needs_new_device": "本机联邦库已丢失：必须用 hub 新登记的设备 ID（--device-id）",
-    "federation_rebuild_incomplete": "联邦库与配置的 hubId 不一致（上次换 hub 没有完成）：重新运行 ab federation rebuild --hub-id <新hubId>",
+    "federation_rebuild_incomplete": "联邦库与配置的 hubId 不一致（上次换 hub 没有完成）：重新运行 ab federation rebuild --hub-id \"新hubId\"",
     "relay_running": "relay 正在运行：先停止 relay 再换 hub，完成后重新启动",
     "federation_rebuild_device_mismatch": "本机联邦库完整时保留原设备 ID；hub 重新登记时请用 --device-id 保留原 ID",
     "hub_rebuilt": "hub 已换新：旧 hub 上的发件冻结，不转投新 hub",
     "summary_federation_unavailable": "联邦库不可读：协作摘要保持上一份，标为落后于账本",
+    # §104 甲：延迟投递、执行方提问、定时提醒、沉默提醒与 todo（DESIGN §104.9 一、二、五、六）
+    "deferred": "定时发出，到点前不外调",
+    "question_asked": "对方在等你回答（任务仍在进行）",
+    "ask_requires_note": "--ask 要用 --note 写明问题",
+    "after_invalid": "--after 格式不对：写 1m～24h 之间的时长（如 30m、2h），单位 m 或 h",
+    "expect_invalid": "--expect 格式不对：写 5m～24h 之间的时长（如 45m、2h），单位 m 或 h",
+    "in_invalid": "--in 格式不对：写 1m～24h 之间的时长（如 31m、2h），单位 m 或 h",
+    "silent": "从锚点起满设定时长没有新的汇报",
+    "remind_requires_session": "{command} remind 只给认得出的 agent 会话用：提醒会送回调用会话本身；用户终端与认不出的会话不能排提醒",
+    # 正文输入统一（DESIGN §104.4）：report 说明超长不再静默截断，与 --note-file 互斥
+    "note_too_large": "说明过长（上限 4000 字），长内容请写成文件用 --file 交附件",
+    "note_and_file_conflict": "--note 与 --note-file 只能二选一",
 }
+# origin_reminded 事件 detail 带 immediate=true 时（确定未送达立即告知，DESIGN §103.2）用这个标签；不新增事件取值
+ORIGIN_NOTIFIED_UNDELIVERED_LABEL = "投递未成功，已告知发起方"
+# origin_reminded 事件 detail.reason=silent 时（对方沉默提醒，DESIGN §104.9 一）用这个标签；同样不新增事件取值
+ORIGIN_NOTIFIED_SILENT_LABEL = "对方迟迟没有汇报，已提醒发起方"
+
+
+def silent_minutes(detail: object) -> int | None:
+    """沉默提醒事件 detail 里的分钟数（§104.9 一：{"reason":"silent","minutes":N}）；不是沉默提醒或没有合法分钟数为 None。"""
+    if not isinstance(detail, dict) or detail.get("reason") != "silent":  # pyright: ignore[reportUnknownMemberType]
+        return None
+    minutes = detail.get("minutes")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    return minutes if isinstance(minutes, int) and not isinstance(minutes, bool) and minutes > 0 else None
+
+
+def reminded_label(detail: object) -> str | None:
+    """origin_reminded 事件按 detail 分支的标签（不新增事件取值）：立即告知（§103.2）与沉默提醒（§104.9 一）各有专用文字，
+    其余返回 None 用默认标签。沉默提醒带分钟数时写「对方 N 分钟没有汇报，已提醒发起方」，时间线不再加附注（见
+    silent_minutes）；缺分钟数时退回固定文字，附注照常写原因。本机与跨设备时间线共用这一份。"""
+    if not isinstance(detail, dict):
+        return None
+    if detail.get("reason") == "silent":  # pyright: ignore[reportUnknownMemberType]
+        minutes = silent_minutes(detail)  # pyright: ignore[reportUnknownArgumentType]
+        return f"对方 {minutes} 分钟没有汇报，已提醒发起方" if minutes is not None else ORIGIN_NOTIFIED_SILENT_LABEL
+    if detail.get("immediate") is True:  # pyright: ignore[reportUnknownMemberType]
+        return ORIGIN_NOTIFIED_UNDELIVERED_LABEL
+    return None
 EVENT_LABELS: dict[str, str] = {
     "created": "创建任务",
     "sending": "发送中",
@@ -339,7 +406,56 @@ EVENT_LABELS: dict[str, str] = {
     "closure_skipped_capacity": "容量已满，未排结束回执",
     "notification_skipped": "未排通知",
     "review_skipped_capacity": "容量已满，未排复核请求",
+    # §104.9 一：执行方停下 5 分钟仍未汇报时排的催促（只在本机）
+    "nudge_created": "排队催促执行方汇报",
 }
+# 联邦库专有的事件（§104.9 七，跨设备时间线）：每台设备显示本设备 fed_events 的记录；这些 kind 本机账本不写
+FEDERATION_EVENT_LABELS: dict[str, str] = {
+    "native_send_boundary": "外调走到发送边界",
+    "cancel_requested": "请求取消未发送的消息",
+    "mirror_archived": "本机已归档这项镜像",
+    "handoff_received": "收到交接",
+    "review_received": "收到复核请求",
+    "notice_received": "收到通知",
+    "report_rejected": "汇报未被发起设备采纳",
+    "report_accepted": "发起设备已采纳汇报",
+    "report_superseded": "汇报已被更新的汇报取代",
+    "report_not_seen": "发起设备没收到这份汇报",
+    "report_pending": "汇报仍在等发起设备确认",
+    "decision_misrouted": "收到指向别的任务的裁决（已忽略）",
+    "content_expired": "附件内容已过留存期",
+}
+# transport_<state> 事件（hub 拒收/对端拒收/过期/撤销，mirror.transport_failed）
+TRANSPORT_EVENT_LABELS: dict[str, str] = {
+    "refused": "hub 拒收",
+    "rejected": "对端拒收",
+    "expired": "传输已过期",
+    "revoked": "传输已撤销",
+}
+
+
+def clock_time(timestamp: float) -> str:
+    """本机时区（含 TZ 环境变量）下的时刻，不带偏移；单独出现时用 clock_text。"""
+    return time.strftime("%m-%d %H:%M:%S", time.localtime(timestamp))
+
+
+def utc_offset(timestamp: float) -> str:
+    """该时刻在本机时区下的 UTC 偏移（如 UTC+08:00），按该时刻自身算，夏令时前后各自正确（§100.2）。
+
+    直接由 localtime 的各字段反推（timegm(本地字段) − 时刻），与 clock_time 显示的时刻必然一致——Windows 上 TZ 被
+    C 运行库按它自己的规则解释时也照实标出，不另外绕开 TZ。
+    """
+    seconds = calendar.timegm(time.localtime(timestamp)) - math.floor(timestamp)
+    hours, rest = divmod(abs(seconds), 3600)
+    minutes, extra = divmod(rest, 60)
+    text = f"UTC{'-' if seconds < 0 else '+'}{hours:02d}:{minutes:02d}"
+    return f"{text}:{extra:02d}" if extra else text
+
+
+def clock_text(timestamp: float) -> str:
+    """单独出现的时刻：本机时区（含 TZ）加该时刻自身的 UTC 偏移（§100.2）。时刻格式只有这一份实现，views 的
+    时间线、「定时发出」与 cli 的定时提示都委托到这里（§104 合并时收拢）。"""
+    return f"{clock_time(timestamp)} {utc_offset(timestamp)}"
 
 
 def review_capacity_hint(code: str, *, reporter: bool = False) -> str:
@@ -371,16 +487,34 @@ def reason_text(code: str | None, *, command: str | None = None) -> str:
             return DELIVERY_LABELS[Delivery(code.removeprefix("delivery_"))]
         except ValueError:
             return code
-    text = REASON_TEXTS.get(code, code)
+    text = REASON_TEXTS.get(code)
+    if text is None:
+        return code  # 没登记的原样返回，不当本地模板展开（§104.12 第 10 条：未知码里的 {command} 不替换）
     return text.replace(PLACEHOLDER, command or command_name()) if PLACEHOLDER in text else text
+
+
+def reason_registered(code: object) -> bool:
+    """原因码有没有本地文案：登记在 REASON_TEXTS，或是合法投递枚举的 `delivery_*`（§104.12 第 10 条）。
+
+    来自远端的取值只有命中才按本地文案展开；其余由调用方当闭集外取值转义，不靠「翻译后有没有变化」去猜。
+    """
+    if not isinstance(code, str) or not code:
+        return False
+    if code.startswith("delivery_"):
+        return code.removeprefix("delivery_") in {item.value for item in Delivery}
+    return code in REASON_TEXTS
 
 
 def role_label(attempt: Attempt) -> str:
     """尝试的角色名；结束回执、补充消息与告知虽是 notice，但不是发给发起方的（DESIGN §45.31.6、§95.5.6、§95.5.7）。"""
     if attempt.is_closure:
         return CLOSURE_LABEL
+    if attempt.is_remind:
+        return REMIND_LABEL
     if attempt.is_fyi:
         return FYI_LABEL
+    if attempt.is_nudge:
+        return NUDGE_LABEL
     return NOTE_LABEL if attempt.is_note else ROLE_LABELS[attempt.role]
 
 
@@ -393,26 +527,69 @@ class NextStep:
     command: str | None = None
 
 
+def capacity_close_text(cmd: str, ref: str) -> str:
+    """交接次数满时的统一下一步：close 本任务后 send 新任务（§83）。含 envelope.CAPACITY_REACHED 的固定措辞，第二行据此
+    写容量写法；后续任务直接写本任务标识，不用 <旧ID> 占位（照抄进 shell 时尖括号是重定向，§104.11 第 1 条）。"""
+    return f"交接次数已达上限，{cmd} close {ref} 后 {cmd} send 新任务（可加 --follows {follows_ref(ref)} 关联）"
+
+
+def follows_ref(ref: str) -> str:
+    """命令引用里的任务那一段：联邦命令的 ref 带路由（`<完整ID> --origin-device <设备>`，§104.13 第 2 条），
+    `send --follows` 只接任务引用、不接 --origin-device，取第一段。"""
+    return ref.split(" ", 1)[0]
+
+
+def deferred_due(options: Mapping[str, Any], *, pending: bool, now: float) -> float | None:
+    """显示层的「定时发出」判据（§104.11 P3）：还没发出、带 deferUntil、不在等自动重试、到期时刻还没过时返回该时刻。
+
+    describe 不看时钟（到点后 worker 还没轮到、或目标一直不在线时仍判 deferred）；写「定时 <时刻> 发出」的地方
+    都先过这一道，到点后改按等待对方的写法，不再印一个已经过去的时刻。本机与联邦 status 共用。
+    """
+    due = defer_time(dict(options))
+    if not pending or due is None or AUTO_RETRY_OPTION in options or due <= now:
+        return None
+    return due
+
+
+def shown_reason(view: TaskView, now: float | None = None) -> str:
+    """显示用的原因码：describe 的 deferred 到点后（或已在等自动重试）按 waiting_for_target 显示（§104.11 P3）。
+
+    只用于人读文字（状态行、任务列表、下一步）；JSON 的 reason 仍是 describe 的原值。
+    """
+    current = view.current
+    if view.reason == "deferred" and (current is None or deferred_due(
+            current.options, pending=current.delivery is Delivery.PENDING,
+            now=time.time() if now is None else now) is None):
+        return "waiting_for_target"
+    return view.reason
+
+
 def next_step(
-    task: Task, attempts: list[Attempt], *, ref: str, command: str | None = None, reserved: int = 0
+    task: Task, attempts: list[Attempt], *, ref: str, command: str | None = None, reserved: int = 0,
+    now: float | None = None,
 ) -> NextStep | None:
     """按任务当前阶段给出下一步；ref 是命令里的任务标识（CLI 用短 ID，摘要用完整 ID）。
 
     命令名缺省按本进程入口解析：这些文案会进摘要的 `next.command`，也会被用户直接照抄（DESIGN §45.36）。
     reserved 是正文写成后还要插入的通知数；达到工作上限时只改文案/命令，不改摘要 action 枚举。
+    now 只用于「定时发出」是否已过（缺省取当前时刻）：到点后按等待对方写，不印过去的时刻（§104.11 P3）。
     """
     cmd = command or command_name()
     view = describe(task, attempts)
-    reason = view.reason
+    reason = shown_reason(view, now)
     at_capacity = max((item.seq for item in attempts), default=0) + reserved >= attempt_limit(Role.HANDOFF)
     close_command = f"{cmd} close {ref}"
-    close_text = f"交接次数已达上限，{close_command} 后 {cmd} send 新任务（可加 --follows <旧ID> 关联）"
+    close_text = capacity_close_text(cmd, ref)
     if view.phase is Phase.DONE or view.phase is Phase.CLOSED:
         return None
     if reason == "paused":
         return NextStep("resume", f"{cmd} resume {ref} 继续发送", f"{cmd} resume {ref}")
     if reason == "waiting_for_target":
         return NextStep("wait", f"等后台 worker 发送；不需要了可 {cmd} cancel {ref}")
+    if reason == "deferred" and view.current is not None and view.current.defer_until is not None:
+        # 延迟投递（§104.9 二）：到点由后台 worker 发出（跨设备远端目标由 relay 交给 hub）；shown_reason 已排除到点后
+        when = clock_text(view.current.defer_until)
+        return NextStep("wait", f"定时 {when} 发出；不需要了可 {cmd} cancel {ref}")
     if reason == "delivery_held":
         # 等接收方批准时重发没有帮助，只提示去对方会话处理
         if at_capacity:
@@ -420,7 +597,7 @@ def next_step(
         return NextStep("approve_at_target", f"去对方会话里批准这条消息；过期后可 {cmd} retry")
     if reason == "delivery_unknown":
         if at_capacity:
-            return NextStep("confirm_then_force_retry", f"不会自动重发。交接次数已达上限；先确认对方没收到（也不会再汇报），再 {close_command} 后 {cmd} send 新任务（可加 --follows <旧ID> 关联）", close_command)
+            return NextStep("confirm_then_force_retry", f"不会自动重发。交接次数已达上限；先确认对方没收到（也不会再汇报），再 {close_command} 后 {cmd} send 新任务（可加 --follows {follows_ref(ref)} 关联）", close_command)
         return NextStep(
             "confirm_then_force_retry",
             f"不会自动重发。确认对方没收到后可 {cmd} retry {ref} --force",
@@ -434,6 +611,12 @@ def next_step(
         if at_capacity:
             return NextStep("rework_or_close", close_text, close_command)
         return NextStep("rework_or_close", f"处理对方的问题后 {cmd} retry {ref} 返工，或 {cmd} close {ref}", f"{cmd} retry {ref}")
+    if reason == "question_asked":
+        # 执行方提问、尝试仍在进行（§104.9 五）：用补充消息回答，送达后回到进行中；补充也占工作类名额（60）
+        if at_capacity:
+            return NextStep("answer", f"对方在等你回答，但交接次数已达上限，补充发不出：{close_text}", close_command)
+        answer = f'{cmd} note {ref} -m "回答"'
+        return NextStep("answer", f"回答对方的问题：{answer}", answer)
     if reason == "review_verdict_missing":
         if at_capacity:
             return NextStep("ask_reviewer_or_retry", f"让复核方补交结论，或 {close_text}", close_command)

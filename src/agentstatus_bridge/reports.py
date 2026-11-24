@@ -24,6 +24,8 @@ from .platforms import process as procfs
 from .ids import short
 from .endpoints import Caller, codex_holdings
 from .model import (
+    ASK_OPTION,
+    RECEIPT_OF_OPTION,
     UNRESOLVED_NATIVE_ID,
     Attempt,
     Delivery,
@@ -76,6 +78,22 @@ class ReportInput:
     files: tuple[str, ...] = ()
     commit: str | None = None
     manual: bool = False
+    # 执行方提问（DESIGN §104.9 五）：kind 为 PROGRESS，尝试保持进行中，立即通知发起方回答
+    ask: bool = False
+
+
+# 会给发起方发结果回执的汇报（与 federation.authority.NOTIFYING_REPORTS 同口径）；提问另见 notifies()
+NOTIFYING_KINDS = (ReportKind.RESULT, ReportKind.BLOCKED, ReportKind.FAILED, ReportKind.APPROVE, ReportKind.CHANGES)
+
+
+def notifies(kind: ReportKind, *, ask: bool) -> bool:
+    """这份汇报要不要给发起方发结果回执：终态、受阻，以及提问（§104.9 五，与 --blocked 同一路径）。"""
+    return kind in NOTIFYING_KINDS or (ask and kind is ReportKind.PROGRESS)
+
+
+def receipt_kind(kind: ReportKind, *, ask: bool) -> str:
+    """结果回执的种类闭集码（§104.9 三，记进回执 options.receiptOf）：提问记 ask，其余就是汇报类别。"""
+    return "ask" if ask and kind is ReportKind.PROGRESS else kind.value
 
 
 @dataclass
@@ -100,6 +118,45 @@ def _git_resolve_commit(cwd: Path, value: str) -> str | None:
         return None
     resolved = completed.stdout.strip()
     return resolved if completed.returncode == 0 and _COMMIT.fullmatch(resolved) else None
+
+
+def checked_note(note: str | None) -> str:
+    """汇报说明的统一口径（DESIGN §104.4）：去掉首尾空白，超过 MAX_NOTE_CHARS 个字符报 note_too_large，不再静默截断。
+
+    CLI 读完说明立即调用（任何写入之前）；apply_report 与跨设备 report 各留同一判定作防御。
+    """
+    text = (note or "").strip()
+    if len(text) > MAX_NOTE_CHARS:
+        raise ReportError("note_too_large")
+    return text
+
+
+def retry_is_rework(task: Task, current: Attempt) -> bool:
+    """retry 是否为返工（§104.4）：受阻、无法完成、复核要求修改、交接交过结果；本机 retry 与跨设备 retry_task 共用。
+
+    与 `cli._rework_body` 前四个分支一一对应；其余情形是原样重发或 `--force`。
+    """
+    return current.work in (Work.BLOCKED, Work.FAILED) or (
+        current.role is Role.REVIEW and task.verdict is Verdict.CHANGES
+    ) or (current.work is Work.RESULT and current.role is Role.HANDOFF)
+
+
+def retry_inherits_first(task: Task, current: Attempt) -> bool:
+    """retry 新尝试是否继承首条工作尝试的附件（§104.11 第 5 条），本机与跨设备共用这一条判据。
+
+    返工且交回实现方时取首条的，与正文里的【原始任务要求】同源；原样重发、`--force` 与复核尝试取当前尝试的，
+    与正文同源（含上一轮 `--ref` 追加的附件）。
+    """
+    to_implementer = current.role is Role.HANDOFF or (current.role is Role.REVIEW and task.verdict is Verdict.CHANGES)
+    return to_implementer and retry_is_rework(task, current)
+
+
+def refs_over_limit(inherited: int, merged: int, limit: int = MAX_FILES) -> bool:
+    """retry `--ref` 合并后的上限（§104.11 第 5 条）：只有新增部分让合并结果超过上限才拒。
+
+    继承本身超过上限（本机 send `--ref` 不限个数）而本次没有新增的，照常重发。本机与跨设备共用。
+    """
+    return merged > limit and merged > inherited
 
 
 def file_reference(path: str, *, cwd: Path) -> dict[str, object]:
@@ -167,15 +224,27 @@ def review_request_body(implement: Attempt, result: dict[str, object], names: Na
 
 def notice_body(
     task: Task, attempt: Attempt, kind: ReportKind, result: dict[str, object], *, next_text: str | None = None,
-    names: NameBook = NO_NAMES,
+    names: NameBook = NO_NAMES, ask: bool = False,
 ) -> str:
-    """回告发起方的结果通知；next_text 是写入后任务阶段对应的下一步（DESIGN §45.28.2）。"""
-    title = f"「{task.title}」" if task.title else ""
-    lines = [f"你发起的任务{title}{REPORT_LABELS[kind]}（{names.local_wire(attempt.target)}）。"]
-    lines.extend(_describe_result(result))
+    """回告发起方的结果通知；next_text 是写入后任务阶段对应的下一步（DESIGN §45.28.2）。
+
+    ask：执行方提问（§104.9 五），首行「对方在等你回答（任务仍在进行）：<问题>」，问题不再作为「结论」重复。
+    """
+    if ask:
+        lines = ask_lines(str(result.get("note") or ""), names.local_wire(attempt.target))
+        lines.extend(_describe_result({**result, "note": ""}))
+    else:
+        title = f"「{task.title}」" if task.title else ""
+        lines = [f"你发起的任务{title}{REPORT_LABELS[kind]}（{names.local_wire(attempt.target)}）。"]
+        lines.extend(_describe_result(result))
     if next_text:
         lines.append(f"下一步：{next_text}")
     return "\n".join(lines)
+
+
+def ask_lines(question: str, asker: str) -> list[str]:
+    """提问回执的开头两行（本机与联邦共用）：问题原文在首行，提问方另起一行。"""
+    return [f"对方在等你回答（任务仍在进行）：{question}", f"提问方：{asker}；任务仍在进行，用补充消息回答后对方继续。"]
 
 
 def _select_attempt(task: Task, attempts: list[Attempt], report: ReportInput) -> Attempt:
@@ -285,6 +354,8 @@ def _check_kind(attempt: Attempt, report: ReportInput) -> None:
         raise ReportError("result_already_submitted")
     if len(report.files) > MAX_FILES:
         raise ReportError("too_many_files")
+    if report.ask and (kind is not ReportKind.PROGRESS or not (report.note or "").strip()):
+        raise ReportError("ask_requires_note")
 
 
 def apply_report(
@@ -301,6 +372,7 @@ def apply_report(
     names: NameBook = NO_NAMES,
 ) -> ReportOutcome:
     """核验并原子记录一条汇报；必要时一并排队复核请求或发起方通知（由 worker 发送）。"""
+    note = checked_note(report.note)  # 说明超长在任何读写之前拒绝（§104.4）
     task = store.resolve_task(report.task_ref)
     # 事务外先做一次校验：尽早给出可读错误，避免无谓的文件 hash
     preview = _select_attempt(task, store.attempts(task.id), report)
@@ -310,7 +382,6 @@ def apply_report(
     report = replace(report, attempt_seq=preview.seq)
 
     files = [file_reference(path, cwd=cwd) for path in report.files]
-    note = (report.note or "").strip()[:MAX_NOTE_CHARS]
     commit = _commit_reference(report.commit, cwd=cwd, git=git) if report.commit else None
 
     followups: list[Attempt] = []
@@ -342,12 +413,20 @@ def apply_report(
         result: dict[str, object] = {"note": note, "files": files, "source": source, "reportedAt": now}
         if commit is not None:
             result["commit"] = commit
+        if kind is not ReportKind.ACK and not report.ask and ASK_OPTION in attempt.options:
+            # 普通汇报在同一事务里清掉先前的提问（§104.12 第 8 条）：不靠比较时刻推断先后，本机时钟回拨或时刻相等时也清得掉；
+            # 重复的 ACK 不算新进展，照旧保留提问
+            store.clear_attempt_option(attempt.id, ASK_OPTION)
         if kind is ReportKind.ACK:
             if attempt.work is Work.AWAITING_ACK:
                 store.set_work(attempt.id, work=Work.ACKNOWLEDGED, result=None, now=now, event="ack", detail=detail)
             else:
                 store.add_event(task.id, "ack", now=now, attempt_seq=attempt.seq, detail=detail)
         elif kind is ReportKind.PROGRESS:
+            if report.ask:
+                # 提问（§104.9 五）：同一事务记下问题与时刻，describe 据此判 question_asked；事件仍是 progress
+                detail["ask"] = True
+                store.set_attempt_option(attempt.id, ASK_OPTION, {"at": now, "note": note})
             store.set_work(attempt.id, work=Work.IN_PROGRESS, result=None, now=now, event="progress", detail=detail)
         elif kind is ReportKind.BLOCKED:
             store.set_work(attempt.id, work=Work.BLOCKED, result=None, now=now, event="blocked", detail=detail)
@@ -390,7 +469,7 @@ def apply_report(
                                 detail={'reason': error.code})
         if (
             not followups
-            and kind in (ReportKind.RESULT, ReportKind.BLOCKED, ReportKind.FAILED, ReportKind.APPROVE, ReportKind.CHANGES)
+            and notifies(kind, ask=report.ask)
             and current_task.origin is not None
             and current_task.notify_origin
             and can_notify(current_task.origin)
@@ -407,11 +486,14 @@ def apply_report(
                     task.id,
                     role=Role.NOTICE,
                     target=current_task.origin,
-                    body=notice_body(current_task, attempt, kind, result, next_text=next_text, names=names),
+                    body=notice_body(current_task, attempt, kind, result, next_text=next_text, names=names,
+                                     ask=report.ask),
                     refs=files,
                     now=now,
                     sender=caller.endpoint.ref if caller.endpoint else None,
                     sender_class=caller_class,
+                    # 回执种类只在本机 options（§104.9 三）：第二行据此选文字，不进容量判定
+                    options={RECEIPT_OF_OPTION: receipt_kind(kind, ask=report.ask)},
                 ))
             except StoreError as error:
                 if error.code not in CAPACITY_CODES:
@@ -420,7 +502,7 @@ def apply_report(
                 store.add_event(task.id, 'notification_skipped', now=now, attempt_seq=attempt.seq,
                                 detail={'reason': error.code, 'route': 'result'})
         elif (not followups and current_task.origin is not None and not can_notify(current_task.origin)
-              and kind in (ReportKind.RESULT, ReportKind.BLOCKED, ReportKind.FAILED, ReportKind.APPROVE, ReportKind.CHANGES)):
+              and notifies(kind, ask=report.ask)):
             store.add_event(task.id, 'notification_skipped', now=now, attempt_seq=attempt.seq,
                             detail={'reason': 'poll_only', 'route': 'result'})
     refreshed = store.get_task(task.id)

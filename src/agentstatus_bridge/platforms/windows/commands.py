@@ -15,10 +15,12 @@ from .codex_discovery import Discovery, discover
 from .local_transport import WindowsPlatform, IdentityEvidence
 from . import claude_discovery as claude
 
-WRITES = frozenset({'send', 'report', 'retry', 'pause', 'resume', 'cancel', 'accept', 'close', 'note'})
+# remind（§104.9 二）排给调用会话自己：要完整发现取到自己的端点（含 data_root），按写命令取证
+WRITES = frozenset({'send', 'report', 'retry', 'pause', 'resume', 'cancel', 'accept', 'close', 'note', 'remind'})
 # note 只需调用方归属（消息头 from=），目标由任务决定，不做整体发现（§95.5.2）
 LIGHT = frozenset({'report', 'accept', 'close', 'pause', 'cancel', 'resume', 'note'})
-ALLOWED = WRITES | {'doctor', 'tasks', 'status', 'summary', 'peers', 'wait', 'worker', 'federation'}
+# todo（§104.9 六）只读，身份口径与 tasks --mine 相同
+ALLOWED = WRITES | {'doctor', 'tasks', 'status', 'summary', 'peers', 'wait', 'worker', 'federation', 'todo'}
 
 
 @dataclass

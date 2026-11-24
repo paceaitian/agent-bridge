@@ -155,7 +155,11 @@ class ReleaseTests(unittest.TestCase):
             # §95.2：worker 取锁的时间预算（共用 retry_lock 与 Windows 假内核取锁）
             'test_bridge_worker_lock',
             # §99：Claude 会话标题的规则/回读/定位/记忆/计数用例真跑，链接、FIFO 与 Linux 打开按 POSIX-only 跳过
-            'test_bridge_claude_titles'})
+            'test_bridge_claude_titles',
+            # §104：判别键常量、Attempt 标记属性与定时上界的纯函数用例（账本/CLI 行为模块在 Linux 夹具里，不进选择集）
+            'test_bridge_markers',
+            # §104.9 三：消息第二行与交接页脚的纯函数用例真跑（VM→Windows 的任务由 Windows 渲染第二行）
+            'test_bridge_action_line_portable'})
         for name in ci.MODULES:self.assertTrue((ROOT/'tests'/f'{name}.py').is_file())
         native=(ROOT/'tests/test_bridge_windows_native.py').read_text()
         self.assertIn('if api.token(api.k.GetCurrentProcess()).elevated:',native)

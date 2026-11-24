@@ -315,6 +315,152 @@ class DeliveryTests(unittest.TestCase):
                     self.assertFalse(any(m.get('id')==88 for m in self.k.messages))
                     self.assertIsNone(result.native_root)
 
+    def test_same_tick_budget_ulp_does_not_fail_the_handoff_instantly(self):
+        # W3.18 现场：intent 到 failed 只有 28 ms、没有 boundary。Windows 上 Python 3.12 的 monotonic 约 15.6 ms 一跳，
+        # 同一 tick 内「600 秒总截止 - now」= (t0+600)-t0 可能比 600 多一个 ulp；DaemonStream 不能因此零耗时抛超时
+        t0 = 511.871
+        self.assertGreater((t0 + 600.0) - t0, 600.0)  # 前提：这个 t0 确实多一个 ulp
+        boundaries = []
+        with self.scope():
+            target = self.target()
+            with patch.object(T.time, 'monotonic', return_value=t0):
+                result = self.deliver(target, before_send=lambda: boundaries.append(1))
+        self.assertEqual((result.delivery, result.reason), (Delivery.QUEUED, 'codex_queued'))
+        self.assertEqual((len(self.adds()), boundaries), (1, [1]))
+
+    def test_same_tick_budget_never_fails_across_uptime_magnitudes(self):
+        # 开机时长 1e3–1e6 秒的网格：每个量级取第一个会多一个 ulp 的毫秒刻度，再加几个整点，零耗时投递都必须 queued
+        overshoot = (1000.003, 3496.002, 15784.006, 32168.001, 130472.004, 523688.006, 1047976.001)
+        for t0 in overshoot + (1000.0, 86400.0, 604800.0):
+            with self.subTest(t0=t0):
+                if t0 in overshoot:
+                    self.assertGreater((t0 + 600.0) - t0, 600.0)
+                self.rebuild()
+                with self.scope():
+                    target = self.target()
+                    with patch.object(T.time, 'monotonic', return_value=t0):
+                        result = self.deliver(target)
+                self.assertEqual((result.delivery, result.reason), (Delivery.QUEUED, 'codex_queued'))
+
+    def test_daemon_restart_symptoms_succeed_after_rediscovery(self):
+        # DESIGN §103.1 第 0 步结论：daemon 重启四码只有在「重试会重新发现到新 daemon 并能成功」时才进闭集。
+        # 这里按 worker 重试的真实顺序验证：首投失败（可证明未写）→ 重新发现 → 按原目标选代际 → 再投成功
+        from agentstatus_bridge.dispatch import select_generation
+        from agentstatus_bridge.transports import codex_native as CN
+
+        def restart_daemon():
+            self.k.processes[201] = (0, 134362090000099999, self.k.sid, False, 'codex.exe')
+            self.k.peer = 201
+
+        # socket_missing 不在内：投递路径上 socket 文件不在时先在取 socket 身份处失败，落成 codex_preflight_failed
+        # （WinFailure 2，见下一个用例），重启窗口根本产生不了 socket_missing，所以没有可证明的重试收益
+        cases = ('target_generation_changed', 'daemon_changed', 'boundary_store_busy')
+        for reason in cases:
+            with self.subTest(reason=reason):
+                self.rebuild()
+                with self.scope():
+                    target = self.target()
+                    kwargs = {}
+                    if reason == 'target_generation_changed':
+                        restart_daemon()  # 发现之后、连接之前 daemon 换了代
+                        result = self.deliver(target)
+                    elif reason == 'daemon_changed':
+                        epochs = iter([('epoch', 1, 1, 1)])
+                        original = CN.local_codex.socket_identity
+                        with patch.object(CN.local_codex, 'socket_identity',
+                                          side_effect=lambda link: next(epochs, None) or ('new', 2, 2, 2)):
+                            result = self.deliver(target)  # 控制 socket 在连接期间被新 daemon 替换
+                        self.assertIs(CN.local_codex.socket_identity, original)
+                    else:
+                        result = self.deliver(target, before_send=lambda: (_ for _ in ()).throw(StoreError('store_busy')))
+                    self.assertEqual((result.delivery, result.reason), (Delivery.FAILED, reason))
+                    self.assertEqual(self.adds(), [])
+                    if reason != 'boundary_store_busy':
+                        restart_daemon()
+                    fresh = D.discover(self.p.transport)
+                    self.assertTrue(fresh.complete)
+                    live, problem = select_generation(target.ref, [fresh.endpoint(row) for row in fresh.rows
+                                                                   if row.eligible])
+                    self.assertIsNone(problem)
+                    assert live is not None
+                    self.assertEqual(live.ref.data_root, target.ref.data_root)
+                    retried = self.deliver(live, **kwargs)
+                self.assertEqual((retried.delivery, retried.reason), (Delivery.QUEUED, 'codex_queued'))
+                self.assertEqual(len(self.adds()), 1)
+
+    def test_missing_control_socket_is_a_preflight_failure_not_socket_missing(self):
+        # daemon 重启窗口里 socket 文件不在：实际原因码是兜底的 codex_preflight_failed（不在自动重试闭集），
+        # 本机诊断能看出是连接阶段的 WinFailure 2
+        with self.scope():
+            target = self.target()
+            self.socket.unlink()
+            result = self.deliver(target)
+            self.socket.touch()
+        self.assertEqual((result.delivery, result.reason), (Delivery.FAILED, 'codex_preflight_failed'))
+        self.assertEqual((result.detail['preSendStage'], result.detail['preSendError'], result.detail['preSendWinerror']),
+                         ('connect', 'WinFailure', 2))
+
+    def test_pre_send_failures_record_stage_class_and_winerror_locally(self):
+        # DESIGN §103.1 第 0 步结论：写前 FAILED 在本机 detail 记 preSendStage/异常类别/winerror，不进跨设备投影
+        from agentstatus_bridge.federation.views import steer_detail
+        from agentstatus_bridge.platforms.windows.api import WinFailure
+        from agentstatus_bridge.platforms.windows.io import WinIO
+        from agentstatus_bridge.transports import codex_native as CN
+        from agentstatus_bridge.transports.websocket import _Closed
+
+        def refused(*_args):
+            raise WinFailure(10061)
+
+        def closed(*_args):
+            raise _Closed('upgrade rejected')
+
+        def deadline(*_args):
+            raise _Timeout('recv') from TimeoutError('windows_io_deadline')
+
+        def read_timeout(reader, method, params):
+            if method == 'thread/read':
+                raise _Timeout('deadline')
+            return original_request(reader, method, params)
+
+        original_request = D.Reader.request
+        cases = [
+            ('connect', patch.object(WinIO, 'connect_unix', refused), 'codex_preflight_failed',
+             {'preSendStage': 'connect', 'preSendError': 'WinFailure', 'preSendWinerror': 10061}),
+            ('handshake', patch.object(CN.BoundedConnection, '_handshake', closed), 'codex_preflight_failed',
+             {'preSendStage': 'handshake', 'preSendError': '_Closed'}),
+            ('loaded', patch.object(D.Reader, 'loaded', deadline), 'codex_deadline_before_send',
+             {'preSendStage': 'loaded', 'preSendError': '_Timeout', 'preSendCause': 'TimeoutError'}),
+            ('read', patch.object(D.Reader, 'request', read_timeout), 'codex_deadline_before_send',
+             {'preSendStage': 'read', 'preSendError': '_Timeout'}),
+        ]
+        for name, patcher, reason, expected in cases:
+            with self.subTest(stage=name):
+                self.rebuild()
+                with self.scope():
+                    target = self.target()
+                    with patcher:
+                        result = self.deliver(target)
+                self.assertEqual((result.delivery, result.reason), (Delivery.FAILED, reason))
+                self.assertEqual({k: v for k, v in result.detail.items() if k.startswith('preSend')}, expected)
+                self.assertEqual(steer_detail(result.detail), {})
+                self.assertEqual(self.adds(), [])
+        self.rebuild()
+        with self.scope():
+            target = self.target()
+            result = self.deliver(target, before_send=lambda: (_ for _ in ()).throw(StoreError('store_busy')))
+        self.assertEqual((result.delivery, result.reason), (Delivery.FAILED, 'boundary_store_busy'))
+        self.assertEqual((result.detail['preSendStage'], result.detail['preSendError'], result.detail['preSendCause']),
+                         ('boundary', 'NativeFailure', 'StoreError'))
+        # 已过边界（add 帧可能已写出）的失败是 UNKNOWN，不带写前诊断
+        self.rebuild()
+        with self.scope():
+            target = self.target()
+            self.k.add_reply = lambda m, r: {'id': m['id'], 'error': {'code': -32603,
+                                                                       'message': 'queued submission operation failed'}}
+            result = self.deliver(target)
+        self.assertIs(result.delivery, Delivery.UNKNOWN)
+        self.assertFalse(any(k.startswith('preSend') for k in result.detail))
+
     def test_budget_after_boundary_and_before_server_requests(self):
         self.assertEqual(T.TOTAL_SECONDS,600.0)
         with self.scope():

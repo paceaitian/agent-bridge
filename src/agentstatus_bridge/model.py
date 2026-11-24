@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import json
+import math
 import re
 from typing import Any, Literal
 
@@ -91,6 +92,35 @@ FYI_OPTION = "fyi"
 # 摘要投递项要标出的 notice 类别：扩展据此静默它们触发的那一轮（结束回执 §45.31.7，补充消息与告知 §95.5.3）；
 # 与 extension/collabModel.js 的 COLLAB_QUIET_NOTICE_KINDS 是同一份（test_contract_collab 核对）
 QUIET_NOTICE_KINDS = frozenset({CLOSURE_KIND, NOTE_KIND, FYI_KIND})
+# 催执行方（DESIGN §104.9 一）：发给当前工作尝试接收方的 notice，noticeKind=nudge，只在本机账本
+NUDGE_KIND = "nudge"
+# 定时提醒（§104.9 二）：`ab remind` 建的告知（noticeKind=fyi）另带 remind=true；叫醒的那一轮不静默
+REMIND_OPTION = "remind"
+# 延迟投递（§104.9 二）：尝试保持 PENDING，到这个时刻（epoch 秒）才外调
+DEFER_OPTION = "deferUntil"
+# 结果回执的种类（§104.9 三）：回执创建时记下的闭集码，只在 A 本机 options，不上线、不进容量判定
+RECEIPT_OF_OPTION = "receiptOf"
+RECEIPT_KINDS = frozenset({"result", "approve", "changes", "blocked", "failed", "ask"})
+# 执行方提问（§104.9 五）：当前工作尝试 options.ask={"at": 秒, "note": 问题}，提问未被补充回答前任务为需处理
+ASK_OPTION = "ask"
+# 沉默提醒令牌的标记（§104.9 一）：`<attempt id>:silent:<锚点>`，记在 REMINDER_OPTION
+SILENT_TOKEN_MARK = ":silent:"
+# 延迟投递的上限（§104.1 B：1 分钟到 24 小时）；到期时刻离现在超过它（本机时钟回拨）按已到期处理
+MAX_DEFER_SECONDS = 24 * 3600.0
+# 沉默判定的 T（§104.1 A、§104.9 一）：任务 options.expect（秒，`ab send --expect`），缺省 30 分钟，范围 5 分钟到 24 小时
+EXPECT_OPTION = "expect"
+DEFAULT_EXPECT_SECONDS = 30 * 60.0
+MIN_EXPECT_SECONDS = 5 * 60.0
+MAX_EXPECT_SECONDS = 24 * 3600.0
+
+
+def expect_seconds(options: dict[str, Any]) -> float:
+    """任务的沉默阈值 T：options.expect 在范围内就用它，缺键或形状、范围不对都按缺省 30 分钟（读方不比写方严）。"""
+    value = options.get(EXPECT_OPTION)
+    if isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value) \
+            and MIN_EXPECT_SECONDS <= value <= MAX_EXPECT_SECONDS:
+        return float(value)
+    return DEFAULT_EXPECT_SECONDS
 DELIVERY_NEEDS_ATTENTION = frozenset(
     {
         Delivery.HELD,
@@ -101,6 +131,93 @@ DELIVERY_NEEDS_ATTENTION = frozenset(
         Delivery.UNKNOWN,
     }
 )
+# 确定未送达的四种终态（DESIGN §103.2）：对方会话确定没有收到，立即告知发起方；UNKNOWN、HELD 不在此列
+DEFINITELY_UNDELIVERED = frozenset({Delivery.FAILED, Delivery.REFUSED, Delivery.DENIED, Delivery.EXPIRED})
+
+# 发送前瞬时失败自动重试一次（DESIGN §103.1）。闭集只放「可证明未被接收、且属瞬时」的原因码：
+# - codex_deadline_before_send：Windows 发出 add/steer 帧之前任何一步超时；
+# - codex_server_overloaded：两平台，服务端明确拒收并要求稍后再试（-32001），可证明未入队；
+# - target_generation_changed、daemon_changed、boundary_store_busy：Windows 写前，daemon 在发现与连接之间重启、
+#   控制 socket 在连接期间被替换、本机账本忙；假内核用例证明重新发现后能投到新 daemon
+#   （tests/test_bridge_windows_delivery.py::test_daemon_restart_symptoms_succeed_after_rediscovery）。
+#   socket_missing 不在内：投递路径上 socket 文件不在时先在取身份处失败，落成 codex_preflight_failed。
+# 增减成员要同步 DESIGN §103.1 与 tests/test_bridge_auto_retry.py 的闭集断言。
+AUTO_RETRY_REASONS = frozenset({
+    "codex_deadline_before_send",
+    "codex_server_overloaded",
+    "target_generation_changed",
+    "daemon_changed",
+    "boundary_store_busy",
+})
+AUTO_RETRY_DELAY_SECONDS = 60.0
+# 尝试 options 里的本机标记（不上线、不进 status 输出）：autoRetry={"due": 秒, "first": 首次原因码,
+# "detail": 首次的写前诊断}，存在即「已自动重试过一次」（begin_send 会整个覆盖 delivery_detail，所以不放 detail）
+AUTO_RETRY_OPTION = "autoRetry"
+# 随标记保存、最终结果里以 first 前缀带出的首次写前诊断键（Windows Codex，DESIGN §103.1）：首投超时、重试成功时
+# 最终只剩这里能说明首次卡在哪一步
+PRE_SEND_KEYS = ("preSendStage", "preSendError", "preSendCause", "preSendWinerror")
+
+
+def pre_send_subset(detail: dict[str, Any]) -> dict[str, Any]:
+    """从一次结果的 detail 里取写前诊断键（只取标量，内容无关）。"""
+    return {key: detail[key] for key in PRE_SEND_KEYS
+            if key in detail and isinstance(detail[key], str | int) and not isinstance(detail[key], bool)}
+
+
+def auto_retry_final_detail(options: dict[str, Any]) -> dict[str, Any]:
+    """自动重试过的尝试，最终 detail 要补的键：autoRetried、firstReason 与首次写前诊断（firstPreSend*）；没重试过为 {}。"""
+    first = auto_retry_first(options)
+    if first is None:
+        return {}
+    state = options.get(AUTO_RETRY_OPTION)
+    saved = state.get("detail") if isinstance(state, dict) else None  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+    extra: dict[str, Any] = {"autoRetried": True, "firstReason": first}
+    if isinstance(saved, dict):
+        extra.update({"first" + key[0].upper() + key[1:]: value
+                      for key, value in pre_send_subset(saved).items()})  # pyright: ignore[reportUnknownArgumentType]
+    return extra
+# 本机 `ab send` 预先盖的章（DESIGN §103.2）：命令打印了确定未送达的终态就留着（= 发起方已见），否则清掉
+ORIGIN_WATCH_OPTION = "originWatch"
+
+
+def auto_retry_first(options: dict[str, Any]) -> str | None:
+    """已自动重试过时返回首次失败的原因码，否则 None（标记形状不对也按没有处理，宁可不重试）。"""
+    state = options.get(AUTO_RETRY_OPTION)
+    if not isinstance(state, dict):
+        return None
+    first = state.get("first")  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+    return first if isinstance(first, str) else "unknown"
+
+
+def auto_retry_pending(options: dict[str, Any], now: float, *, delay: float = AUTO_RETRY_DELAY_SECONDS) -> bool:
+    """这条 PENDING 尝试是否还在等自动重试的到期时刻。
+
+    到期时刻离现在超过一个 delay（本机时钟回拨）时按已到期处理：等待有上界，不会因时钟回拨卡住。
+    """
+    state = options.get(AUTO_RETRY_OPTION)
+    due = state.get("due") if isinstance(state, dict) else None  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+    if not isinstance(due, int | float) or isinstance(due, bool):
+        return False
+    return now < due <= now + delay
+
+
+def defer_time(options: dict[str, Any]) -> float | None:
+    """尝试 options 里的延迟投递时刻（epoch 秒，DESIGN §104.9 二）；缺键或形状不对（布尔、非有限数）为 None。"""
+    value = options.get(DEFER_OPTION)
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def defer_pending(options: dict[str, Any], now: float) -> bool:
+    """这条 PENDING 尝试是否还没到延迟投递时刻：到期前不外调、不进发现（§104.9 二）。
+
+    不复用 auto_retry_pending：它「超过一个 delay 就当已到期」，24 小时的延迟会被判成已到期。这里的上界是
+    MAX_DEFER_SECONDS 加一分钟余量：到期时刻离现在更远（本机时钟回拨）按已到期处理，等待不会因回拨卡住。
+    """
+    due = defer_time(options)
+    return due is not None and now < due <= now + MAX_DEFER_SECONDS + 60.0
 
 
 class Consumption(StrEnum):
@@ -389,6 +506,8 @@ class Task:
     close_reason: str | None = None
     # notify=False：结果不回推发起会话
     options: dict[str, Any] = field(default_factory=dict)
+    # 联邦投影：权威设备（发起方所在设备）的 deviceId；本机账本为 None（§104.13 第 4 条）
+    device: str | None = None
 
     @property
     def notify_origin(self) -> bool:
@@ -433,6 +552,8 @@ class Attempt:
     sender_class: str | None = None
     # allowShared=True：用户已显式允许投递到被多个进程加载的 Codex thread
     options: dict[str, Any] = field(default_factory=dict)
+    # 联邦投影：接收方所在设备的 deviceId；本机账本为 None（§104.13 第 4 条）
+    target_device: str | None = None
 
     @property
     def allow_shared(self) -> bool:
@@ -474,6 +595,33 @@ class Attempt:
             return None
         return value
 
+    @property
+    def is_silent_reminder(self) -> bool:
+        """给发起方的沉默提醒（DESIGN §104.9 一）：notice 的提醒令牌含 `:silent:`。"""
+        token = self.options.get(REMINDER_OPTION)
+        return self.role is Role.NOTICE and isinstance(token, str) and SILENT_TOKEN_MARK in token
+
+    @property
+    def is_nudge(self) -> bool:
+        """发给执行方的催促（§104.9 一）：不是给发起方的回执，拒收也不算发起方拒绝。"""
+        return self.role is Role.NOTICE and self.options.get(NOTICE_KIND_OPTION) == NUDGE_KIND
+
+    @property
+    def is_remind(self) -> bool:
+        """`ab remind` 排给自己的定时提醒（§104.9 二）：告知（noticeKind=fyi）且 remind=true。"""
+        return self.is_fyi and self.options.get(REMIND_OPTION) is True
+
+    @property
+    def receipt_of(self) -> str | None:
+        """结果回执的种类（§104.9 三）：闭集内的 receiptOf 原样返回，缺键、旧回执或闭集外取值为 None。"""
+        value = self.options.get(RECEIPT_OF_OPTION)
+        return value if self.role is Role.NOTICE and isinstance(value, str) and value in RECEIPT_KINDS else None
+
+    @property
+    def defer_until(self) -> float | None:
+        """延迟投递的到期时刻（epoch 秒，§104.9 二）；没有或形状不对（布尔、非有限数）为 None。"""
+        return defer_time(self.options)
+
 
 @dataclass(frozen=True)
 class TaskView:
@@ -499,9 +647,50 @@ def note_may_steer(work: Attempt | None) -> bool:
     return work is not None and (work.consumption is Consumption.LEFT_QUEUE or work.work in WORK_STARTED)
 
 
+def on_task_device(task: Task, attempt: Attempt) -> bool:
+    """这次尝试的接收方是否就在任务所在的设备上（§104.13 第 4 条）。
+
+    本机账本两边都是 None，恒为真；联邦投影里任务所在设备是权威设备（发起方所在设备），接收方设备取自联邦尝试。
+    投影后的 EndpointRef 不带设备：不同设备上的同号会话（例如把同一 Codex thread 拷到两台机器）只比会话会被当成同一个。
+    """
+    return task.device is None or attempt.target_device is None or attempt.target_device == task.device
+
+
+def origin_is_receiver(task: Task, attempt: Attempt) -> bool:
+    """发起方是不是这次尝试的接收方：同一会话，且接收方就在发起方所在的设备上（§104.13 第 4 条）。"""
+    return task.origin is not None and on_task_device(task, attempt) and task.origin.same_session(attempt.target)
+
+
 def work_attempts(attempts: list[Attempt]) -> list[Attempt]:
     """去掉结果通知，只保留承载工作的尝试。"""
     return [attempt for attempt in attempts if attempt.role is not Role.NOTICE]
+
+
+def ask_question(attempt: Attempt) -> tuple[float, str] | None:
+    """当前尝试上记下的提问（DESIGN §104.9 五）：(提问时刻秒, 问题)；没有或形状不对为 None。"""
+    raw = attempt.options.get(ASK_OPTION)
+    if not isinstance(raw, dict):
+        return None
+    at = raw.get("at")  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+    note = raw.get("note")  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]
+    if not isinstance(at, int | float) or isinstance(at, bool) or not math.isfinite(at):
+        return None
+    return float(at), note if isinstance(note, str) else ""
+
+
+def ask_pending(current: Attempt | None, attempts: list[Attempt]) -> bool:
+    """执行方的提问是否还在等发起方回答（§104.9 五）：仍是进行中、提问之后没有别的汇报（ask.at ≥ work_at），
+    也没有提问之后建立并已交出的补充。补充按 created_at 比较：联邦里补充的 delivery_at 是投递设备的钟，
+    created_at 与 ask.at 同是权威设备的钟。补充确定未送达时仍在等。"""
+    if current is None or current.role is Role.NOTICE or current.work is not Work.IN_PROGRESS:
+        return False
+    question = ask_question(current)
+    if question is None or current.work_at is None or question[0] < current.work_at:
+        return False
+    return not any(
+        item.note_for_seq == current.seq and item.created_at >= question[0] and item.delivery in HANDED_OVER
+        for item in attempts
+    )
 
 
 def describe(task: Task, attempts: list[Attempt]) -> TaskView:
@@ -516,7 +705,12 @@ def describe(task: Task, attempts: list[Attempt]) -> TaskView:
         return TaskView(Phase.NEEDS_ATTENTION, "no_attempt", None)
     delivery = current.delivery
     if delivery is Delivery.PENDING:
-        return TaskView(Phase.QUEUED, "paused" if task.paused else "waiting_for_target", current)
+        if task.paused:
+            return TaskView(Phase.QUEUED, "paused", current)
+        # 延迟投递（§104.9 二）：到期前与到期后 worker 还没轮到时都写 deferred（describe 不看时钟）；
+        # 首发后在等自动重试（§103.1）时已不是「定时」，照旧写 waiting_for_target
+        deferred = current.defer_until is not None and AUTO_RETRY_OPTION not in current.options
+        return TaskView(Phase.QUEUED, "deferred" if deferred else "waiting_for_target", current)
     if delivery is Delivery.CANCELLED:
         return TaskView(Phase.NEEDS_ATTENTION, "cancelled_undelivered", current)
     if delivery is Delivery.SENDING:
@@ -524,6 +718,9 @@ def describe(task: Task, attempts: list[Attempt]) -> TaskView:
     if delivery in DELIVERY_NEEDS_ATTENTION:
         return TaskView(Phase.NEEDS_ATTENTION, f"delivery_{delivery.value}", current)
     work = current.work
+    if ask_pending(current, attempts):
+        # 执行方提问、任务仍在进行（§104.9 五）：等发起方用补充回答；补充交出即回到进行中
+        return TaskView(Phase.NEEDS_ATTENTION, "question_asked", current)
     if work is Work.BLOCKED:
         return TaskView(Phase.NEEDS_ATTENTION, "blocked_reported", current)
     if work is Work.FAILED:

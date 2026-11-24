@@ -8,17 +8,32 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
+import re
 from typing import Any
 
 from ..closure import ACCEPTED, CLOSED, closure_body
 from ..ids import new_id, short
 from ..labels import next_step, review_capacity_hint
-from ..native_names import text_id_token
-from ..model import MAY_HAVE_ARRIVED, Attempt, Delivery, Provider, ReportKind, Role, Task, Verdict, Work
-from ..reports import REPORT_LABELS
-from ..store import CAPACITY_CODES, MAX_ACTIVE_TASKS, MAX_PENDING_ATTEMPTS, StoreError, attempt_limit
-from . import envelopes
-from .codec import SENDER_CLASSES
+from ..native_names import remote_display, text_id_token
+from ..model import (
+    DEFER_OPTION,
+    EXPECT_OPTION,
+    MAY_HAVE_ARRIVED,
+    RECEIPT_OF_OPTION,
+    Attempt,
+    Delivery,
+    Provider,
+    ReportKind,
+    Role,
+    Task,
+    Verdict,
+    Work,
+    defer_time,
+)
+from ..reports import REPORT_LABELS, ask_lines, receipt_kind, retry_inherits_first, retry_is_rework
+from ..store import CAPACITY_CODES, MAX_ACTIVE_TASKS, MAX_BODY_BYTES, MAX_PENDING_ATTEMPTS, StoreError, attempt_limit
+from . import attachments, envelopes
+from .codec import SENDER_CLASSES, is_slug
 from .fedstore import LOCAL_NOTICE_KIND, FederatedStore, FedAttempt, FedTask, dump, notice_options
 from .refs import AttemptDefinition, Checkpoint, RemoteEndpointRef, TargetRef, WireActor
 from .views import TERMINAL_REPORTS, fold_report, initial_work, model_attempt, model_attempts, model_task
@@ -46,6 +61,16 @@ class Identity:
     device_id: str
     device_name: str
     hub_id: str
+
+
+def command_ref(ident: Identity, task_id: str) -> str:
+    """权威端生成的可执行命令里的任务引用（§104.13 第 2 条）：完整任务 ID 加 `--origin-device <本机>`。
+
+    两库前八位相同、甚至完整 ID 相同时，带路由的命令只会作用到联邦这一项；展示用的短号另写。设备引用与页脚同一判据：
+    登记名是 slug 就用名，否则完整 deviceId（§101.1）。用于待办行、提醒与汇报回执正文。
+    """
+    device = ident.device_name if is_slug(ident.device_name) else ident.device_id
+    return f"{task_id} --origin-device {device}"
 
 
 @dataclass
@@ -147,6 +172,11 @@ def _check_capacity(store: FederatedStore) -> None:
         raise StoreError("capacity_pending")
 
 
+def _defer_option(defer_until: float | None) -> dict[str, Any]:
+    """延迟投递写进尝试 options 的键（§104.9 二）；没给不写。"""
+    return {} if defer_until is None else {DEFER_OPTION: defer_until}
+
+
 def _queue(store: FederatedStore, ident: Identity, task: FedTask, attempt: FedAttempt, *, now: int,
            extra_data: dict[str, Any] | None = None) -> None:
     """把一个原生 attempt 交给投递设备：远端目标进 outbox（携带当前 checkpoint），本机目标直接建等价的就绪作业。"""
@@ -178,8 +208,11 @@ def _queue(store: FederatedStore, ident: Identity, task: FedTask, attempt: FedAt
                               refs=attempt.refs, blob_state="staged", now=now)
     store.add_operation(source_device=ident.device_id, operation_id=envelope["operationId"], msg_id=attempt.msg_id,
                         payload_hash=digest, result={"kind": attempt.role}, now=now)
+    # 延迟投递（§104.9 二，A1）：远端目标照常入 outbox，next_try_at 设成到期时刻，常驻 relay 到点才提交；线上不加键
+    due = defer_time(attempt.options)
     store.add_outbox(msg_id=attempt.msg_id, operation_id=envelope["operationId"], target_device=attempt.target_device,
-                     envelope=envelope, payload_hash=digest, expires_at=envelope["expiresAt"], now=now)
+                     envelope=envelope, payload_hash=digest, expires_at=envelope["expiresAt"], now=now,
+                     not_before=int(due * 1000) if due is not None else None)
 
 
 def send_task_state(store: FederatedStore, ident: Identity, task: FedTask, *, now: int,
@@ -235,10 +268,14 @@ def create_task(
     allow_shared: bool = False,
     now: int,
     follows: str | None = None,
+    expect: float | None = None,
+    defer_until: float | None = None,
 ) -> tuple[FedTask, FedAttempt]:
     """A 上建联邦任务与第一次交接（L0）：任务、attempt、路由、operation 与 outbox 同一事务。
 
     follows（§93.3）只进本机 state_json：build_checkpoint 按字段挑选，不会把它带进 checkpoint 与信封。
+    expect（沉默阈值秒数，§104.9 一）同样只进 state_json；defer_until（延迟投递 epoch 秒，§104.9 二）进尝试 options
+    （_queue 的白名单不带它），远端目标的 outbox 以它为 next_try_at，由 relay 到点提交。
     """
     if not can_notify(target):
         raise StoreError("target_no_inbox")
@@ -259,12 +296,13 @@ def create_task(
                 "notifyOrigin": notify_origin, "allowShared": allow_shared,
                 "createdAt": now, "updatedAt": now, "hubId": ident.hub_id,
                 **({"follows": follows} if follows is not None else {}),
+                **({EXPECT_OPTION: expect} if expect is not None else {}),
             },
         )
         store.insert_task(task)
         attempt = _new_attempt(task, seq=1, role="handoff", target=target, body=body, refs=refs,
                                sender=origin_actor, sender_class=origin_class,
-                               options={"allowShared": allow_shared}, now=now)
+                               options={"allowShared": allow_shared, **_defer_option(defer_until)}, now=now)
         store.insert_attempt(attempt)
         store.add_route(task_id=task.task_id, authority_device=ident.device_id, hub_id=ident.hub_id,
                         local_role="origin", local_endpoint_id=origin.remote.endpoint_id if origin else "",
@@ -288,6 +326,7 @@ def create_fyi(
     allow_shared: bool = False,
     now: int,
     follows: str | None = None,
+    defer_until: float | None = None,
 ) -> tuple[FedTask, FedAttempt]:
     """A 上建「已关闭」的联邦告知（DESIGN §95.5.7）：任务、唯一一条 seq 1 的 notice、路由与 outbox 同一事务。
 
@@ -315,7 +354,8 @@ def create_fyi(
         store.insert_task(task)
         attempt = _new_attempt(task, seq=1, role="notice", target=target, body=body, refs=refs,
                                sender=origin_actor, sender_class=origin_class,
-                               options={LOCAL_NOTICE_KIND: "fyi", "allowShared": allow_shared}, now=now)
+                               options={LOCAL_NOTICE_KIND: "fyi", "allowShared": allow_shared,
+                                        **_defer_option(defer_until)}, now=now)
         store.insert_attempt(attempt)
         store.add_route(task_id=task.task_id, authority_device=ident.device_id, hub_id=ident.hub_id,
                         local_role="origin", local_endpoint_id=origin.remote.endpoint_id if origin else "",
@@ -339,8 +379,9 @@ def add_attempt(
     options: dict[str, Any] | None = None,
     now: int,
     event: str | None = None,
+    event_detail: dict[str, Any] | None = None,
 ) -> tuple[FedTask, FedAttempt]:
-    """为已有任务追加一个原生 attempt（复核、通知、返工）；容量按 §83 同一函数判定。"""
+    """为已有任务追加一个原生 attempt（复核、通知、返工）；容量按 §83 同一函数判定。event_detail 只进本机事件。"""
     opts = dict(options or {})
     with store.transaction():
         current = store.get_task(task.authority_device, task.task_id)
@@ -357,7 +398,8 @@ def add_attempt(
         work_seq = seq if role != "notice" else current.current_work_seq
         updated = replace(current, max_seq=seq, current_work_seq=work_seq)
         updated = _bump(store, updated, now=now)
-        store.add_event(task.authority_device, task.task_id, event or f"{role}_created", now=now, attempt_seq=seq)
+        store.add_event(task.authority_device, task.task_id, event or f"{role}_created", now=now, attempt_seq=seq,
+                        detail=event_detail)
         _queue(store, ident, updated, attempt, now=now)
     return updated, attempt
 
@@ -370,7 +412,7 @@ _NOTE_OPEN_WORK = frozenset({Work.AWAITING_ACK, Work.ACKNOWLEDGED, Work.IN_PROGR
 
 
 def add_note(store: FederatedStore, ident: Identity, task: FedTask, *, body: str, sender: WireActor | None,
-             sender_class: str, now: int) -> tuple[FedTask, FedAttempt]:
+             sender_class: str, now: int, refs: list[dict[str, Any]] | None = None) -> tuple[FedTask, FedAttempt]:
     """A 上给当前工作尝试补一条 note：资格与写入同一事务；目标与当前工作尝试相同，不改 current_work_seq。"""
     with store.transaction():
         current = store.get_task(task.authority_device, task.task_id)
@@ -385,7 +427,8 @@ def add_note(store: FederatedStore, ident: Identity, task: FedTask, *, body: str
         view = model_attempt(work) if work is not None else None
         if work is None or view is None or view.delivery not in _NOTE_SENT or view.work not in _NOTE_OPEN_WORK:
             raise StoreError("note_no_active_attempt")
-        return add_attempt(store, ident, current, role="notice", target=work.target, body=body, refs=[],
+        # note --ref 的冻结清单（§104.4）：_queue 照常登记附件，B 收件不分类别落地
+        return add_attempt(store, ident, current, role="notice", target=work.target, body=body, refs=list(refs or []),
                            sender=sender, sender_class=sender_class,
                            options={LOCAL_NOTICE_KIND: "note", "forSeq": work.seq,
                                     "allowShared": work.options.get("allowShared") is True},
@@ -395,7 +438,13 @@ def add_note(store: FederatedStore, ident: Identity, task: FedTask, *, body: str
 # ---- 报告裁决 ----
 
 
+# 提交号的显示判据（§103.3）：与汇报端 reports._COMMIT 同形（写方存小写，读方大小写都认，不比写方严）
+_COMMIT_SHAPE = re.compile(r"[0-9a-fA-F]{7,64}")
+
+
 def _describe_result(result: dict[str, Any]) -> list[str]:
+    """跨设备报告的结论段：note 是对方的内容照原样；文件名与提交号来自远端报告，A 采纳时不校验，
+    文件名与其余远端字符串同一套转义，提交号按十六进制形状判、判不过写「未知取值」（§103.3）。"""
     lines: list[str] = []
     note = result.get("note")
     if isinstance(note, str) and note:
@@ -404,10 +453,13 @@ def _describe_result(result: dict[str, Any]) -> list[str]:
         if isinstance(item, dict):
             digest = str(item.get("sha256") or "")[:12]
             name = item.get("name")
-            lines.append(f"文件：{name}（sha256 {digest}）" if digest else f"文件：{name}（未传输）")
+            shown = remote_display(name if isinstance(name, str) else str(name)) or ""
+            lines.append(f"文件：{shown}（sha256 {digest}）" if digest else f"文件：{shown}（未传输）")
     commit = result.get("commit")
     if isinstance(commit, dict) and isinstance(commit.get("commit"), str):
-        lines.append(f"提交：{commit['commit']}")
+        value = commit["commit"]
+        shown = value if _COMMIT_SHAPE.fullmatch(value) else f"未知取值（{remote_display(value) or ''}）"
+        lines.append(f"提交：{shown}")
     return lines
 
 
@@ -523,8 +575,10 @@ def _accept_report(store: FederatedStore, ident: Identity, task: FedTask, attemp
                               "source": report.get("source", "agent"), "reportedAt": now}
     if isinstance(report.get("commit"), dict):
         result["commit"] = report["commit"]
+    # 提问（§104.9 五）：汇报帧 data.report 的可选键 ask；只对 progress 有意义，旧 B 不发、旧 A 不读
+    ask = report.get("ask") is True and kind is ReportKind.PROGRESS
     # 与镜像读时推导共用同一个折叠函数（§97.2）：A 的行为不变
-    effective = fold_report(attempt.effective_work, kind, result=result, at=now)
+    effective = fold_report(attempt.effective_work, kind, result=result, at=now, ask=ask)
     delivery = dict(attempt.delivery)
     delivery["receiverReported"] = True  # 只写 A 侧派生视图，不覆盖 B 的原始证据
     authority_state = dict(attempt.authority_state)
@@ -538,7 +592,8 @@ def _accept_report(store: FederatedStore, ident: Identity, task: FedTask, attemp
         changes["verdict"] = "changes_requested"
     task = _bump(store, task, now=now, **changes)
     store.add_event(task.authority_device, task.task_id, kind.value, now=now, attempt_seq=attempt.seq,
-                    detail={"source": result["source"], "reporterDevice": short(reporter_device)})
+                    detail={"source": result["source"], "reporterDevice": short(reporter_device),
+                            **({"ask": True} if ask else {})})
     store.add_decision(reporter_device=reporter_device, report_operation_id=report["operationId"],
                        authority_revision=task.revision, decision="accepted", reason=None)
     decision = Decision("accepted", None, task.revision)
@@ -567,12 +622,13 @@ def _accept_report(store: FederatedStore, ident: Identity, task: FedTask, attemp
             store.add_event(task.authority_device, task.task_id, "review_skipped_capacity", now=now,
                             attempt_seq=attempt.seq, detail={"reason": error.code})
     origin = task.origin()
-    if (not decision.followups and kind in NOTIFYING_REPORTS and origin is not None
+    if (not decision.followups and (kind in NOTIFYING_REPORTS or ask) and origin is not None
             and task.state.get("notifyOrigin", True) is not False and not _same_session(origin, attempt.target)):
         if can_notify(origin):
             view_task = model_task(task)
             view_attempts = model_attempts(store.attempts(task.authority_device, task.task_id))
-            step = next_step(view_task, view_attempts, ref=short(task.task_id), command=command, reserved=1)
+            # 回执正文里的命令用完整 ID 加路由（§104.13 第 2 条），不用短号
+            step = next_step(view_task, view_attempts, ref=command_ref(ident, task.task_id), command=command, reserved=1)
             next_text = step.text if step else None
             if "review" in decision.skipped:
                 next_text = review_capacity_hint(decision.skipped["review"])
@@ -581,14 +637,19 @@ def _accept_report(store: FederatedStore, ident: Identity, task: FedTask, attemp
             # ID 来自远端，非 UUID 形状时与文字行同一套转义（§101.1）
             label = (text_id_token(reporter_actor.provider, reporter_actor.native_id) if reporter_actor
                      else text_id_token(attempt.target.remote.provider, attempt.target.remote.native_id))
-            lines = [f"你发起的任务{title}{REPORT_LABELS[kind]}（{label}）。", *_describe_result(result)]
+            if ask:
+                # 提问回执（§104.9 五）：问题原文在首行，不再作为「结论」重复
+                lines = [*ask_lines(str(result["note"]), label), *_describe_result({**result, "note": ""})]
+            else:
+                lines = [f"你发起的任务{title}{REPORT_LABELS[kind]}（{label}）。", *_describe_result(result)]
             if next_text:
                 lines.append(f"下一步：{next_text}")
             try:
                 task, notice = add_attempt(
                     store, ident, task, role="notice", target=origin, body="\n".join(lines),
                     refs=list(report.get("refs") or []), sender=reporter_actor, sender_class=reporter_class,
-                    options={"noticeKind": "result"}, now=now,
+                    # receiptOf 只在 A 本机（发起方恒在 A，回执不经线上；_queue 的白名单也不带它，§104.9 三）
+                    options={"noticeKind": "result", RECEIPT_OF_OPTION: receipt_kind(kind, ask=ask)}, now=now,
                 )
                 decision.followups.append(notice)
             except StoreError as error:
@@ -754,9 +815,35 @@ class RetryOutcome:
     rework: bool
 
 
+def _retry_role(view_task: Task, current: FedAttempt) -> str:
+    """retry 新尝试的角色：复核要求修改时交回实现方（handoff），其余沿用当前尝试的角色（与本机 retry 同口径）。"""
+    return "handoff" if current.role == "review" and view_task.verdict is Verdict.CHANGES else current.role
+
+
+def _retry_base_refs(task: FedTask, first: FedAttempt, current: FedAttempt) -> list[dict[str, Any]]:
+    """retry 新尝试继承的附件（§104.11 第 5 条，判据与本机共用 retry_inherits_first）：返工交回实现方取首条工作尝试的，
+    原样重发、--force 与复核尝试取当前尝试的。"""
+    inherits_first = retry_inherits_first(model_task(task), model_attempt(current))
+    return list(first.refs if inherits_first else current.refs)
+
+
+def retry_inherited_refs(task: FedTask, attempts: list[FedAttempt]) -> list[dict[str, Any]]:
+    """retry 新尝试继承的附件清单（与 retry_task 同一规则，见 _retry_base_refs）。
+
+    CLI 冻结 --ref 之前据此预判合并后的个数与 32 MiB 预算（§104.4、§104.11 第 5 条），超出个数就不复制任何副本。
+    """
+    work = [item for item in attempts if item.role != "notice"]
+    if not work:
+        return []
+    first, current = work[0], next((item for item in work if item.seq == task.current_work_seq), work[-1])
+    return _retry_base_refs(task, first, current)
+
+
 def retry_task(store: FederatedStore, ident: Identity, task: FedTask, *, force: bool, message: str | None,
-               new_target: TargetRef | None, rework_body: Callable[[Attempt, Attempt, Task, str | None], str],
-               now: int, allow_shared: bool = False) -> RetryOutcome:
+               new_target: TargetRef | None,
+               rework_body: Callable[[Attempt, Attempt, Task, str | None, bool], str],
+               now: int, allow_shared: bool = False,
+               extra_refs: list[dict[str, Any]] | None = None) -> RetryOutcome:
     """A 上重发或返工（与本机 `_retry_in_transaction` 同口径）：校验、作废本机待发通知、追加新尝试、清 verdict 同一事务。
 
     远端「仍在途」（无 B 证据）与本机 PENDING 一样报 still_pending；--force 可越过远端在途（B 收到新 checkpoint 后
@@ -776,25 +863,33 @@ def retry_task(store: FederatedStore, ident: Identity, task: FedTask, *, force: 
         view_task, view_first, view_current = model_task(current_task), model_attempt(first), model_attempt(current)
         local_target = current.target_device == ident.device_id
         undelivered = proven_undelivered(current, ident)
-        rework = view_current.work in (Work.BLOCKED, Work.FAILED) or (
-            view_current.role is Role.REVIEW and view_task.verdict is Verdict.CHANGES
-        ) or (view_current.work is Work.RESULT and view_current.role is Role.HANDOFF)
+        rework = retry_is_rework(view_task, view_current)
         if view_current.delivery is Delivery.PENDING and not rework and (local_target or not force):
             raise StoreError("still_pending")
         if not (undelivered or rework or force):
             raise StoreError("retry_requires_force")
-        role, target = current.role, current.target
+        role, target = _retry_role(view_task, current), current.target
         if undelivered and not rework:
             body = current.body if not message else f"{current.body}\n\n补充：{message}"
+            if len(body.encode("utf-8")) > MAX_BODY_BYTES:
+                # 原样重发加补充超过正文上限：写入前拒绝，不让信封校验在事务里抛 CodecError（§104.9 四，既有缺陷）
+                raise StoreError("message_too_large")
         else:
-            if view_current.role is Role.REVIEW and view_task.verdict is Verdict.CHANGES:
-                role = "handoff"
+            if role != current.role:
                 target = next((item for item in reversed(work) if item.role == "handoff"), first).target
-            body = rework_body(view_first, view_current, view_task, message)
+            # --to 改派到另一个会话：新执行方没给过上次的结论／说明，正文改称「上一位执行方的…」（§104.4）
+            reassigned = new_target is not None and not _same_session(new_target, target)
+            body = rework_body(view_first, view_current, view_task, message, reassigned)
         if new_target is not None:
             target = new_target
         if not can_notify(target):
             raise StoreError("target_no_inbox")
+        # retry --ref 追加在继承的附件之后，按（来源路径, sha256）去重、新增部分不得让合并结果超过 16（§104.4、
+        # §104.11 第 5 条）；作废旧通知之前判。继承哪一条与 CLI 的预判同一规则（_retry_base_refs）
+        try:
+            refs = attachments.merge_refs(_retry_base_refs(current_task, first, current), extra_refs or [])
+        except attachments.AttachmentError as error:
+            raise StoreError(error.code) from error
         # 先作废本机待发的旧通知（返工意味着旧结果不作数）；远端通知随新 checkpoint 由 B 判定
         for stale in attempts:
             if stale.role == "notice" and stale.target_device == ident.device_id and not stale.is_closure:
@@ -809,7 +904,7 @@ def retry_task(store: FederatedStore, ident: Identity, task: FedTask, *, force: 
         reset = _bump(store, current_task, now=now, control="active", verdict=None)
         updated, attempt = add_attempt(
             store, ident, reset, role=role, target=target, body=body,
-            refs=list(first.refs if role == "handoff" else current.refs), sender=first.sender,
+            refs=refs, sender=first.sender,
             sender_class=first.sender_class, options={"allowShared": allow_shared}, now=now, event="retry")
         # 新尝试的信封已带最新 checkpoint；其余远端成员另发一次 task_state，让 B 上的旧作业按新序号抑制
         others = [device for device in members(updated, store.attempts(task.authority_device, task.task_id))

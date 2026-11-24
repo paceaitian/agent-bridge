@@ -141,7 +141,9 @@ def _project_kind(value: object, requested: str) -> ThreadMetadata:
 
 class BoundedConnection(WebSocket):
     """协议载体私有；业务只通过 ReadBatchClient / QueueDeleteClient 的窄入口使用。"""
-    def __init__(self, home: Path, deadline: float, clock: Callable[[], float]) -> None:
+    def __init__(self, home: Path, deadline: float, clock: Callable[[], float], *,
+                 stage: Callable[[str], None] | None = None) -> None:
+        """连接、认证对端并完成 WebSocket 握手；`stage` 只用于诊断（连接成功、开始握手时回调 "handshake"）。"""
         backend = local_codex.platform()
         link = backend.control_socket_path(home)
         epoch = local_codex.socket_identity(link)
@@ -159,6 +161,8 @@ class BoundedConnection(WebSocket):
             backend.connect(self._socket, target)
             if not self._peer_is_me():
                 raise NativeFailure("peer_rejected")
+            if stage is not None:
+                stage("handshake")
             self._handshake(deadline)
             self._upgraded = True
         except BaseException:

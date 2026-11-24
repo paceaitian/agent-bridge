@@ -1038,7 +1038,7 @@ class WorkdirAndFeaturesTests(DirectoryCase):
     def test_budget_drops_workdir_then_rows_then_features(self) -> None:
         rows = [self.live(index) for index in range(1, 6)]
         full = directory.snapshot(self.store, DEV_A, rows, provider_complete={"codex": True})
-        self.assertEqual(full["features"], ["fyi"])
+        self.assertEqual(full["features"], ["fyi", "ask"])
         self.assertTrue(all("workdir" in item for item in full["endpoints"]))
         bare = directory.snapshot(self.store, DEV_A, [self.live(index, workdir=None) for index in range(1, 6)],
                                   provider_complete={"codex": True})
@@ -1050,7 +1050,7 @@ class WorkdirAndFeaturesTests(DirectoryCase):
         with patch.object(directory, "MAX_SNAPSHOT_BYTES", len(canonical_bytes(bare)) - 1):
             dropped = directory.snapshot(self.store, DEV_A, rows, provider_complete={"codex": True})
         self.assertEqual((len(dropped["endpoints"]), dropped["reason"], dropped["features"]),
-                         (4, "snapshot_too_large", ["fyi"]))
+                         (4, "snapshot_too_large", ["fyi", "ask"]))
         self.assertFalse(any("workdir" in item for item in dropped["endpoints"]))
         # 行掉光仍超限：最后才丢 features
         empty = directory.snapshot(self.store, DEV_A, [], provider_complete={"codex": True})
@@ -1062,11 +1062,11 @@ class WorkdirAndFeaturesTests(DirectoryCase):
     def test_new_and_old_readers_with_a_workdir_row_and_features(self) -> None:
         document = directory.snapshot(self.store, DEV_A, [self.live(1), self.live(2, workdir=None)],
                                       provider_complete={"codex": True})
-        self.assertEqual((document["features"], document["endpoints"][0]["workdir"]), (["fyi"], "repo-a"))
+        self.assertEqual((document["features"], document["endpoints"][0]["workdir"]), (["fyi", "ask"], "repo-a"))
         self.store.put_device_state(device_id=DEV_B, name="win", revision=1, snapshot=document, last_seen=NOW,
                                     state="online")
         # 新读方：能力表与 workdir 都认，寻址不受影响
-        self.assertEqual(directory.device_features(self.store, DEV_B), frozenset({"fyi"}))
+        self.assertEqual(directory.device_features(self.store, DEV_B), frozenset({"fyi", "ask"}))
         [device] = directory.peer_devices(self.store, "win", now=NOW)
         self.assertEqual([peer["workdir"] for peer in device["peers"]], ["repo-a", None])
         for selector, expected in (("codex@w1", _codex(1)), (f"codex@id:{_codex(1)}", _codex(1)),

@@ -444,7 +444,8 @@ class CallerTests(unittest.TestCase):
             dispatcher=Dispatcher(store,lambda:[],{},clock=lambda:5000)
             self.assertEqual(dispatcher.queue_reminders(),0)
             fake=Mock(token='token',view=describe(task,store.attempts(task.id)));fake.due.return_value=True
-            with patch('agentstatus_bridge.dispatch.pending_reminder',return_value=fake):
+            fake.note=None;fake.immediate=False
+            with patch('agentstatus_bridge.dispatch.pending_notices',return_value=[fake]):
                 self.assertFalse(dispatcher._queue_reminder(task.id,'token',5000))
             self.assertEqual(len(store.attempts(task.id)),1)
 

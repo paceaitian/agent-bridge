@@ -327,7 +327,7 @@ class ReworkTests(unittest.TestCase):
               patch.object(worker.time, 'monotonic', side_effect=lambda: tick[0]),
               patch.object(worker.time, 'time', side_effect=lambda: 1000 + tick[0]),
               patch.object(worker.time, 'sleep', side_effect=sleep),
-              patch.object(worker, '_publish_summary', return_value=SimpleNamespace(status='written', ledger_id='fixture', revision=0))):
+              patch.object(worker, '_publish_summary', return_value=SimpleNamespace(status='written', ledger_id='fixture', revision=0, refresh_at=None))):
             self.assertEqual(worker.run_worker(root=self.root / 'worker-state', discover_fn=lambda: [], loop_seconds=1), 0)
         self.assertEqual(opened, [0, 10, 20])
         self.assertIsNone(addresses[0][1])

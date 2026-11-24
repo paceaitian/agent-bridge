@@ -75,6 +75,30 @@ class DiscoveryParkTests(unittest.TestCase):
         self.assertTrue(needs_worker(self.store, self.wall))
         self.assertEqual(self.transport.calls, [])
 
+    def test_note_held_behind_a_parked_work_attempt_does_not_keep_the_worker(self):
+        # §103.8 修 4 × §79：补充等在工作消息后面时没有自己的发现等待记录；工作尝试停泊后，补充也不能把 worker 留住
+        from agentstatus_bridge.model import AUTO_RETRY_DELAY_SECONDS, FOR_SEQ_OPTION, NOTE_KIND, NOTICE_KIND_OPTION
+
+        target = ref()
+        self.found = [endpoint(target)]
+        self.transport._outcome = DeliveryOutcome(Delivery.FAILED, 'codex_deadline_before_send')
+        task, work = self.task(target=target)
+        self.run_once()  # 发送前失败，转入等自动重试
+        note = self.store.add_attempt(task.id, role=Role.NOTICE, target=target, body='synthetic', refs=[],
+                                      now=self.wall, sender=None, sender_class=None,
+                                      options={NOTICE_KIND_OPTION: NOTE_KIND, FOR_SEQ_OPTION: work.seq})
+        self.found = []  # 之后整体发现为空、不完整：工作尝试等发现
+        self.advance(AUTO_RETRY_DELAY_SECONDS)
+        self.run_once()
+        self.assertTrue(self.dispatcher.has_live_work())
+        self.advance(DISCOVERY_PARK_SECONDS)
+        self.run_once()
+        self.assertFalse(self.dispatcher.has_live_work())
+        self.assertEqual([item['attempt'] for item in self.parked()], [work.seq])
+        self.assertEqual((self.store.get_attempt(work.id).delivery, self.store.get_attempt(note.id).delivery),
+                         (Delivery.PENDING, Delivery.PENDING))
+        self.assertEqual(len(self.transport.calls), 1)
+
     def test_windows_equivalent_incomplete_empty_parks_not_fails(self):
         self.dispatcher = self.make_dispatcher(complete=lambda: False)
         _, attempt = self.task()

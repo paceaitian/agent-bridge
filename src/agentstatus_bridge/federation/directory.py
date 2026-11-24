@@ -19,14 +19,14 @@ from pathlib import Path
 from typing import Any
 
 from ..endpoints import ADAPTERS, Endpoint
-from ..model import UNRESOLVED_NATIVE_ID, EndpointRef, NameSource, Provider
-from ..native_names import (TARGET_ID_UNVERIFIED, TARGET_PROVIDER_REQUIRED, UUID_SHAPE, SelectorError, copyable,
+from ..model import UNRESOLVED_NATIVE_ID, EndpointRef, Provider
+from ..native_names import (TARGET_ID_UNVERIFIED, TARGET_PROVIDER_REQUIRED, UUID_SHAPE, SelectorError,
                             id_prefixes, parse_selector, remote_display, remote_workdir, workdir_suffix, workdir_text)
 from ..paths import claude_sessions_dirs, codex_home, grok_home
 from ..platforms.factory import get_platform
-from .codec import canonical_bytes, is_hex32, is_slug
+from .codec import CodecError, canonical_bytes, is_hex32, is_slug
 from .fedstore import FederatedStore
-from .refs import RemoteEndpointRef, TargetRef
+from .refs import RemoteEndpointRef, TargetRef, verified_label
 
 MAX_ENDPOINTS = 256
 MAX_ENDPOINT_BYTES = 2048
@@ -36,8 +36,12 @@ FRESH_MS = 90_000
 # last_seen 是 hub 的时刻、now 是本机时刻：hub 钟略快会算出小的负年龄。owner 2026-11-12 定容忍 5 秒（§91.9 D-B）
 CLOCK_SKEW_MS = 5_000
 NAME_POLICY = "agent-native-v1"
-# 本版对端能处理的可选能力，随目录快照发布（可选键 features）；发起方据此决定能不能发跨设备告知（§95.5.7）
-FEATURES: tuple[str, ...] = ("fyi",)
+# 对端目录里选中的那一行记录不合法（§103.3 第 4 条）：只出现在 stderr/--json，不进账本；target_ 前缀与两平台的
+# EXIT_TARGET 口径一致（联邦路径由 commands.remote_target 显式给退出码 2）
+TARGET_REMOTE_INVALID = "target_remote_invalid"
+# 本版对端能处理的可选能力，随目录快照发布（可选键 features）；发起方据此决定能不能发跨设备告知（§95.5.7）。
+# ask（§104.9 五）：本设备作为发起设备时认汇报帧的可选键 ask（提问会叫醒发起方）；执行方据此决定要不要提示「可能不会叫醒」
+FEATURES: tuple[str, ...] = ("fyi", "ask")
 
 
 class DirectoryError(Exception):
@@ -234,8 +238,9 @@ def resolve_remote(store: FederatedStore, device_reference: str, selector: str, 
     - 完整 ID（`id:<完整>` 或裸完整 UUID）精确匹配已观察绑定，跳过完整性与时效门；stale/offline 的已验证绑定照样排队，
       由 B 复核；从未见过的 ID 报 remote_endpoint_unresolved，不按名字猜。
     - `id:` 前缀要求相关 provider 明确完整且目录新鲜，否则 remote_directory_incomplete / target_id_unverified。
-    - 名字必须带 provider（target_provider_required），只匹配原生主名：规范值命中的每一行都须逐字相等且 namesVerified
-      明确为 true，不能先丢掉未核实行再算唯一。
+    - 名字必须带 provider（target_provider_required），只匹配原生主名：规范值命中的每一行都须过 verified_label（逐字
+      相等、namesVerified 明确为 true、≤120、copyable），不能先丢掉未核实行再算唯一（§103.3 第 3 条）。
+    - 选定的那一行按账本形状严格构造，坏记录报 target_remote_invalid（§103.3 第 4 条）。
     - 历史帧（无或未知 namePolicy）按旧字段理解，不追认来源，但补上同样的门；带 provider、≥32 字符的值沿旧启发式按
       nativeId 精确匹配。
     """
@@ -261,7 +266,9 @@ def resolve_remote(store: FederatedStore, device_reference: str, selector: str, 
             matches = [item for item in pool if str(item.get("nativeId", "")).lower().startswith(wanted.value)]
         else:
             named = [item for item in pool if isinstance(item.get("name"), str) and item["name"].strip() == wanted.value]
-            if any(item["name"] != wanted.value or item.get("namesVerified") is not True for item in named):
+            # 命中的每一行都须过共用判据（已核实、逐字相等、≤120、copyable），与 peers 文字行写成 provider@名字的条件
+            # 相同：peers 标「仅展示」的名字在这里也不能按名字选中，新旧帧同一口径（§103.3 第 3 条）
+            if any(verified_label(item["name"], item.get("namesVerified")) != wanted.value for item in named):
                 raise DirectoryError("target_names_unverified", tuple(_full_id(item) for item in named))
             matches = named
     if not matches:
@@ -271,12 +278,16 @@ def resolve_remote(store: FederatedStore, device_reference: str, selector: str, 
     item = matches[0]
     if item.get("inbox") is False:
         raise DirectoryError("target_no_inbox")
-    name = item.get("name")
-    label = name if (isinstance(name, str) and item.get("namesVerified") is True
-                     and len(name) <= MAX_LABEL_CHARS) else None
-    remote = RemoteEndpointRef(device_id=str(device["device_id"]), provider=Provider(item["provider"]),
-                               native_id=str(item["nativeId"]), endpoint_id=str(item["endpointId"]),
-                               endpoint_revision=int(item.get("endpointRevision") or 1), display_label=label)
+    # 目录快照逐项不经校验（hub 只限 dict 与大小、relay 原样存）：选定后按账本同一严格形状构造，坏记录（nativeId 含
+    # 空白/控制字符或超长、provider 未知、endpointId/endpointRevision 不合规）在这里干净拒绝，不等入库回读时报
+    # corrupt_record、也不打 traceback（§103.3 第 4 条）
+    try:
+        remote = RemoteEndpointRef.from_dict({
+            "deviceId": device["device_id"], "provider": item.get("provider"), "nativeId": item.get("nativeId"),
+            "endpointId": item.get("endpointId"), "endpointRevision": item.get("endpointRevision") or 1,
+            "displayLabel": verified_label(item.get("name"), item.get("namesVerified"))})
+    except CodecError:
+        raise DirectoryError(TARGET_REMOTE_INVALID) from None
     return TargetRef(remote=remote)
 
 
@@ -398,14 +409,14 @@ def peer_lines(store: FederatedStore, device_reference: str | None, *, now: int)
             # 名字只作带设备的人读旁注：已核实写「provider@名字〔ID〕」，否则「provider@id:<ID> 名称=…（仅展示）」；
             # 可复制的永远是 target 里的完整 ID 与 --device（§91.4.2）。对端自称已核实、名字却过不了 copyable
             # （含会被改动的字符、首尾空白、id: 开头或 UUID 形状）或超过 120 字符（§91 上限，诚实写方不发布更长的）
-            # 时按未核实只作展示（由 remote_display 转义并截断），不写成 provider@名字
-            name = peer["name"]
-            if (peer["namesVerified"] and isinstance(name, str) and len(name) <= MAX_LABEL_CHARS
-                    and copyable(NameSource("named", name))):
+            # 时按未核实只作展示（由 remote_display 转义并截断），不写成 provider@名字；判据 verified_label 与 resolve_remote、
+            # remote_text 共用，展示成名字的才能按名字选中（§103.3 第 3 条）
+            name = verified_label(peer["name"], peer["namesVerified"])
+            if name is not None:
                 shown = f"{provider_text}@{name}〔{short_id}〕"
                 shown_name: str | None = name
             else:
-                shown_name = remote_display(peer["displayName"]) or remote_display(name)
+                shown_name = remote_display(peer["displayName"]) or remote_display(peer["name"])
                 shown = f"{provider_text}@id:{short_id}" + (f" 名称={shown_name}（仅展示）" if shown_name else "")
             flags = [] if peer["inbox"] else ["只读"]
             if not peer["eligible"]:

@@ -76,10 +76,11 @@ class CapacityTests(unittest.TestCase):
     def fill_global_pending(self):
         """真实填满 256 个 PENDING，返回条目以便在用例内模拟队列腾空。"""
         queued = []
+        # 填充任务不通知发起方：它们的工作尝试一直开放，否则满 30 分钟会各自排沉默提醒（§104.9 一），干扰本用例的计数
         for _ in range(4):
-            other, _ = self.task()
+            other, _ = self.task(notify=False)
             queued.extend(self.add(other) for _ in range(63))
-        extra, _ = self.task()
+        extra, _ = self.task(notify=False)
         queued.extend(self.add(extra) for _ in range(4))
         return queued
 

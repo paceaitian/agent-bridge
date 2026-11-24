@@ -740,6 +740,76 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, cli.EXIT_TARGET, err)
         self.assertIn("target_ambiguous", err)
 
+    def test_send_origin_watch_stamp_stays_only_when_a_definite_failure_was_printed(self) -> None:
+        # DESIGN §103.2：create_task 同一事务预先盖 originWatch；打印的不是四种确定未送达之一就清掉；--no-wait 不盖
+        from agentstatus_bridge.model import ORIGIN_WATCH_OPTION
+
+        self.caller = as_agent(LEAD)
+        cases = [(Delivery.FAILED, "codex_thread_not_found", True), (Delivery.DENIED, "claude_denied", True),
+                 (Delivery.PENDING, None, False), (Delivery.HELD, "claude_held", False),
+                 (Delivery.QUEUED, "codex_queued", False), (Delivery.UNKNOWN, "codex_queue_timeout", False)]
+        for delivery, reason, kept in cases:
+            with self.subTest(delivery=delivery):
+                seen: dict[str, bool] = {}
+
+                def settle(store: Any, task_id: str, _timeout: float) -> Any:
+                    attempt = [item for item in store.attempts(task_id) if item.role is not Role.NOTICE][-1]
+                    seen["stamped"] = attempt.options.get(ORIGIN_WATCH_OPTION) is True
+                    if delivery is not Delivery.PENDING:
+                        store.begin_send(attempt.id, now=1.0, pid=1, start_ticks="1")
+                        store.finish_send(attempt.id, delivery=delivery, reason=reason, provider_ref=None,
+                                          detail={}, now=1.0)
+                    return store.get_attempt(attempt.id)
+
+                with patch.object(cli, "_wait_first_delivery", side_effect=settle):
+                    _code, out, err = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--json")
+                task_id = json.loads(out)["id"]
+                with self.store() as store:
+                    attempt = store.attempts(task_id)[0]
+                self.assertTrue(seen["stamped"], "盖章与建任务同一事务，worker 开始投递前已在")
+                self.assertEqual(attempt.options.get(ORIGIN_WATCH_OPTION) is True, kept, err)
+        code, out, err = self.run_cli("send", "--to", "codex@impl", "-m", "x", "--no-wait", "--json")
+        self.assertEqual(code, cli.EXIT_OK, err)
+        with self.store() as store:
+            self.assertNotIn(ORIGIN_WATCH_OPTION, store.attempts(json.loads(out)["id"])[0].options)
+
+    def test_send_json_clears_the_stamp_by_the_printed_document(self) -> None:
+        # §103.8 修 5：--json 打印的是重读账本的文档；清不清章按文档里那条尝试的状态，不按等待时拿到的快照
+        from dataclasses import replace
+
+        from agentstatus_bridge.model import ORIGIN_WATCH_OPTION
+
+        self.caller = as_agent(LEAD)
+        # (等待返回的快照, 账本里实际落定的状态, 输出模式, 是否留章)
+        cases = [
+            ("stale_pending", Delivery.FAILED, "--json", True),  # 快照还是 PENDING，文档已打印 failed：留章
+            ("stale_failed", Delivery.PENDING, "--json", False),  # 快照说 failed，文档打印 pending：清章
+            ("stale_failed", Delivery.PENDING, None, True),  # 文字模式打印的就是快照：留章
+        ]
+        for snapshot, ledger, mode, kept in cases:
+            with self.subTest(snapshot=snapshot, mode=mode):
+                def settle(store: Any, task_id: str, _timeout: float) -> Any:
+                    attempt = [item for item in store.attempts(task_id) if item.role is not Role.NOTICE][-1]
+                    if ledger is Delivery.FAILED:
+                        store.begin_send(attempt.id, now=1.0, pid=1, start_ticks="1")
+                        store.finish_send(attempt.id, delivery=Delivery.FAILED, reason="codex_thread_not_found",
+                                          provider_ref=None, detail={}, now=1.0)
+                    if snapshot == "stale_pending":
+                        return attempt  # 落定之前读到的旧快照
+                    return replace(attempt, delivery=Delivery.FAILED, delivery_reason="codex_thread_not_found")
+
+                args = ["send", "--to", "codex@impl", "-m", "x", *([mode] if mode else [])]
+                with self.store() as store:
+                    before = {task.id for task in store.list_tasks()}
+                with patch.object(cli, "_wait_first_delivery", side_effect=settle):
+                    _code, out, err = self.run_cli(*args)
+                with self.store() as store:
+                    [created] = [task for task in store.list_tasks() if task.id not in before]
+                    work = store.attempts(created.id)[0]
+                if mode:
+                    self.assertEqual(json.loads(out)["attempts"][0]["delivery"], ledger.value)
+                self.assertEqual(work.options.get(ORIGIN_WATCH_OPTION) is True, kept, err)
+
     def test_send_from_terminal_creates_queued_task(self) -> None:
         task_id = self.send()
         code, out, _ = self.run_cli("status", task_id[:8], "--json")

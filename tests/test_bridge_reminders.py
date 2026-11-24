@@ -36,7 +36,14 @@ from agentstatus_bridge.model import (
     work_attempts,
 )
 from agentstatus_bridge.native_names import NO_NAMES, NameBook
-from agentstatus_bridge.reminders import REMIND_AFTER_SECONDS, REMINDER_OPTION, pending_reminder, reminder_body, reminder_token
+from agentstatus_bridge.reminders import (
+    REMIND_AFTER_SECONDS,
+    REMINDER_OPTION,
+    pending_notices,
+    pending_reminder,
+    reminder_body,
+    reminder_token,
+)
 from agentstatus_bridge.store import MAX_ATTEMPTS_PER_TASK, Store, StoreError
 from agentstatus_bridge.transports import DeliveryOutcome
 from bridge_support import RecordingTransport, endpoint, ref, with_name_views
@@ -373,7 +380,7 @@ class ReminderTests(unittest.TestCase):
     def test_reminder_crash_does_not_stop_other_deliveries_and_backs_off(self) -> None:
         self._task()  # 有发起方：会进入提醒判定
         self.queue_state = Consumption.LEFT_QUEUE  # 交接一发出就被消费：驻留只可能来自提醒退避（Opus 复审 P3-3）
-        with patch("agentstatus_bridge.dispatch.pending_reminder", side_effect=RuntimeError("boom")):
+        with patch("agentstatus_bridge.dispatch.pending_notices", side_effect=RuntimeError("boom")):
             self._run()
             self.assertEqual(len(self.codex.calls), 1, "提醒判定出错，排队的交接照常发出")
             errors = [event for event, _fields in self.records if event == "reminder_error"]
@@ -393,7 +400,7 @@ class ReminderTests(unittest.TestCase):
         self._report(task_id)
         self._run()
         self.now += 120  # 回执写入后的观察窗口已过：驻留只可能来自等提醒
-        with patch("agentstatus_bridge.dispatch.pending_reminder", side_effect=RuntimeError("boom")):
+        with patch("agentstatus_bridge.dispatch.pending_notices", side_effect=RuntimeError("boom")):
             self.assertEqual(REMINDER_MAX_SCAN_ERRORS, 10)
             for round_ in range(1, 11):
                 if round_ > 1:
@@ -632,7 +639,7 @@ class ReminderTests(unittest.TestCase):
         self._report(task_id)
         self._run()
         self._run()  # 上一轮投递回执改了账本：这一轮按新修订号重算一次缓存
-        with patch("agentstatus_bridge.dispatch.pending_reminder", wraps=pending_reminder) as spy:
+        with patch("agentstatus_bridge.dispatch.pending_notices", wraps=pending_notices) as spy:
             self._run()
             self._run()
             self.assertEqual(len(self.dispatcher.pending_reminders()), 1)
@@ -711,7 +718,8 @@ class ReminderTests(unittest.TestCase):
                 self.assertIn(text, reminder.body)
                 self.assertIn(step, reminder.body)
 
-    def test_delivery_failure_is_reminded_from_the_failure_time(self) -> None:
+    def test_delivery_failure_is_notified_at_once_from_the_failure_time(self) -> None:
+        # §103.2：确定未送达不再等 30 分钟，到期时刻就是落定时刻；同一令牌只告知一次
         task_id = self._task()
         attempt = work_attempts(self.store.attempts(task_id))[-1]
         self.store.transition_delivery(
@@ -719,11 +727,13 @@ class ReminderTests(unittest.TestCase):
         )
         pending = self._pending(task_id)
         assert pending is not None
-        self.assertEqual(pending.due_at, self.now + REMIND_AFTER_SECONDS)
-        self.now += REMIND_AFTER_SECONDS
+        self.assertEqual((pending.due_at, pending.immediate), (self.now, True))
         self._run()
         [reminder] = self._reminders(task_id)
-        self.assertIn("未送达", reminder.body)
+        self.assertIn("投递未成功", reminder.body)
+        self.now += 3 * REMIND_AFTER_SECONDS
+        self._run()
+        self.assertEqual(len(self._reminders(task_id)), 1)
 
     def test_review_changes_are_reminded_but_self_review_is_not(self) -> None:
         reviewer = ref(Provider.CLAUDE, "review-session", pid=2000, pane="%2", label="review")

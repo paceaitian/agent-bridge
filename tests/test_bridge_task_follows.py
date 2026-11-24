@@ -290,7 +290,7 @@ class LimitTextTests(LocalCliCase):
     def test_limit_texts_mention_follows(self) -> None:
         for code in ("attempts_near_limit", "report_attempts_near_limit", "capacity_attempts"):
             with self.subTest(code=code):
-                self.assertIn("（可加 --follows <旧ID> 关联）", labels.reason_text(code))
+                self.assertIn('（可加 --follows "旧任务ID" 关联）', labels.reason_text(code))
         task_id = self.send()
         self.mark_sent(task_id, Delivery.FAILED)
         with self.store() as store:
@@ -301,10 +301,10 @@ class LimitTextTests(LocalCliCase):
             assert task is not None
             step = labels.next_step(task, store.attempts(task_id), ref="TASK", command="ab")
             assert step is not None
-            self.assertIn("ab close TASK 后 ab send 新任务（可加 --follows <旧ID> 关联）", step.text)
+            self.assertIn("ab close TASK 后 ab send 新任务（可加 --follows TASK 关联）", step.text)
         code, _, err = self.run_cli("retry", task_id)
         self.assertEqual(code, cli.EXIT_REJECTED)
-        self.assertIn("--follows <旧ID>", err)
+        self.assertIn('--follows "旧任务ID"', err)
 
 
 class WindowsFollowsTests(unittest.TestCase):

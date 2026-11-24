@@ -13,6 +13,10 @@ fixture classes SKIP with the same "POSIX-only:" prefix. Codex turn/steer: the c
 table and Fake-kernel Windows client run; the Linux UDS fake daemon class SKIPs likewise.
 Claude titles (DESIGN 99): rule/chunk/locate/memo/count cases run; symlink, FIFO and Linux
 open cases SKIP with the same "POSIX-only:" prefix (Fake-kernel title discovery is in _discovery).
+DESIGN 104: the pure marker/defer-bound module runs; its ledger/CLI behaviour tests are Linux-fixture modules
+outside this selection (nudges are Linux-only; Windows worker passes observe=None).
+Message second line (DESIGN 104.2/104.9): the pure action_line/render cases run, since a VM->Windows
+task is rendered by Windows as the delivering device.
 """
 from pathlib import Path
 import sys
@@ -36,7 +40,9 @@ MODULES = ('test_bridge_windows', 'test_bridge_windows_streams',
            'test_bridge_federation_transport_close',
            'test_bridge_task_filters', 'test_bridge_task_follows',
            'test_bridge_note', 'test_bridge_codex_steer', 'test_bridge_fyi',
-           'test_bridge_worker_lock', 'test_bridge_claude_titles')
+           'test_bridge_worker_lock', 'test_bridge_claude_titles',
+           'test_bridge_markers',
+           'test_bridge_action_line_portable')
 # Only these skips may appear; any other skip means a module silently did not qualify.
 NATIVE_PREFIX = 'test_bridge_windows_native.'
 POSIX_ONLY = "POSIX-only:"

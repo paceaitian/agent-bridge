@@ -6,12 +6,10 @@
 
 from __future__ import annotations
 
-import calendar
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-import math
 import re
-import time
+import time  # 时刻实现已收拢到 labels；测试仍经 views.time 打补丁（同一模块对象）
 from typing import Any
 
 from .closure import ClosureOutcome
@@ -25,9 +23,16 @@ from .labels import (
     WORK_LABELS,
     next_step,
     reason_text,
+    shown_reason,
     role_label,
     review_capacity_hint,
     notification_capacity_hint,
+    clock_text,
+    clock_time,
+    deferred_due,
+    reminded_label,
+    silent_minutes,
+    utc_offset,
 )
 from .model import (
     CLOSURE_KIND,
@@ -74,26 +79,18 @@ def _age(timestamp: float | None, now: float) -> str:
 
 
 def _clock(timestamp: float) -> str:
-    """本机时区（含 TZ 环境变量）下的时刻，不带偏移；单独出现时用 _clock_with_offset。"""
-    return time.strftime("%m-%d %H:%M:%S", time.localtime(timestamp))
+    """本机时区下的时刻，不带偏移；实现在 labels.clock_time（时刻格式只留一份）。"""
+    return clock_time(timestamp)
 
 
 def _utc_offset(timestamp: float) -> str:
-    """该时刻在本机时区下的 UTC 偏移（如 UTC+08:00），按该时刻自身算，夏令时前后各自正确（§100.2）。
-
-    直接由 localtime 的各字段反推（timegm(本地字段) − 时刻），与 _clock 显示的时刻必然一致——Windows 上 TZ 被
-    C 运行库按它自己的规则解释时也照实标出，不另外绕开 TZ。
-    """
-    seconds = calendar.timegm(time.localtime(timestamp)) - math.floor(timestamp)
-    hours, rest = divmod(abs(seconds), 3600)
-    minutes, extra = divmod(rest, 60)
-    text = f"UTC{'-' if seconds < 0 else '+'}{hours:02d}:{minutes:02d}"
-    return f"{text}:{extra:02d}" if extra else text
+    """该时刻自身的 UTC 偏移（§100.2）；实现在 labels.utc_offset。"""
+    return utc_offset(timestamp)
 
 
 def _clock_with_offset(timestamp: float) -> str:
-    """单独出现的时刻：本机时区时刻加该时刻自身的 UTC 偏移。"""
-    return f"{_clock(timestamp)} {_utc_offset(timestamp)}"
+    """单独出现的时刻：本机时区时刻加该时刻自身的 UTC 偏移；实现在 labels.clock_text。"""
+    return clock_text(timestamp)
 
 
 def _ref_document(ref: EndpointRef | None, names: NameBook = NO_NAMES) -> dict[str, object] | None:
@@ -219,7 +216,7 @@ def _task_document(
         "phase": view.phase.value,
         "phaseLabel": PHASE_LABELS[view.phase],
         "reason": view.reason,
-        "reasonText": reason_text(view.reason),
+        "reasonText": reason_text(shown_reason(view)),
         "origin": _ref_document(task.origin, names),
         "reviewer": _ref_document(task.reviewer, names),
         "control": task.control,
@@ -290,7 +287,7 @@ def _print_task(
         print(f"任务 {short(task.id)} {title} {FYI_STATUS_LABEL}：{state}")
         flow = "告知（只需读到，不汇报、不验收）"
     else:
-        print(f"任务 {short(task.id)} {title} {PHASE_LABELS[view.phase]}：{reason_text(view.reason)}")
+        print(f"任务 {short(task.id)} {title} {PHASE_LABELS[view.phase]}：{reason_text(shown_reason(view, now))}")
         flow = "交接" if task.flow is Flow.HANDOFF else f"实现 → 复核（{names.text(task.reviewer) if task.reviewer else '?'}）"
     origin = names.text(task.origin) if task.origin else "用户"
     print(f"流程：{flow}；发起：{origin}；创建于 {_age(task.created_at, now)}")
@@ -320,6 +317,9 @@ def _print_task(
             print(f"  #{attempt.seq} {role_label(attempt)} → {names.text(attempt.target)}：{delivery}{work}")
         for line in _describe_result(attempt.result):
             print(f"      {line}")
+        deferred = defer_line(attempt, now)
+        if deferred is not None:
+            print(f"      {deferred}")
         if show_body:
             for line in attempt.body.splitlines():
                 print(f"      | {line}")
@@ -365,37 +365,69 @@ def _print_task(
         print(line)
 
 
-def _timeline_lines(events: Sequence[Mapping[str, Any]]) -> list[str]:
-    """`ab status` 时间线的文字行（含标题）；没有事件时为空。
+def _local_event_text(event: Mapping[str, Any]) -> tuple[str, object]:
+    """本机时间线一行的标签与附注；本机事件都由本机代码写入，没有登记的 kind 按原样显示。"""
+    kind = str(event["kind"])
+    detail = event["detail"] if isinstance(event["detail"], dict) else {}
+    label = EVENT_LABELS.get(kind)
+    if kind == "origin_reminded":
+        label = reminded_label(detail) or label
+    if label is None and kind.startswith("delivery_"):
+        label = reason_text(kind)
+    if label is None and kind.startswith("consumption_"):
+        try:
+            label = CONSUMPTION_LABELS[Consumption(kind.removeprefix("consumption_"))] or kind
+        except ValueError:
+            label = kind
+    extra = detail.get("note") or detail.get("text") or reason_text(detail.get("reason"))
+    if kind == "origin_reminded" and silent_minutes(detail) is not None:
+        extra = ""  # 沉默提醒的分钟数已写进标签，原因不再重复（缺分钟数时照常写原因）
+    if kind == 'notification_skipped' and detail.get('reason') in CAPACITY_CODES:
+        extra = notification_capacity_hint(detail['reason'])
+    elif kind == 'review_skipped_capacity' and detail.get('reason') in CAPACITY_CODES:
+        extra = review_capacity_hint(detail['reason'])
+    return label or kind, extra
+
+
+def timeline_lines(events: Sequence[Mapping[str, Any]], *,
+                   describe: Callable[[Mapping[str, Any]], tuple[str, object]] = _local_event_text,
+                   note: str = "") -> list[str]:
+    """`ab status` 时间线的文字行（含标题）；没有事件时为空。events 的 at 是 epoch 秒。
 
     时刻按本机时区（含 TZ）显示：整条时间线偏移相同时只在标题标一次，跨夏令时等偏移不同时逐行标（§100.2）。
+    describe 给出每行的标签与附注（联邦时间线另给一份，远端取值在那里转义，§104.9 七）；note 附在标题括号里。
     """
     if not events:
         return []
     offsets = [_utc_offset(float(event["at"])) for event in events]
     uniform = len(set(offsets)) == 1
-    rows = [f"时间线（{offsets[0]}）：" if uniform else "时间线："]
+    inner = "，".join(part for part in (offsets[0] if uniform else "", note) if part)
+    rows = [f"时间线（{inner}）：" if inner else "时间线："]
     for event, offset in zip(events, offsets):
-        kind = str(event["kind"])
-        label = EVENT_LABELS.get(kind)
-        if label is None and kind.startswith("delivery_"):
-            label = reason_text(kind)
-        if label is None and kind.startswith("consumption_"):
-            try:
-                label = CONSUMPTION_LABELS[Consumption(kind.removeprefix("consumption_"))] or kind
-            except ValueError:
-                label = kind
-        detail = event["detail"] if isinstance(event["detail"], dict) else {}
-        extra = detail.get("note") or detail.get("text") or reason_text(detail.get("reason"))
-        if kind == 'notification_skipped' and detail.get('reason') in CAPACITY_CODES:
-            extra = notification_capacity_hint(detail['reason'])
-        elif kind == 'review_skipped_capacity' and detail.get('reason') in CAPACITY_CODES:
-            extra = review_capacity_hint(detail['reason'])
+        label, extra = describe(event)
         suffix = f"：{str(extra)[:160]}" if extra else ""
         seq = f" #{event['attemptSeq']}" if event["attemptSeq"] else ""
         stamp = _clock(float(event["at"])) if uniform else f"{_clock(float(event['at']))} {offset}"
-        rows.append(f"  {stamp}{seq} {label or kind}{suffix}")
+        rows.append(f"  {stamp}{seq} {label}{suffix}")
     return rows
+
+
+def _timeline_lines(events: Sequence[Mapping[str, Any]]) -> list[str]:
+    """本机任务的时间线（保留原名：测试与旧调用点按这个名字用）。"""
+    return timeline_lines(events)
+
+
+def defer_line(attempt: Attempt, now: float | None = None) -> str | None:
+    """还没发出、还没到点的延迟投递尝试写一行「定时发出：<时刻>」（§104.9 二）；到点后或在等自动重试时不写
+    （§104.11 P3，判据见 labels.deferred_due，与联邦 status 同一份）。"""
+    due = deferred_due(attempt.options, pending=attempt.delivery is Delivery.PENDING,
+                       now=time.time() if now is None else now)
+    return None if due is None else deferred_text(due)
+
+
+def deferred_text(due: float) -> str:
+    """「定时发出：<本机时刻> <UTC 偏移>」：本机与跨设备 status 共用同一写法。"""
+    return f"定时发出：{clock_text(due)}"
 
 
 def _closure_document(outcome: ClosureOutcome, names: NameBook = NO_NAMES) -> dict[str, object]:

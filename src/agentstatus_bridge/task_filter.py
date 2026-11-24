@@ -18,6 +18,8 @@ TASK_LIST_LIMIT = 200
 _RELATIVE = re.compile(r"([1-9][0-9]*)([mhd])")
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400}
+# --after/--expect/--in 的时长（DESIGN §104.9 一、二）：`<正整数>m` 或 `<正整数>h`
+_DURATION = re.compile(r"([1-9][0-9]{0,5})([mh])")
 
 # 参与方投影：(provider 值, 会话 ID)
 Party = tuple[str, str]
@@ -46,6 +48,15 @@ def parse_since(raw: str, now: float) -> float:
     except (ValueError, OverflowError, OSError) as error:
         raise FilterError("since_invalid") from error
     raise FilterError("since_invalid")
+
+
+def parse_duration(raw: str, *, minimum: float, maximum: float) -> float | None:
+    """`30m`、`2h` 这类时长换成秒；格式不对或超出 [minimum, maximum] 返回 None，由调用方报各自的原因码。"""
+    found = _DURATION.fullmatch(raw.strip())
+    if found is None:
+        return None
+    seconds = float(int(found[1]) * _UNIT_SECONDS[found[2]])
+    return seconds if minimum <= seconds <= maximum else None
 
 
 @dataclass(frozen=True)

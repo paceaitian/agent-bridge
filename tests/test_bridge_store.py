@@ -13,12 +13,13 @@ from unittest.mock import patch
 
 import uuid
 
-from agentstatus_bridge.model import Consumption, Delivery, Flow, Phase, Work, describe
+from agentstatus_bridge.model import Consumption, Delivery, Flow, Phase, Role, Work, describe
 from agentstatus_bridge.store import (
     DB_NAME,
     FINISHED_RETENTION_SECONDS,
     MAX_BODY_BYTES,
     MAX_EVENTS_PER_TASK,
+    MAX_FINISHED_TASKS,
     Store,
     StoreError,
 )
@@ -329,6 +330,52 @@ class BridgeStoreTests(unittest.TestCase):
         self.assertEqual(removed, 1)
         self.assertIsNone(self.store.get_task(old.id))
         self.assertIsNotNone(self.store.get_task(open_task.id))
+
+    def test_prune_keeps_finished_tasks_that_still_have_a_deliverable_attempt(self) -> None:
+        # Codex P1-05（§104.12 第 5 条）：24 小时后的定时提醒建好就关闭；之后 1000 条更新的告知交出，它也不能被数量清理删掉
+        _task, reminder = self.store.create_fyi(title="提醒", origin=ref(), origin_class="bypass", target=ref(),
+                                                body="到点看", refs=[], now=1000.0, bridge_sender=True,
+                                                attempt_options={"deferUntil": 1000.0 + 86400, "remind": True})
+        with self.store.transaction():
+            for n in range(1, MAX_FINISHED_TASKS + 1):
+                _, fyi = self.store.create_fyi(title="告知", origin=ref(), origin_class="bypass", target=ref(),
+                                               body="x", refs=[], now=1000.0 + n)
+                self.store.begin_send(fyi.id, now=1000.0 + n, pid=1, start_ticks="1")
+                self.store.finish_send(fyi.id, delivery=Delivery.QUEUED, reason="t", provider_ref=None, detail={},
+                                       now=1000.0 + n)
+        self.store.prune(now=1000.0 + MAX_FINISHED_TASKS + 1)
+        kept = self.store.get_attempt(reminder.id)
+        assert kept is not None
+        self.assertEqual(kept.delivery, Delivery.PENDING)
+        # 保留期同理：超过保留期也不删，投递落定后才进入清理
+        self.store.prune(now=1000.0 + FINISHED_RETENTION_SECONDS + 10)
+        self.assertIsNotNone(self.store.get_attempt(reminder.id))
+        self.store.begin_send(reminder.id, now=90000.0, pid=1, start_ticks="1")
+        self.assertIsNotNone(self.store.get_attempt(reminder.id))  # SENDING 也留着
+        self.store.prune(now=1000.0 + FINISHED_RETENTION_SECONDS + 20)
+        self.assertIsNotNone(self.store.get_attempt(reminder.id))
+        self.store.finish_send(reminder.id, delivery=Delivery.QUEUED, reason="t", provider_ref=None, detail={},
+                               now=90001.0)
+        self.store.prune(now=1000.0 + FINISHED_RETENTION_SECONDS + 30)
+        self.assertIsNone(self.store.get_attempt(reminder.id))
+
+    def test_prune_keeps_a_pending_closure_receipt_but_not_a_leftover_note(self) -> None:
+        # §104.12 第 5 条：结束后才排的结束回执与告知同样等投递落定；其他残留 PENDING（如补充）不会再发，不挡清理；
+        # options 不是合法 JSON 的旧行不让整条清理报错
+        old = FINISHED_RETENTION_SECONDS + 10
+        receipt_task, _ = self._create()
+        note_task, _ = self._create()
+        broken_task, _ = self._create()
+        for task_id, kind in ((receipt_task.id, "closure"), (note_task.id, "note"), (broken_task.id, "closure")):
+            self.store.update_task(task_id, now=1.0, event="closed", closed_at=1.0)
+            self.store.add_attempt(task_id, role=Role.NOTICE, target=ref(), body="x", refs=[], now=2.0, sender=None,
+                                   sender_class="bypass", options={"noticeKind": kind, "forSeq": 1})
+        with self.store.transaction() as conn:
+            conn.execute("UPDATE attempts SET options='not json' WHERE task_id=? AND role='notice'", (broken_task.id,))
+        self.store.prune(now=1.0 + old)
+        self.assertIsNotNone(self.store.get_task(receipt_task.id))
+        self.assertIsNone(self.store.get_task(note_task.id))
+        self.assertIsNone(self.store.get_task(broken_task.id))  # 坏 options 认不出种类：按普通残留处理
 
     def test_message_limits(self) -> None:
         with self.assertRaises(StoreError) as empty:

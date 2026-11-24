@@ -728,7 +728,8 @@ class LocalHitDecisionTests(FedCliCase):
                 patch.object(fed_commands, "open_runtime", wraps=fed_commands.open_runtime) as opened, \
                 patch.object(fed_commands, "find_task", wraps=fed_commands.find_task) as resolved, \
                 patch.object(FederatedStore, "open", wraps=FederatedStore.open) as fed_open, \
-                patch.object(FederatedStore, "open_readonly", wraps=FederatedStore.open_readonly) as fed_readonly:
+                patch.object(FederatedStore, "open_readonly", wraps=FederatedStore.open_readonly) as fed_readonly, \
+                patch.object(cli, "_federation_twin", wraps=cli._federation_twin) as twin:  # pyright: ignore[reportPrivateUsage]
             for step in steps:
                 for extra in ((), ("--json",)) if step[0] == "pause" else ((),):
                     with self.subTest(step=step, extra=extra):
@@ -737,9 +738,12 @@ class LocalHitDecisionTests(FedCliCase):
                 if step[0] == "pause":
                     self.assertEqual(self.run_on("vm", "resume", task_id, caller=FED_USER)[0], 0)
                     self.assertEqual(self.run_on("vm", "pause", task_id, caller=FED_USER)[0], 0)
-        # 命令本身开联邦库的全部入口严格 0 次（r1 两方 P3-1：不能用「等于摘要刷新次数」，命令内经摘要入口开库会被抵消）
-        self.assertEqual((probe.call_count, opened.call_count, resolved.call_count, fed_open.call_count,
-                          fed_readonly.call_count), (0, 0, 0, 0, 0))
+        # 命令本身开可写联邦库与经联邦解析任务的入口严格 0 次（r1 两方 P3-1：不能用「等于摘要刷新次数」，命令内经摘要入口
+        # 开库会被抵消）。§104.13 第 1 条起本机命中时要只读查一次联邦有没有同引用的任务（跨库歧义）：只读打开只来自
+        # 这一个探测，每条命令恰好一次
+        self.assertEqual((probe.call_count, opened.call_count, resolved.call_count, fed_open.call_count), (0, 0, 0, 0))
+        self.assertTrue(twin.call_count)
+        self.assertEqual(fed_readonly.call_count, twin.call_count)
 
 
 class WindowsTaskFilterTests(unittest.TestCase):

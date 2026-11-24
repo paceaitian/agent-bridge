@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
@@ -20,18 +20,32 @@ import unicodedata
 from .platforms.factory import get_platform
 from . import __version__
 from .ids import opaque_id, short
-from .labels import next_step, reason_text
-from .model import PHASE_LABELS, Attempt, EndpointRef, Phase, Provider, Task, TaskView, describe
+from .labels import next_step, reason_text, shown_reason
+from .model import (
+    AUTO_RETRY_OPTION,
+    PHASE_LABELS,
+    Attempt,
+    Delivery,
+    EndpointRef,
+    Phase,
+    Provider,
+    Task,
+    TaskView,
+    describe,
+)
 from .paths import device_name
 from .store import Store, StoreError
 
 if TYPE_CHECKING:
+    from .federation.authority import Identity
     from .federation.fedstore import FederatedStore
+    from .federation.views import FederatedItem, RemoteEndpoint
 
 SUMMARY_NAME = "summary.json"
 LOCK_NAME = "summary.lock"
 SCHEMA = 1
-# 存储层活跃任务上限为 100，按最长字段估算远低于此值；超限只截断 tasks，attentionIndex 始终完整
+# 本机账本与联邦权威任务各自的活跃上限都是 100（两库合并后最多 200 条，§103.7），按最长字段估算仍在此值之内；
+# 超限只截断 tasks，attentionIndex 始终完整
 MAX_BYTES = 512 * 1024
 # 最近投递：只发布消息 id 与角色，条数有界；扩展拿对方开轮时回传的消息 id 与它比对（DESIGN §45.26）
 DELIVERY_LIMIT = 64
@@ -42,11 +56,18 @@ LOCK_WAIT_SECONDS = 2.0
 TITLE_CODEPOINTS = 80
 INDEX_TITLE_CODEPOINTS = 40
 LABEL_CODEPOINTS = 64
+# 远端端点的面板短标签上限（§103.7）：「<设备> 上的 provider@id:<完整ID>」在 32 字 slug 下约 81 字，64 会截成半截 ID
+REMOTE_LABEL_CODEPOINTS = 120
 ATTENTION_KINDS: tuple[str, ...] = ("result", "decision", "failure")
 # 有联邦实例时的组合新鲜度键（DESIGN §88.8）：两个库的 identity 与修订号同时进入摘要水位
 FEDERATION_CONFIG = "federation.json"
 FEDERATION_DB = "federation.sqlite3"
 FEDERATION_ID_TAG = "summary-fed-v1"
+# 有联邦实例时摘要顶层的可选标记（§103.7）：值是并入联邦任务的写法版本。无联邦实例时不写，摘要与旧版逐字相同；
+# 旧发布器（不并入联邦任务）写出的文档没有它，新代码据此在水位相同时也重建一次（与 _lacks_endpoint_bindings 同类）。
+# 读方只比「缺失或小于本版」，更新的写方写更大的值时本版不抢写
+FEDERATED_TASKS_KEY = "federatedTasks"
+FEDERATED_TASKS = 1
 STATE_LABELS: dict[str, str] = {
     "absent": "未生成",
     "ok": "正常",
@@ -79,6 +100,11 @@ class PublishResult:
     status: str
     revision: int
     ledger_id: str = ""
+    # §103.7 的内容无关诊断：坏联邦任务逐条跳过的条数、与本机账本重复 ID（本机优先）的条数；调用方只记数字
+    skipped: int = 0
+    duplicates: int = 0
+    # 下一个会让摘要文字变化、但账本修订不变的时刻（最早的未到期定时项，§104.11 P3）；worker 到点再发布一次
+    refresh_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +115,13 @@ class LedgerSnapshot:
     revision: int
     tasks: list[tuple[Task, list[Attempt]]]
     deliveries: list[dict[str, Any]] = field(default_factory=list)
+    # 联邦权威任务里关注类别不为 none 的条目（§103.7），已按 _task_entry 算好、已按 ID 让位本机；attention.at 的
+    # 钟差钳制留给 build_document（需要 generatedAt）
+    remote_entries: list[dict[str, Any]] = field(default_factory=list)
+    skipped: int = 0
+    duplicates: int = 0
+    # 这份快照读过联邦库（有联邦实例）：文档带 FEDERATED_TASKS_KEY 标记
+    federated: bool = False
 
 
 def clean_text(value: str | None, limit: int) -> str:
@@ -147,6 +180,12 @@ def binding(attempt: Attempt) -> dict[str, Any]:
     return endpoint_binding(target)
 
 
+def remote_binding() -> dict[str, Any]:
+    """远端端点的绑定（§103.7）：不按 provider 与原生 ID 算 observer 键——同一原生 ID 可能对上本机同名会话行，
+    点击或通知就跳错窗口。形状与 Windows、无 pane 的 Linux Codex 现行写出的一致，旧扩展照样判有效。"""
+    return {"source": "selected", "pane": None, "observerKeys": []}
+
+
 def endpoint_binding(ref: EndpointRef) -> dict[str, Any]:
     """按账本记下的端点（source=selected）推导 observer 会话键：发起方、复核方与没有投递证据的接收方共用（DESIGN §45.27.1）。"""
     return _observer_binding(ref.provider, ref.native_id, "selected", ref.pane, ref.pid, ref.start_ticks, ref.server_pid)
@@ -178,8 +217,9 @@ def _observer_binding(
 def read_ledger(store: Store, federation: FederatedStore | None = None) -> LedgerSnapshot:
     """在同一 SQLite 读事务里取修订号与全部未结束任务，避免拼出不属于同一时刻的摘要。
 
-    有联邦实例时另在联邦库的读快照里取 identity/修订号与本设备实际执行的联邦投递，组合成同一水位（DESIGN §88.8）；
-    两库没有跨库事务：各自快照里的修订号随数据一起取，期间有新写入时水位偏旧，下一轮按组合键重建。
+    有联邦实例时另在联邦库的读快照里取 identity/修订号、本设备实际执行的联邦投递，以及本机为权威、未结束、关注类别不为
+    none 的联邦任务（§103.7），组合成同一水位（DESIGN §88.8）；两库没有跨库事务：各自快照里的修订号随数据一起取，
+    期间有新写入时水位偏旧，下一轮按组合键重建。
     """
     with store.read_snapshot():
         ledger_id, revision = store.ledger_revision()
@@ -187,12 +227,50 @@ def read_ledger(store: Store, federation: FederatedStore | None = None) -> Ledge
         local = store.recent_delivery_rows(limit=DELIVERY_LIMIT)
     if federation is None:
         return LedgerSnapshot(ledger_id, revision, tasks, [item for _, item in local])
+    from .federation.authority import Identity  # layout: allow 联邦按需加载：无联邦实例的机器不导入
+    from .federation.views import summary_items  # layout: allow 联邦按需加载：无联邦实例的机器不导入
     with federation.read_snapshot():
         instance, fed_revision = federation.revision()
         remote = federation.recent_deliveries(limit=DELIVERY_LIMIT)
+        items, skipped = summary_items(federation)
+        # 本机在联邦里的身份（启用时写进联邦库 meta）：权威项 next.command 的路由用（§104.13 第 2 条）
+        ident = Identity(federation.meta("deviceId") or "", federation.meta("deviceName") or "", "")
     composite_id, composite_revision = combine_mark(ledger_id, revision, instance, fed_revision)
     merged = merge_deliveries(local, [(at / 1000.0, item) for at, item in remote])
-    return LedgerSnapshot(composite_id, composite_revision, tasks, merged)
+    entries, failed, duplicates = federated_entries(items, {task.id for task, _ in tasks}, ident=ident)
+    return LedgerSnapshot(composite_id, composite_revision, tasks, merged, entries, skipped + failed, duplicates,
+                          federated=True)
+
+
+# 一条坏联邦任务在算条目时可能抛的错（枚举值、时间溢出、字段形状、记录损坏）：逐条跳过，不让整份摘要发布失败（§103.7）
+_ITEM_ERRORS = (ValueError, OverflowError, TypeError, KeyError, StoreError)
+
+
+def federated_entries(items: list[FederatedItem], local_ids: Collection[str], *,
+                      ident: Identity | None = None) -> tuple[list[dict[str, Any]], int, int]:
+    """联邦权威任务的摘要条目（§103.7）：与本机同一个 _task_entry，只留关注类别不为 none 的；与本机账本重复的 ID
+    本机优先。返回 (条目, 算条目时出错跳过的条数, 重复让位的条数)，后两者只是内容无关的计数。
+
+    ident 是本机联邦身份：next.command 用「完整 ID --origin-device <本机>」（authority.command_ref，§104.13 第 2 条），
+    两库同 ID 时照抄也只作用到联邦这一项；读不到身份时退回只写完整 ID。next.command 在 v1 合同里是开放字符串。
+    """
+    from .federation.authority import command_ref  # layout: allow 联邦按需加载：只有联邦条目会走到这里
+    entries: list[dict[str, Any]] = []
+    failed = duplicates = 0
+    for item in items:
+        ref = command_ref(ident, item.task.id) if ident is not None and ident.device_id else None
+        try:
+            entry = _task_entry(item.task, item.attempts, remote=item.remote, ref=ref)
+        except _ITEM_ERRORS:
+            failed += 1
+            continue
+        if entry["attention"]["kind"] == "none":
+            continue  # 没有关注的进行中跨设备任务不并入（完整联邦任务列表是 §88.8 另期）
+        if entry["id"] in local_ids:
+            duplicates += 1
+            continue
+        entries.append(entry)
+    return entries, failed, duplicates
 
 
 def combine_mark(ledger_id: str, revision: int, fed_instance: str, fed_revision: int) -> tuple[str, int]:
@@ -270,7 +348,10 @@ def build_document(snapshot: LedgerSnapshot, *, now: float, device: str) -> dict
     `device` 是这份摘要所属的设备（本机名，由调用方注入以便 golden 固定）：跨设备时 hub 合并的是
     各设备各自的摘要，所以设备记在顶层，不进每个任务或端点（DESIGN §45.35）。
     """
-    entries = [_task_entry(task, attempts) for task, attempts in snapshot.tasks]
+    entries = [_task_entry(task, attempts, now=now) for task, attempts in snapshot.tasks]
+    # 联邦条目的关注时刻可能取自投递设备 B 的证据（B 的时钟）：扩展对晚于本机 now+5 秒的条目先记已见再跳过、之后不补发，
+    # 所以这里的 at 不晚于生成时刻；token 不变，仍与发起方提醒的令牌相等（§103.7）
+    entries.extend(_clamp_attention(entry, now) for entry in snapshot.remote_entries)
     entries.sort(key=lambda item: (item["attention"]["kind"] == "none", -float(item["updatedAt"]), item["id"]))
     index = [
         {
@@ -287,7 +368,7 @@ def build_document(snapshot: LedgerSnapshot, *, now: float, device: str) -> dict
     ]
     counts = {"active": len(entries), "attention": len(index)}
     counts.update({kind: sum(1 for item in index if item["kind"] == kind) for kind in ATTENTION_KINDS})
-    return {
+    document: dict[str, Any] = {
         "schema": SCHEMA,
         "ledgerId": snapshot.ledger_id,
         "ledgerRevision": snapshot.revision,
@@ -300,6 +381,16 @@ def build_document(snapshot: LedgerSnapshot, *, now: float, device: str) -> dict
         "tasks": entries,
         "deliveries": snapshot.deliveries[:DELIVERY_LIMIT],
     }
+    if snapshot.federated:
+        document[FEDERATED_TASKS_KEY] = FEDERATED_TASKS
+    return document
+
+
+def _clamp_attention(entry: dict[str, Any], now: float) -> dict[str, Any]:
+    attention = entry["attention"]
+    if attention["kind"] == "none" or attention["at"] <= now:
+        return entry
+    return {**entry, "attention": {**attention, "at": now}}
 
 
 def encode(document: dict[str, Any]) -> bytes:
@@ -494,10 +585,24 @@ def load(directory: Path) -> dict[str, Any] | None:
     return document if valid else None
 
 
+def defer_dues(snapshot: LedgerSnapshot) -> list[float]:
+    """快照里还没发出、带 deferUntil、不在等自动重试的本机尝试的到期时刻（§104.11 P3）。
+
+    reasonText/next.text 在到期时刻前后写法不同（labels.shown_reason），账本修订却不变；摘要据此判断「修订相同但
+    文字已过期」，并告诉 worker 下一个到期时刻。联邦条目只收关注类别不为 none 的任务（§103.7），定时项不在其中。
+    """
+    return [due for _task, attempts in snapshot.tasks for attempt in attempts
+            if attempt.delivery is Delivery.PENDING and AUTO_RETRY_OPTION not in attempt.options
+            and (due := attempt.defer_until) is not None]
+
+
 def publish(store: Store, directory: Path, *, force: bool = False, now: float | None = None) -> PublishResult:
-    """发布摘要。if-stale（默认）只在现有摘要结构有效、属于同一账本且修订号相同时跳过；force 总是重建。
+    """发布摘要。if-stale（默认）只在现有摘要结构有效、属于同一账本且修订号相同、而且上次生成之后没有定时项到期时跳过；
+    force 总是重建。结果带下一个定时项的到期时刻（refresh_at），worker 到点再调一次。
 
     读取账本快照与写入都在 summary.lock 内完成：并发发布者按加锁顺序落盘，旧快照不会覆盖新文件。
+    本次时刻也在锁内、读完快照之后统一取一次（§104.13 第 6 条），判过期、算下次刷新、渲染与写入都用它：若在拿锁前取时，
+    等锁期间别的发布者已按到期后的时刻写好，较早取时的强制发布会把它覆盖回「定时发出」的旧写法。
     """
     try:
         with _lock(directory):
@@ -510,6 +615,9 @@ def publish(store: Store, directory: Path, *, force: bool = False, now: float | 
             finally:
                 if federation is not None:
                     federation.close()
+            moment = time.time() if now is None else now
+            dues = defer_dues(snapshot)
+            refresh_at = min((due for due in dues if due > moment), default=None)
             if not force:
                 existing = load(directory)
                 if (
@@ -517,18 +625,27 @@ def publish(store: Store, directory: Path, *, force: bool = False, now: float | 
                     and existing["ledgerId"] == snapshot.ledger_id
                     and existing["ledgerRevision"] == snapshot.revision
                     and not _lacks_endpoint_bindings(existing)
+                    and not (snapshot.federated and _lacks_federated_tasks(existing))
+                    # 上次生成之后有定时项到期：修订没变，但「定时发出」已该改成等待写法
+                    and not any(existing["generatedAt"] < due <= moment for due in dues)
                 ):
-                    return PublishResult("fresh", snapshot.revision, snapshot.ledger_id)
+                    return PublishResult("fresh", snapshot.revision, snapshot.ledger_id, refresh_at=refresh_at)
             try:
-                payload = encode(
-                    build_document(snapshot, now=time.time() if now is None else now, device=device_name())
-                )
+                payload = encode(build_document(snapshot, now=moment, device=device_name()))
             except ValueError as error:
                 raise SummaryError("summary_invalid_value") from error
             _atomic_write(directory, payload)
     except OSError as error:
         raise SummaryError("summary_write_failed") from error
-    return PublishResult("written", snapshot.revision, snapshot.ledger_id)
+    return PublishResult("written", snapshot.revision, snapshot.ledger_id, snapshot.skipped, snapshot.duplicates,
+                         refresh_at=refresh_at)
+
+
+def _lacks_federated_tasks(document: dict[str, Any]) -> bool:
+    # 有联邦实例时，旧发布器（部署时还活着的旧 worker）按同一水位写出的摘要不含联邦任务（§103.7）：缺标记或标记版本
+    # 低于本版就重建一次。新文档在旧发布器眼里仍是 fresh（它只比水位与 binding），同一修订内不会来回抢写
+    value = document.get(FEDERATED_TASKS_KEY)
+    return not (isinstance(value, int) and not isinstance(value, bool) and value >= FEDERATED_TASKS)
 
 
 def _lacks_endpoint_bindings(document: dict[str, Any]) -> bool:
@@ -567,16 +684,32 @@ def status(directory: Path, store: Store | None) -> dict[str, Any]:
     return result
 
 
-def _task_entry(task: Task, attempts: list[Attempt]) -> dict[str, Any]:
+def _task_entry(
+    task: Task, attempts: list[Attempt], *, remote: Mapping[EndpointRef, RemoteEndpoint] | None = None,
+    now: float | None = None, ref: str | None = None,
+) -> dict[str, Any]:
+    """一条任务的摘要条目（now：判断定时项是否已到期的时刻，本机条目用摘要的 generatedAt）。remote 只由联邦权威任务给出（§103.7）：其中的端点是远端，走 remote_binding、面板短标签与
+    可选 device，绝不进 binding()/endpoint_binding()；不在其中的端点（发起方、本机复核方、投给本机的尝试）照旧。"""
     view = describe(task, attempts)
     kind, notify = classify(view)
     current = view.current
     attention: dict[str, Any] = {"kind": kind}
     if kind != "none":
         attention.update(token=attention_token(task, view), at=attention_at(task, view), notify=notify)
-    step = next_step(task, attempts, ref=task.id, reserved=0)
+    # ref：命令里的任务引用，本机条目是完整 ID；联邦权威条目由调用方传带路由的引用（§104.13 第 2 条）
+    step = next_step(task, attempts, ref=ref or task.id, reserved=0, now=now)
     target: dict[str, Any] | None = None
-    if current is not None:
+    shown = None if remote is None or current is None else remote.get(current.target)
+    if current is not None and shown is not None:
+        target = {
+            "provider": current.target.provider.value,
+            "label": clean_text(shown.label, REMOTE_LABEL_CODEPOINTS),
+            "pane": None,
+            "role": current.role.value,
+            "binding": remote_binding(),
+            "device": shown.device,
+        }
+    elif current is not None:
         bound = binding(current)
         target = {
             "provider": current.target.provider.value,
@@ -593,11 +726,11 @@ def _task_entry(task: Task, attempts: list[Attempt]) -> dict[str, Any]:
         "phase": view.phase.value,
         "phaseLabel": PHASE_LABELS[view.phase],
         "reason": view.reason,
-        "reasonText": reason_text(view.reason),
+        "reasonText": reason_text(shown_reason(view, now)),
         "attention": attention,
         "originIsUser": task.origin is None,
-        "origin": _endpoint(task.origin),
-        "reviewer": _endpoint(task.reviewer),
+        "origin": _endpoint(task.origin, remote),
+        "reviewer": _endpoint(task.reviewer, remote),
         "current": None
         if current is None
         else {
@@ -623,9 +756,14 @@ def _label(ref: EndpointRef) -> str:
     return clean_text(f"{ref.provider.value}@{where}" if where else ref.provider.value, LABEL_CODEPOINTS)
 
 
-def _endpoint(ref: EndpointRef | None) -> dict[str, Any] | None:
+def _endpoint(ref: EndpointRef | None, remote: Mapping[EndpointRef, RemoteEndpoint] | None = None) -> dict[str, Any] | None:
     if ref is None:
         return None
+    shown = None if remote is None else remote.get(ref)
+    if shown is not None:
+        # 远端发起方/复核方（§103.7）：同样必须带 binding 键，否则 _lacks_endpoint_bindings 每轮判需重建
+        return {"provider": ref.provider.value, "label": clean_text(shown.label, REMOTE_LABEL_CODEPOINTS), "pane": None,
+                "binding": remote_binding(), "device": shown.device}
     pane = ref.pane if ref.pane is not None and _PANE.fullmatch(ref.pane) else None
     # binding 让界面把发起方/复核方也对上会话行，协作组才能把两端排在一起（DESIGN §45.27.1）
     return {"provider": ref.provider.value, "label": _label(ref), "pane": pane, "binding": endpoint_binding(ref)}

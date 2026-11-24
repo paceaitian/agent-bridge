@@ -528,7 +528,7 @@ class WakeTests(RelayTestCase):
         self.b.cycle()
         self.tick(31_000)
         self.a.cycle()
-        self.assertEqual(directory.device_features(self.a.store, self.b.device_id), frozenset({"fyi"}))
+        self.assertEqual(directory.device_features(self.a.store, self.b.device_id), frozenset({"fyi", "ask"}))
         # 旧版本对端的快照没有这个键：按空集，发起方据此拒发告知
         self.b.relay._directory = lambda: {  # pyright: ignore[reportPrivateUsage]
             "endpoints": [], "complete": True, "providers": {"codex": True}, "namePolicy": "agent-native-v1"}
@@ -614,6 +614,66 @@ class WakeTests(RelayTestCase):
         self.tick(21 * 60_000)
         self.a.cycle()
         self.assertEqual(self.a.work, woken + 1)
+
+    def _b_delivers(self, outcome: Any) -> None:
+        """B 的 worker 投一次，结果按 outcome 回传 A（不经过 relay 的拉起判定）。"""
+        from agentstatus_bridge.federation.delivery import FederationDispatcher  # layout: allow 只在本用例投递
+        from bridge_support import RecordingTransport, endpoint  # layout: allow 同上
+
+        worker_ref = self.worker.local
+        assert worker_ref is not None
+        with mock.patch("agentstatus_bridge.federation.delivery.root_binding", return_value="root"):
+            FederationDispatcher(self.b.store, self.b.ident, self.b.paths, discover=lambda: [endpoint(worker_ref)],
+                                 transports={Provider.CODEX: RecordingTransport(Provider.CODEX, outcome)},
+                                 clock=self.clock, command="ab").run_once()
+
+    def test_attention_evidence_wakes_authority_worker_at_once(self) -> None:
+        # §103.2/§103.7：B 回传需处理集合的证据时 A 立即拉起 worker（立即告知、刷新面板），不等 15 秒轮询；
+        # HELD 没有到期提醒，原先只能等别的事件；QUEUED 不叫醒
+        from agentstatus_bridge.model import Delivery  # layout: allow 只在本用例构造投递结果
+        from agentstatus_bridge.transports import DeliveryOutcome  # layout: allow 同上
+
+        for outcome, wakes in ((DeliveryOutcome(Delivery.QUEUED, "codex_queued", provider_ref="i"), False),
+                               (DeliveryOutcome(Delivery.HELD, "claude_held"), True),
+                               (DeliveryOutcome(Delivery.FAILED, "codex_thread_not_found"), True)):
+            with self.subTest(delivery=outcome.delivery):
+                self.create()
+                self.a.cycle()
+                self.tick()
+                self.b.cycle()
+                self._b_delivers(outcome)
+                self.tick()
+                self.a.cycle()  # 先把 A 的周期复查跑掉，后面 15 秒内只剩立即叫醒这条路
+                woken = self.a.work
+                self.tick()
+                self.b.cycle()  # 证据推给 hub
+                self.tick()
+                self.a.cycle()
+                self.assertEqual(self.a.work, woken + (1 if wakes else 0))
+
+    def test_authority_transport_failure_wakes_worker_at_once(self) -> None:
+        # A 侧 hub 拒收（确定未 L1）派生 failed：同样立即拉起 worker
+        task, first = self.create()
+        item = next(row for row in self.a.store.outbox() if row["msg_id"] == first.msg_id)
+        woken = self.a.work
+        self.a.relay._refuse(item, "frame_invalid")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.a.store.attempt_by_msg(first.msg_id).delivery["state"], "failed")  # type: ignore[union-attr]
+        self.assertEqual(self.a.work, woken + 1)
+        self.assertEqual(task.task_id, first.task_id)
+
+    def test_hub_receipt_rejection_wakes_worker_at_once(self) -> None:
+        # §103.8 修 3（MX.8）：hub 回执里收件方 never-intent 拒绝（rejected）让 A 派生 failed，同样立即拉起 worker；
+        # expired 不证明未投、不派生 failed，也不为它叫醒
+        for state, derived in (("rejected", True), ("expired", False)):
+            with self.subTest(state=state):
+                _task, first = self.create()
+                item = next(row for row in self.a.store.outbox() if row["msg_id"] == first.msg_id)
+                woken = self.a.work
+                self.a.relay._apply_receipts([{"state": state, "msgId": item["msg_id"],  # pyright: ignore[reportPrivateUsage]
+                                               "at": self.clock.now, "reason": "frame_invalid"}])
+                delivery = self.a.store.attempt_by_msg(first.msg_id).delivery  # type: ignore[union-attr]
+                self.assertEqual(delivery["state"] == "failed", derived)
+                self.assertEqual(self.a.work, woken + (1 if derived else 0))
 
     def test_paused_work_wakes_only_after_resume(self) -> None:
         task, _ = self.create()

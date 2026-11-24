@@ -130,6 +130,11 @@ def _altered_char(char: str) -> bool:
     return category[0] == 'C' or category in ('Zl', 'Zp')
 
 
+def altered_char(char: str) -> bool:
+    """公开的判据（§103.8 修 2）：这个字符是否属于 copyable 的拒绝集合（C* 全类与 Zl/Zp，含 C1、RLO、零宽、行/段分隔符）。"""
+    return _altered_char(char)
+
+
 def _altered_by_a_consumer(value: str) -> bool:
     """名字里是否有会被改动的字符；这类名字照抄后与原名不等（例如零宽空格、emoji 的 ZWJ），只能作展示（§91.4.2 不改名字）。"""
     return any(_altered_char(char) for char in value)
@@ -181,6 +186,15 @@ def remote_display(value: object) -> str | None:
     RLO、零宽字符写成 \\uXXXX，伪造不出新行、也倒排不了同行的 target=；非字符串、空串或只有空白为 None。
     只用于文字行，--json 照给原值（JSON 自己转义控制字符）；对诚实写方已转义过的 displayName 幂等。"""
     return display_text(NameSource('named', value)) if isinstance(value, str) else None
+
+
+def remote_path(value: object) -> str | None:
+    """对端给的路径在本机人读文字里的写法（§103.3）：与 remote_display 同一套转义与首尾空白标注，但**不截断**——
+    路径最长 4096，截断会让人以为那就是完整来源。非字符串、空串或只有空白为 None。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = ''.join(_escape(char) if _altered_char(char) else char for char in value)
+    return f'"{text}"' if value != value.strip() else text
 
 
 def remote_workdir(value: object) -> str | None:

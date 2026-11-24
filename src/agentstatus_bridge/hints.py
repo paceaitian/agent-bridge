@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .model import Attempt, Consumption, Delivery, Endpoint, Provider, Role, Runtime, Work
+from .model import Attempt, Consumption, Delivery, Endpoint, Provider, Role, Runtime, Work, ask_pending
 
 # 轮次结束后留给对方补交汇报的时间，避免在它刚结束、汇报命令尚未落账时误提示
 STOPPED_GRACE_SECONDS = 60.0
@@ -49,9 +49,20 @@ def stopped_without_report(
     pane: PaneState | None,
     *,
     now: float,
+    grace: float = STOPPED_GRACE_SECONDS,
+    attempts: list[Attempt] | None = None,
+    since: float | None = None,
 ) -> float | None:
-    """对方在送达（或最近一次汇报）之后结束了一轮、现已空闲超过宽限期仍未交结果时，返回该轮结束时刻。"""
+    """对方在送达（或最近一次汇报）之后结束了一轮、现已空闲超过宽限期仍未交结果时，返回该轮结束时刻。
+
+    grace 缺省 60 秒（查询提示）；worker 催执行方传 300（DESIGN §104.9 一）。给了同任务的 attempts 时，
+    执行方提问还在等回答（§104.9 五）不算「停下未汇报」：它停下是在等发起方。
+    since：调用方另给的起点（worker 传沉默锚点，含已交出补充的投递时刻，§104.11 第 2 条），轮次须结束在它之后；
+    缺省 None 时行为不变（ab tasks/status 的提示与扩展 JS 同一判据）。
+    """
     if attempt is None or not _awaiting_report(attempt):
+        return None
+    if attempts is not None and ask_pending(attempt, attempts):
         return None
     if (
         attempt.target.provider is Provider.CODEX
@@ -66,9 +77,9 @@ def stopped_without_report(
     if endpoint.runtime is not Runtime.IDLE or pane.runtime is not Runtime.IDLE:
         return None
     ended = pane.last_turn_ended_at
-    marks = [value for value in (attempt.delivery_at, attempt.work_at) if value is not None]
+    marks = [value for value in (attempt.delivery_at, attempt.work_at, since) if value is not None]
     if ended is None or not marks or ended <= max(marks):
         return None
-    if now - ended < STOPPED_GRACE_SECONDS:
+    if now - ended < grace:
         return None
     return ended

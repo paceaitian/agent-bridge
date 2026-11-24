@@ -49,7 +49,7 @@ from agentstatus_bridge.transports.codex_queue import CodexQueueTransport, RunRe
 from agentstatus_bridge.transports.codex_rpc import RpcFallback
 from bridge_support import FakeProc, RecordingTransport, endpoint, ref, register_claude_session
 
-from test_bridge_federation_rules import DEV_A, DEV_B, T0, Device, pump
+from test_bridge_federation_rules import DEV_A, DEV_B, T0, Device, deliver, pump
 
 THREAD = "019a0000-1111-7222-8333-444455556666"
 ITEM = "019A9999-AAAA-7BBB-8CCC-DDDDEEEEFFFF"
@@ -836,6 +836,34 @@ class ControlTests(DeliveryTestCase):
         self.assertEqual(len(claude.calls), 1)
         self.assertEqual(db_state(self.a, reminder.msg_id)[0], "suppressed")
 
+    def test_outdated_silent_reminders_do_not_use_up_the_three_slots_across_devices(self) -> None:
+        # §104.12 第 4 条在联邦上同一口径：A 排出的沉默提醒在领取前因 B 的新进展作废（suppress_one，reminder_outdated），
+        # 投影带回作废原因，不占「每次尝试最多 3 条」；连作废 3 条后第 4 次到期仍能排出
+        task, first = self.create()
+        pump(self.a, self.b, now=self.clock.now)
+        deliver(self.b, first.msg_id, "queued", now=self.clock.now)
+        pump(self.b, self.a, now=self.clock.now)
+        claude = RecordingTransport(Provider.CLAUDE, DeliveryOutcome(Delivery.DELIVERED, "claude_delivered"))
+        dispatcher = self.dispatcher(self.a, self.a_paths, claude, [self.live(self.origin)], reply="uds:/x")
+        for n in range(4):
+            self.clock.now += 31 * 60 * 1000
+            self.assertEqual(dispatcher.queue_reminders(), 1, f"第 {n + 1} 次到期没有排出沉默提醒")
+            reminder = self.a.store.attempts(DEV_A, task.task_id)[-1]
+            self.assertEqual(reminder.options["noticeKind"], "reminder")
+            report = {"authorityDeviceId": DEV_A, "taskId": task.task_id, "attempt": 1, "reportNo": n + 1,
+                      "operationId": f"{n + 1:x}" * 32, "kind": "progress", "note": "", "refs": [],
+                      "reporter": authority.actor_for(self.worker, wire_token="codex@win").to_dict(),
+                      "reporterClass": "bypass", "source": "agent"}
+            authority.apply_report_safely(self.a.store, self.a.ident, report, reporter_device=DEV_B,
+                                          now=self.clock.now)
+            dispatcher.dispatch(reminder.msg_id, [self.live(self.origin)])
+            self.assertEqual(db_state(self.a, reminder.msg_id)[0], "suppressed")
+            refreshed = self.a.store.attempt_by_msg(reminder.msg_id)
+            assert refreshed is not None
+            view = model_attempt(refreshed)
+            self.assertEqual((view.delivery, view.delivery_reason), (Delivery.CANCELLED, "reminder_outdated"))
+        self.assertEqual(claude.calls, [])
+
     def test_disabled_authority_neither_queues_reminders_nor_stays_resident_for_them(self) -> None:
         # 领取另有 mirror.blocked 把关；这里锁住停用分支自己的两条合同：不排提醒、只为中断的 intent 驻留
         task, _ = self.create()
@@ -1222,3 +1250,257 @@ class RealLinuxCodexTests(DeliveryTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutoRetryFederationTests(DeliveryTestCase):
+    """B 侧发送前瞬时失败自动重试一次（DESIGN §103.1、§88.5 例外）：重排形状、不回传中间失败、到期驱动、只一次。"""
+
+    DEADLINE = DeliveryOutcome(Delivery.FAILED, "codex_deadline_before_send",
+                               detail={"preSendStage": "loaded", "preSendError": "_Timeout", "codexVersion": "0.171.0"})
+
+    def run_b(self, outcomes: list[DeliveryOutcome], calls: list[int] | None = None) -> tuple[FederationDispatcher,
+                                                                                             RecordingTransport]:
+        transport = RecordingTransport(Provider.CODEX, lambda _e, _t, _c: outcomes.pop(0))
+
+        def discover() -> list[Any]:
+            if calls is not None:
+                calls.append(1)
+            return [self.live(self.worker)]
+
+        return FederationDispatcher(self.b.store, self.b.ident, self.b_paths, discover=discover,
+                                    transports={Provider.CODEX: transport}, clock=self.clock, command="ab"), transport
+
+    def evidence_kinds(self) -> list[str]:
+        return [json.loads(item["envelope_json"])["kind"] for item in self.b.store.outbox()
+                if json.loads(item["envelope_json"])["targetDeviceId"] == DEV_A]
+
+    def test_requeue_shape_no_evidence_then_retry_once_with_same_message(self) -> None:
+        _task, first = self.create()
+        pump(self.a, self.b, now=self.clock.now)
+        outcomes = [self.DEADLINE, DeliveryOutcome(Delivery.QUEUED, "codex_queued", provider_ref="item-1")]
+        discoveries: list[int] = []
+        dispatcher, transport = self.run_b(outcomes, discoveries)
+        dispatcher.run_once()
+        native = self.b.store.native(first.msg_id)
+        assert native is not None
+        # 回到可领取的 prepared：intent 三列置空、inbox 仍 ready（回滚后旧版照常领取，不会每轮 skipped）
+        self.assertEqual((native["state"], native["intent_at"], native["worker_generation"], native["local_target_json"]),
+                         ("prepared", None, None, None))
+        self.assertEqual(json.loads(native["result_json"]),
+                         {"autoRetry": {"due": self.clock.now + 60_000, "first": "codex_deadline_before_send",
+                                        "detail": {"preSendStage": "loaded", "preSendError": "_Timeout"}}})
+        self.assertEqual(self.b.store.inbox_item(first.msg_id)["apply_state"], "ready")  # type: ignore[index]
+        self.assertEqual(db_state(self.b, first.msg_id), ("prepared", "pending"))
+        self.assertNotIn("delivery_status", self.evidence_kinds())  # 重试用尽前不回传 failed
+        pump(self.b, self.a, now=self.clock.now)
+        self.assertEqual(self.a.store.attempt_by_msg(first.msg_id).delivery["state"], "pending")  # type: ignore[union-attr]
+        self.assertTrue(dispatcher.has_live_work())
+
+        # 到期前：不外调、不做整体发现
+        before = len(discoveries)
+        self.clock.now += 59_000
+        dispatcher.run_once()
+        self.assertEqual((len(transport.calls), len(discoveries)), (1, before))
+        self.assertTrue(dispatcher.has_live_work())
+
+        self.clock.now += 1_000
+        dispatcher.run_once()
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(transport.calls[0][2].message_uuid, transport.calls[1][2].message_uuid)
+        native = self.b.store.native(first.msg_id)
+        assert native is not None
+        result = json.loads(native["result_json"])
+        self.assertEqual((native["state"], result["autoRetried"], result["firstReason"]),
+                         ("finished", True, "codex_deadline_before_send"))
+        self.assertEqual((result["firstPreSendStage"], result["firstPreSendError"]), ("loaded", "_Timeout"))
+        # 证据形状不变：没有 autoRetried/firstReason/preSend* 之类新键
+        sent = [json.loads(item["envelope_json"])["data"]["evidence"] for item in self.b.store.outbox()
+                if json.loads(item["envelope_json"])["kind"] == "delivery_status"]
+        self.assertEqual(len(sent), 1)
+        self.assertLessEqual(set(sent[0]), {"state", "reason", "at", "detail"})
+        pump(self.b, self.a, now=self.clock.now)
+        evidence = self.a.store.attempt_by_msg(first.msg_id).delivery  # type: ignore[union-attr]
+        self.assertEqual(evidence["state"], "queued")
+
+    def test_authority_refuses_a_note_while_the_remote_work_awaits_retry(self) -> None:
+        # §103.8 修 4 只改本机 Dispatcher 的前提：B 等自动重试时不回传证据，A 看到的工作尝试一直是 pending，
+        # add_note 的资格（已发出）不成立，A 建不出会抢在重试前面的 note。若以后放宽这条资格，B 侧也要加同样的等待
+        task, _first = self.create()
+        pump(self.a, self.b, now=self.clock.now)
+        dispatcher, _transport = self.run_b([self.DEADLINE])
+        dispatcher.run_once()
+        pump(self.b, self.a, now=self.clock.now)
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        with self.assertRaises(StoreError) as caught:
+            authority.add_note(self.a.store, self.a.ident, current, body="补一句",
+                               sender=authority.actor_for(self.origin, wire_token="claude@vm"),
+                               sender_class="bypass", now=self.clock.now)
+        self.assertEqual(caught.exception.code, "note_no_active_attempt")
+
+    def test_target_gone_at_the_retry_still_records_the_auto_retry(self) -> None:
+        # §103.8 修 7（B 侧）：到期重试时在 intent 之前就失败（目标已不在），本机 result_json 同样补 autoRetried/firstReason；
+        # 证据形状不变
+        _task, first = self.create()
+        pump(self.a, self.b, now=self.clock.now)
+        outcomes = [self.DEADLINE]
+        gone: list[bool] = []
+        transport = RecordingTransport(Provider.CODEX, lambda _e, _t, _c: outcomes.pop(0))
+        other = endpoint(ref(Provider.CODEX, "other-thread", pid=4321, pane="%9", label="other"))
+        dispatcher = FederationDispatcher(self.b.store, self.b.ident, self.b_paths,
+                                          discover=lambda: [other] if gone else [self.live(self.worker)],
+                                          transports={Provider.CODEX: transport}, clock=self.clock, command="ab")
+        dispatcher.run_once()
+        gone.append(True)
+        self.clock.now += 60_000
+        dispatcher.run_once()  # 目标不在：进 15 秒宽限
+        self.clock.now += 15_000
+        dispatcher.run_once()
+        native = self.b.store.native(first.msg_id)
+        assert native is not None
+        result = json.loads(native["result_json"])
+        self.assertEqual((native["state"], result.get("reason"), result.get("autoRetried"), result.get("firstReason")),
+                         ("finished", "target_gone", True, "codex_deadline_before_send"))
+        self.assertEqual((result.get("firstPreSendStage"), result.get("firstPreSendError")), ("loaded", "_Timeout"))
+        self.assertEqual(len(transport.calls), 1)
+        sent = [json.loads(item["envelope_json"])["data"]["evidence"] for item in self.b.store.outbox()
+                if json.loads(item["envelope_json"])["kind"] == "delivery_status"]
+        self.assertEqual(len(sent), 1)
+        self.assertLessEqual(set(sent[0]), {"state", "reason", "at", "detail"})
+
+    def test_second_failure_is_final_and_reported_once(self) -> None:
+        _task, first = self.create()
+        pump(self.a, self.b, now=self.clock.now)
+        dispatcher, transport = self.run_b([self.DEADLINE, self.DEADLINE])
+        dispatcher.run_once()
+        self.clock.now += 60_000
+        dispatcher.run_once()
+        self.clock.now += 600_000
+        dispatcher.run_once()
+        self.assertEqual(len(transport.calls), 2)
+        native = self.b.store.native(first.msg_id)
+        assert native is not None
+        result = json.loads(native["result_json"])
+        self.assertEqual((native["state"], result["delivery"], result["firstReason"]), ("finished", "failed",
+                                                                                         "codex_deadline_before_send"))
+        # 写前诊断只留在 B 本机 result_json
+        self.assertEqual((result["preSendStage"], result["preSendError"]), ("loaded", "_Timeout"))
+        self.assertEqual(self.evidence_kinds().count("delivery_status"), 1)
+        pump(self.b, self.a, now=self.clock.now)
+        evidence = self.a.store.attempt_by_msg(first.msg_id).delivery  # type: ignore[union-attr]
+        self.assertEqual((evidence["state"], evidence["reason"]), ("failed", "codex_deadline_before_send"))
+        self.assertNotIn("preSendStage", json.dumps(evidence))
+
+    def test_unknown_and_permanent_failures_are_reported_at_once(self) -> None:
+        for outcome in (DeliveryOutcome(Delivery.UNKNOWN, "codex_deadline_before_send"),
+                        DeliveryOutcome(Delivery.FAILED, "codex_preflight_failed")):
+            with self.subTest(reason=outcome.reason, delivery=outcome.delivery):
+                _task, first = self.create()
+                pump(self.a, self.b, now=self.clock.now)
+                dispatcher, transport = self.run_b([outcome])
+                dispatcher.run_once()
+                native = self.b.store.native(first.msg_id)
+                assert native is not None
+                self.assertIn(native["state"], ("finished", "unknown"))
+                self.assertNotIn("autoRetry", json.loads(native["result_json"]))
+                self.assertEqual(len(transport.calls), 1)
+
+    def test_cancel_during_the_wait_is_suppressed_without_delivery(self) -> None:
+        task, first = self.create()
+        pump(self.a, self.b, now=self.clock.now)
+        dispatcher, transport = self.run_b([self.DEADLINE])
+        dispatcher.run_once()
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        authority.request_cancel(self.a.store, self.a.ident, current, now=self.clock.now)
+        pump(self.a, self.b, now=self.clock.now)
+        self.clock.now += 60_000
+        dispatcher.run_once()
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(db_state(self.b, first.msg_id)[0], "suppressed")
+
+    def test_requeue_store_failure_keeps_the_decision_for_the_rewrite(self) -> None:
+        _task, first = self.create()
+        pump(self.a, self.b, now=self.clock.now)
+        dispatcher, transport = self.run_b([self.DEADLINE])
+        original = dispatcher._requeue_for_retry  # pyright: ignore[reportPrivateUsage]
+        failures = [StoreError("store_busy")]
+
+        def flaky(*args: Any) -> bool:
+            if failures:
+                raise failures.pop()
+            return original(*args)
+
+        dispatcher._requeue_for_retry = flaky  # type: ignore[method-assign]
+        dispatcher.run_once()
+        self.assertEqual(db_state(self.b, first.msg_id)[0], "intent")
+        dispatcher.run_once()  # 结果重写：仍按重试判定退回 prepared，不回传 failed
+        self.assertEqual(db_state(self.b, first.msg_id), ("prepared", "pending"))
+        self.assertNotIn("delivery_status", self.evidence_kinds())
+        self.assertEqual(len(transport.calls), 1)
+
+
+class UndeliveredFederationNoticeTests(DeliveryTestCase):
+    """A 上确定未送达立即告知（DESIGN §103.2）：B 回传 failed 后立即排；远端尝试不写「已自动重试」；只一次；note 支。"""
+
+    def test_remote_failure_is_notified_at_once_without_auto_retry_claim(self) -> None:
+        task, first = self.create()
+        pump(self.a, self.b, now=self.clock.now)
+        transport = RecordingTransport(Provider.CODEX, DeliveryOutcome(Delivery.FAILED, "codex_thread_not_found"))
+        self.dispatcher(self.b, self.b_paths, transport, [self.live(self.worker)]).run_once()
+        pump(self.b, self.a, now=self.clock.now)
+        claude = RecordingTransport(Provider.CLAUDE, DeliveryOutcome(Delivery.DELIVERED, "claude_delivered"))
+        a_dispatcher = self.dispatcher(self.a, self.a_paths, claude, [self.live(self.origin)], reply="uds:/x")
+        self.assertEqual(a_dispatcher.run_once()["reminders"], 1)
+        notice = self.a.store.attempts(DEV_A, task.task_id)[-1]
+        self.assertEqual(notice.options["noticeKind"], "reminder")
+        device = a_dispatcher._device_name(DEV_B)  # pyright: ignore[reportPrivateUsage]
+        first_line = notice.body.splitlines()[0]
+        self.assertTrue(first_line.startswith("投递未成功：#1 尝试 Codex 找不到这个会话"), first_line)
+        self.assertIn(f"（{device} 上的 codex@id:{self.worker.remote.native_id}", first_line)
+        self.assertIn("对方会话确定没有收到这条消息，可以安全重试。", notice.body)
+        self.assertNotIn("已自动重试", notice.body)  # A 拿不到远端是否重试过
+        events = [item for item in self.a.store.events(DEV_A, task.task_id) if item["kind"] == "origin_reminded"]
+        self.assertEqual([item["detail"] for item in events], [{"reason": "delivery_failed", "immediate": True}])
+        self.clock.now += 61 * 60 * 1000
+        self.assertEqual(a_dispatcher.run_once()["reminders"], 0)  # 只一次
+        self.assertEqual(first.seq, 1)
+
+    def test_immediate_notice_does_not_wait_for_a_fast_remote_clock(self) -> None:
+        # 证据的 at 是 B 的时钟：B 比 A 快 10 分钟时，A 也要立即告知，不能等到 A 的时钟追上（DESIGN §103.2）
+        task, _first = self.create()
+        pump(self.a, self.b, now=self.clock.now)
+        transport = RecordingTransport(Provider.CODEX, DeliveryOutcome(Delivery.FAILED, "codex_thread_not_found"))
+        FederationDispatcher(self.b.store, self.b.ident, self.b_paths, discover=lambda: [self.live(self.worker)],
+                             transports={Provider.CODEX: transport}, clock=lambda: self.clock.now + 600_000,
+                             command="ab").run_once()
+        pump(self.b, self.a, now=self.clock.now)
+        claude = RecordingTransport(Provider.CLAUDE, DeliveryOutcome(Delivery.DELIVERED, "claude_delivered"))
+        a_dispatcher = self.dispatcher(self.a, self.a_paths, claude, [self.live(self.origin)], reply="uds:/x")
+        self.assertEqual(a_dispatcher.run_once()["reminders"], 1)
+        self.assertTrue(self.a.store.attempts(DEV_A, task.task_id)[-1].body.startswith("投递未成功："))
+
+    def test_remote_failed_note_gets_its_own_notice_on_authority(self) -> None:
+        task, first = self.create()
+        pump(self.a, self.b, now=self.clock.now)
+        transport = RecordingTransport(Provider.CODEX)
+        b_dispatcher = self.dispatcher(self.b, self.b_paths, transport, [self.live(self.worker)])
+        b_dispatcher.run_once()  # 工作尝试已入队
+        pump(self.b, self.a, now=self.clock.now)
+        current = self.a.store.get_task(DEV_A, task.task_id)
+        assert current is not None
+        _task, note = authority.add_note(self.a.store, self.a.ident, current, body="补一句",
+                                         sender=authority.actor_for(self.origin, wire_token="claude@vm"),
+                                         sender_class="bypass", now=self.clock.now)
+        pump(self.a, self.b, now=self.clock.now)
+        transport_fail = RecordingTransport(Provider.CODEX, DeliveryOutcome(Delivery.FAILED, "codex_thread_not_found"))
+        self.dispatcher(self.b, self.b_paths, transport_fail, [self.live(self.worker)]).run_once()
+        pump(self.b, self.a, now=self.clock.now)
+        claude = RecordingTransport(Provider.CLAUDE, DeliveryOutcome(Delivery.DELIVERED, "claude_delivered"))
+        a_dispatcher = self.dispatcher(self.a, self.a_paths, claude, [self.live(self.origin)], reply="uds:/x")
+        self.assertEqual(a_dispatcher.run_once()["reminders"], 1)
+        notice = self.a.store.attempts(DEV_A, task.task_id)[-1]
+        self.assertTrue(notice.body.startswith(f"投递未成功：补充 #{note.seq} "), notice.body)
+        self.assertIn(":note_undelivered:", notice.options["reminderToken"])
+        self.assertEqual(a_dispatcher.run_once()["reminders"], 0)
+        self.assertEqual(first.seq, 1)

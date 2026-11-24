@@ -4,6 +4,8 @@
 CAS prepared→intent（同时复读 inbox、控制、工作序号、附件版本、catchup/sync/hub 冻结）并 FULL 提交 → 外调 →
 结果事务写 native 事实与证据（回传 A）。两平台相同：Linux 通道从不调用 before_send 也已持久 intent。
 intent 之后崩溃一律恢复为 UNKNOWN，绝不自动重投；CAS 失败零 native 字节。
+唯一例外（DESIGN §103.1、§88.5）：传输明确 FAILED 且原因在自动重试闭集内时，intent→prepared 一次（intent_at、
+worker_generation、local_target_json 置空，inbox 保持 ready，不回传证据），60 秒后同一消息 ID 再投；重试用尽前不回传 failed。
 """
 
 from __future__ import annotations
@@ -22,18 +24,35 @@ from .. import envelope
 from ..dispatch import TARGET_GONE_GRACE_SECONDS, message_uuid, native_priority, select_generation
 from ..endpoints import ADAPTERS, Endpoint
 from ..ids import short
-from ..model import REMINDER_OPTION, TERMINAL_WORK, WORK_STARTED, Attempt, Delivery, Provider, Work, note_may_steer
-from ..native_names import id_token, sender_display
+from ..model import (
+    AUTO_RETRY_DELAY_SECONDS,
+    AUTO_RETRY_OPTION,
+    AUTO_RETRY_REASONS,
+    REMINDER_OPTION,
+    TERMINAL_WORK,
+    WORK_STARTED,
+    Attempt,
+    Delivery,
+    Provider,
+    Work,
+    auto_retry_final_detail,
+    auto_retry_pending,
+    defer_pending,
+    note_may_steer,
+    pre_send_subset,
+)
+from ..native_names import id_token, remote_display, remote_path, sender_display
 from ..naming import command_name
 from ..platforms import process as procfs
 from ..platforms.factory import get_platform
 from ..platforms.transport_codec import Receipt, parse_receipt
-from ..reminders import attention_declined, reminder_body, reminder_sender_class, reminder_token
+from ..reminders import reminder_body, reminder_current, reminder_event_detail, reminder_sender_class
 from ..store import StoreError, WINDOWS_SENDING_RECOVERY_SECONDS
 from ..transports import DeliveryContext, DeliveryOutcome, Transport
 from . import attachments, authority, mirror
 from .directory import root_binding
 from .attachments import REFERENCE_NOTICE, AttachmentError
+from .codec import is_slug
 from .fedstore import FederatedStore, FedAttempt, FedTask, dump, load_dict
 from .relay import RelayPaths, local_blob
 from .views import model_attempt, model_attempts, model_task, remote_text, steer_detail
@@ -42,6 +61,20 @@ LogFn = Callable[[str, Mapping[str, object]], None]
 REMINDER_RETRY_MS = 60_000
 DISCOVERY_PARK_MS = 600_000  # 与本机 DISCOVERY_PARK_SECONDS 同口径：等目标超过 10 分钟就不再为它驻留
 _REASON_TEXT = {"single_file_limit": "单文件超过 8 MiB", "message_total_limit": "本条消息附件合计超过 32 MiB"}
+AUTO_RETRY_DELAY_MS = int(AUTO_RETRY_DELAY_SECONDS * 1000)
+# 只留在投递设备本机 result_json 的诊断键（Windows 写前阶段等，DESIGN §103.1）；证据照旧只带 steer 闭集
+
+
+def deferred(attempt: FedAttempt, now: int) -> bool:
+    """这条作业是否还没到延迟投递时刻（毫秒；§104.9 二）：A 本机目标在这里扣住，远端目标由 outbox next_try_at 扣住。"""
+    return defer_pending(attempt.options, now / 1000.0)
+
+
+def _retry_waiting(native: Mapping[str, Any] | None, now: int) -> bool:
+    """这条 prepared 作业是否还在等自动重试的到期时刻（毫秒；与本机同一上界：回拨超过一个 D 按已到期）。"""
+    if native is None or native["state"] != "prepared":
+        return False
+    return auto_retry_pending(load_dict(native["result_json"]), now, delay=AUTO_RETRY_DELAY_MS)
 # Claude 接收端回执可推进的来源状态，与本机 _RECEIPT_SOURCES 同口径
 _RECEIPT_SOURCES: dict[str, tuple[str, ...]] = {
     "delivered": ("written", "held", "unknown"),
@@ -138,6 +171,12 @@ class FederationDispatcher:
                 if self._blocked(task, attempt):
                     counts["waiting"] += 1  # 冻结/暂停/需同步：不发现、不计停泊，解除后由 relay 重新唤醒
                     continue
+                if _retry_waiting(row, now):
+                    counts["waiting"] += 1  # 等自动重试到期（§103.1）：不发现；has_live_work 按未停泊驻留
+                    continue
+                if deferred(attempt, now):
+                    counts["waiting"] += 1  # 延迟投递未到期（§104.9 二）：不发现、不驻留，到点由 relay 唤醒
+                    continue
                 if endpoints is None:
                     endpoints = self.discover()  # 只有真要领取时才做整体发现
             outcome = self.dispatch(msg_id, endpoints or [])
@@ -172,8 +211,8 @@ class FederationDispatcher:
                 continue
             if self._suppress_reason(task, attempt) is not None:
                 return True  # 下一轮就会收尾
-            if self._blocked(task, attempt):
-                continue
+            if self._blocked(task, attempt) or deferred(attempt, now):
+                continue  # 延迟投递未到期不驻留：relay 的唤醒候选到点才收它（mirror.wake_candidates）
             since = self._waiting_since.get(msg_id)
             if since is None or now - since < DISCOVERY_PARK_MS:
                 return True
@@ -253,9 +292,14 @@ class FederationDispatcher:
         now = self.clock()
         with self.store.transaction() as conn:
             target_state = "suppressed" if state == "cancelled" else "finished"
+            result: dict[str, Any] = {"reason": reason}
+            if state == "failed":
+                # 自动重试到期后在发送前就失败：本机 result_json 同样补 autoRetried/firstReason（§103.8 修 7）
+                native = self.store.native(attempt.msg_id)
+                result.update(auto_retry_final_detail(load_dict(native["result_json"]) if native is not None else {}))
             changed = conn.execute(
                 "UPDATE fed_native_sends SET state=?, result_json=? WHERE msg_id=? AND state='prepared'"
-                " AND intent_at IS NULL", (target_state, dump({"reason": reason}), attempt.msg_id)).rowcount
+                " AND intent_at IS NULL", (target_state, dump(result), attempt.msg_id)).rowcount
             if changed != 1:
                 return "skipped"
             mirror.record_evidence(self.store, self.ident, task, attempt, {"state": state, "reason": reason, "at": now},
@@ -278,6 +322,8 @@ class FederationDispatcher:
             # 所补的那次尝试已终态汇报（本设备交过的或 A 已采纳的）：不再发出这条补充（G4 审计 r1 P3-4/F-3）
             return self._finish_pre_intent(attempt, task, "note_outdated", state="cancelled")
         if self._blocked(task, attempt):
+            return "waiting"
+        if _retry_waiting(self.store.native(msg_id), self.clock()):
             return "waiting"
         local = attempt.target.local
         if local is None:
@@ -349,8 +395,11 @@ class FederationDispatcher:
         lines: list[str] = []
         versions: dict[int, str] = {}
         for row in rows:
-            name = str(row["original_name"])
-            source = f"{self._device_name(str(row['origin_device']))}:{row['original_path']}"
+            # 附件名与来源路径来自发起方（codec 只拒 0x20 以下控制字符）：名字照常转义截断，路径只转义不截断；
+            # 来源设备名与页脚同一判据，不是 slug 时写完整 deviceId（§103.3）
+            name = remote_display(str(row["original_name"])) or ""
+            origin = str(row["origin_device"])
+            source = f"{self._device_reference(origin)}:{remote_path(str(row['original_path'])) or ''}"
             if row["transfer"] == "reference":
                 reason = _REASON_TEXT.get(str(row["reason"]), str(row["reason"]))
                 lines.append(f"- {name}：{REFERENCE_NOTICE}（{reason}；来源 {source}，{row['size']} B）")
@@ -370,7 +419,9 @@ class FederationDispatcher:
             if not intact or any(current.get(key) != recorded.get(key) for key in ("dev", "ino", "size")):
                 raise AttachmentError("attachment_unavailable")  # DB ready 但文件丢失/被改：不投
             versions[int(row["ref_index"])] = str(row["file_identity_json"])
-            lines.append(f"- {name}：{path}（{row['size']} B，sha256 {str(row['sha256'])[:12]}；来源 {source}）")
+            # 交付路径：新落地的叶名已清洗、输出不变；按旧规则落地的叶名再转义一次，伪造不出新行（§103.8 修 2）
+            lines.append(f"- {name}：{remote_path(str(path)) or ''}（{row['size']} B，sha256 {str(row['sha256'])[:12]}；"
+                         f"来源 {source}）")
         return lines, versions
 
     def _land_staged(self, task: FedTask, attempt: FedAttempt, row: dict[str, Any]) -> dict[str, Any]:
@@ -412,6 +463,12 @@ class FederationDispatcher:
                 return str(row["name"])
         return device_id  # 进消息头 device= 与页脚 --origin-device：用完整 deviceId，8 位前缀解析不了
 
+    def _device_reference(self, device_id: str) -> str:
+        """投给 agent 的正文里可照抄的设备引用（页脚 --origin-device、附件来源）：登记名是 slug 才用，否则完整 deviceId，
+        与 status 页脚、peers 的 target= 同一判据（§101.1、§103.3）；消息头 device= 不经这里。"""
+        name = self._device_name(device_id)
+        return name if is_slug(name) else device_id
+
     def _render(self, task: FedTask, attempt: FedAttempt, lines: list[str] | None,
                 provider: Provider) -> tuple[str, DeliveryContext]:
         view_task = model_task(task)
@@ -423,7 +480,7 @@ class FederationDispatcher:
         token = id_token(sender.provider, sender.native_id) if sender is not None else "user"
         text = envelope.render(view_task, view_attempt, sender=token,
                                device=sender_device, command=self.command,
-                               origin_device=self._device_name(task.authority_device), attachment_lines=lines)
+                               origin_device=self._device_reference(task.authority_device), attachment_lines=lines)
         if sender is not None:
             name = sender_display(token, sender_device)
         elif REMINDER_OPTION in attempt.options:
@@ -538,18 +595,61 @@ class FederationDispatcher:
 
     # ---- 结果 ----
 
+    def _requeue_for_retry(self, attempt: FedAttempt, outcome: DeliveryOutcome, now: int) -> bool:
+        """发送前瞬时失败（§103.1）：intent→prepared 一次，返回是否已重排；已重试过或已不是 intent 时 False。
+
+        不回传证据、inbox 不置 applied、本机镜像的投递回到 pending；intent_at/worker_generation/local_target_json
+        一并置空——留下「prepared 但 intent_at 非空」的行会让回滚后的旧版每轮 skipped、永不回传。
+        """
+        with self.store.transaction() as conn:
+            native = self.store.native(attempt.msg_id)
+            if native is None or native["state"] != "intent" or AUTO_RETRY_OPTION in load_dict(native["result_json"]):
+                return False
+            state: dict[str, Any] = {"due": now + AUTO_RETRY_DELAY_MS, "first": outcome.reason}
+            saved = pre_send_subset(outcome.detail)
+            if saved:
+                state["detail"] = saved  # 首次卡在哪一步：重试成功时最终 result_json 只能从这里带出
+            marker = {AUTO_RETRY_OPTION: state}
+            changed = conn.execute(
+                "UPDATE fed_native_sends SET state='prepared', intent_at=NULL, worker_generation=NULL,"
+                " local_target_json=NULL, result_json=? WHERE msg_id=? AND state='intent'",
+                (dump(marker), attempt.msg_id)).rowcount
+            if changed != 1:
+                return False
+            current = self.store.attempt_by_msg(attempt.msg_id)
+            if current is not None:
+                kept = {key: value for key, value in current.delivery.items() if key not in ("state", "at", "reason")}
+                self.store.update_attempt_columns(attempt.msg_id, delivery={**kept, "state": "pending"})
+        return True
+
     def _record_outcome(self, attempt: FedAttempt, live: Endpoint, outcome: DeliveryOutcome) -> None:
         now = self.clock()
+        if outcome.delivery is Delivery.FAILED and outcome.reason in AUTO_RETRY_REASONS:
+            try:
+                requeued = self._requeue_for_retry(attempt, outcome, now)
+            except StoreError as error:
+                self._unrecorded[attempt.msg_id] = (attempt, live, outcome)
+                self.log("federation_record_deferred", {"task": short(attempt.task_id), "code": error.code})
+                return
+            if requeued:
+                self.log("federation_retry_scheduled", {"task": short(attempt.task_id), "attempt": attempt.seq,
+                                                        "reason": outcome.reason, **pre_send_subset(outcome.detail)})
+                return
         evidence: dict[str, Any] = {"state": outcome.delivery.value, "reason": outcome.reason, "at": now}
         detail = steer_detail(outcome.detail)
         if detail:
             # 只带闭集细节（steer 通道与拒绝码），随证据回传权威端；版本、进程等明细不出本机（§97.3）
             evidence["detail"] = detail
-        result = {"delivery": outcome.delivery.value, "reason": outcome.reason, "providerRef": outcome.provider_ref,
-                  "deliveredPane": live.ref.pane, "deliveredPid": live.ref.pid}
+        result: dict[str, Any] = {"delivery": outcome.delivery.value, "reason": outcome.reason,
+                                  "providerRef": outcome.provider_ref, "deliveredPane": live.ref.pane,
+                                  "deliveredPid": live.ref.pid}
+        result.update(pre_send_subset(outcome.detail))
         final = "unknown" if outcome.delivery is Delivery.UNKNOWN else "finished"
         try:
             with self.store.transaction() as conn:
+                native = self.store.native(attempt.msg_id)
+                # 只记在本机 result_json：A 拿不到「是否自动重试过」与首次诊断（证据不加新键，§103.1）
+                result.update(auto_retry_final_detail(load_dict(native["result_json"]) if native is not None else {}))
                 conn.execute("UPDATE fed_native_sends SET state=?, result_json=? WHERE msg_id=? AND state='intent'",
                              (final, dump(result), attempt.msg_id))
                 current, task = self._load(attempt.msg_id)
@@ -603,9 +703,7 @@ class FederationDispatcher:
         """
         view = model_task(task)
         attempts = model_attempts(self.store.attempts(task.authority_device, task.task_id))
-        current = reminder_token(view, attempts)
-        return (current is not None and current[0] == attempt.options.get(REMINDER_OPTION)
-                and not attention_declined(view, attempts, current[1]))
+        return reminder_current(view, attempts, attempt.options.get(REMINDER_OPTION))
 
     def queue_reminders(self) -> int:
         """只在权威设备 A 上算提醒（B 不催）；到期仍未处理的发起方各排一条（§88.4）。"""
@@ -621,18 +719,23 @@ class FederationDispatcher:
                 continue
             attempts = self.store.attempts(task.authority_device, task.task_id)
             view_task, view_attempts = model_task(task), model_attempts(attempts)
-            current = reminder.view.current
+            current = reminder.note if reminder.note is not None else reminder.view.current
             stuck = next((item for item in attempts if current is not None and item.seq == current.seq), None)
             receiver = (remote_text(stuck.target, self._device_name(stuck.target_device))
                         if stuck is not None and stuck.target_device != self.ident.device_id else None)
+            # 沉默提醒的「对方」状态（§104.9 一）：远端执行方一律「跨设备未知」，A 本机执行方不另做发现，写「未知」
+            silent = reminder if reminder.kind == "silent" else None
+            state = "跨设备未知" if receiver is not None else "未知"
             try:
                 _, notice = authority.add_attempt(
                     self.store, self.ident, task, role="notice", target=origin,
                     body=reminder_body(view_task, view_attempts, reminder.view, command=self.command,
-                                       receiver=receiver), refs=[],
+                                       receiver=receiver, immediate=reminder.immediate, note=reminder.note,
+                                       silent=silent, state=state, now=now / 1000.0,
+                                       ref=authority.command_ref(self.ident, task.task_id)), refs=[],
                     sender=None, sender_class=reminder_sender_class(view_attempts) or "unknown",
                     options={"noticeKind": "reminder", REMINDER_OPTION: reminder.token}, now=now,
-                    event="origin_reminded")
+                    event="origin_reminded", event_detail=reminder_event_detail(reminder, now / 1000.0))
             except StoreError as error:
                 self._reminder_retry[reminder.token] = now + REMINDER_RETRY_MS
                 self.log("federation_reminder_failed", {"task": short(task.task_id), "code": error.code})

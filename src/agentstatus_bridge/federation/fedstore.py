@@ -793,12 +793,14 @@ class FederatedStore:
             )
 
     def add_outbox(self, *, msg_id: str, operation_id: str, target_device: str, envelope: Mapping[str, Any],
-                   payload_hash: str, expires_at: int, now: int) -> None:
+                   payload_hash: str, expires_at: int, now: int, not_before: int | None = None) -> None:
+        """排一条待提交的信封；not_before（毫秒，§104.9 二的延迟投递）给出时 relay 到这个时刻才提交。"""
         with self._transaction() as conn:
             conn.execute(
                 "INSERT INTO fed_outbox(msg_id,operation_id,target_device,envelope_json,payload_hash,state,expires_at,"
                 "next_try_at) VALUES (?,?,?,?,?,'ready',?,?)",
-                (msg_id, operation_id, target_device, dump(dict(envelope)), payload_hash, expires_at, now),
+                (msg_id, operation_id, target_device, dump(dict(envelope)), payload_hash, expires_at,
+                 max(now, not_before) if not_before is not None else now),
             )
 
     def outbox(self, *, states: tuple[str, ...] = ("ready",), limit: int = 64) -> list[dict[str, Any]]:

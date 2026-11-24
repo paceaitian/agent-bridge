@@ -18,8 +18,8 @@ from . import authority, envelopes
 from .codec import CodecError, canonical_bytes, is_hex32, sha256_hex
 from .fedstore import FederatedStore, FedAttempt, FedTask, dump, load_dict
 from .refs import AttemptDefinition, Checkpoint, RemoteEndpointRef, TargetRef, WireActor
-from ..model import EndpointRef, Phase, TaskView, describe
-from ..reminders import PendingReminder, pending_reminder, reminder_candidate
+from ..model import EndpointRef, Phase, TaskView, defer_pending, describe
+from ..reminders import PendingReminder, pending_notices, reminder_candidate
 from .views import derive_work, initial_work, model_attempt, model_attempts, model_task
 
 FROM_AUTHORITY = frozenset({"handoff", "review", "notice", "task_state", "report_decision", "sync_state"})
@@ -172,8 +172,8 @@ def reminder_candidates(store: FederatedStore, now: int) -> Iterator[tuple[FedTa
         view = model_task(task)
         if not reminder_candidate(view) or task.origin() is None:
             continue
-        reminder = pending_reminder(view, model_attempts(store.attempts(task.authority_device, task.task_id)))
-        if reminder is not None:
+        # 主提醒与补充消息未送达的告知（§103.2）各算一条
+        for reminder in pending_notices(view, model_attempts(store.attempts(task.authority_device, task.task_id))):
             yield task, reminder, reminder.due(now_s)
 
 
@@ -190,7 +190,11 @@ def wake_candidates(store: FederatedStore, ident: authority.Identity, *, now: in
         task = store.get_task(attempt.authority_device, attempt.task_id) if attempt is not None else None
         if attempt is None or task is None:
             continue
-        if suppress_reason(task, attempt) is not None or not blocked(store, ident, task, attempt, now=now):
+        if suppress_reason(task, attempt) is not None:
+            found.add(msg_id)
+        elif not blocked(store, ident, task, attempt, now=now) and not defer_pending(attempt.options, now / 1000.0):
+            # 延迟投递未到期（§104.9 二）不算：提前唤醒会把它记进复查退避（12 分钟起翻倍），到点反而晚好几小时才发；
+            # 不在候选里时 relay 不记它，到点作为新候选立即唤醒
             found.add(msg_id)
     found |= {f"reminder:{reminder.token}" for _task, reminder, due in reminder_candidates(store, now) if due}
     return found
@@ -304,22 +308,26 @@ def reject_receiving(store: FederatedStore, msg_id: str, *, reason: str) -> bool
 
 
 def transport_failed(store: FederatedStore, ident: authority.Identity, outbox: dict[str, Any], *, state: str,
-                     reason: str | None, now: int) -> None:
+                     reason: str | None, now: int) -> bool:
     """本机发出的信封被 hub 拒收（refused，确定未 L1）或收件方 never-intent 拒绝（rejected）后的业务收尾。
 
     - 原生 attempt：这是「已证明未投」，派生 failed（不覆盖收件方已有证据或报告）；
     - 报告：写 rejected 决定以解除源端冻结，原报告事实保留；
     - 其余（控制/证据/决定/同步）只记事件，等下次状态同步。
+
+    返回是否给原生 attempt 派生了 failed：relay 据此立即叫醒 worker（立即告知发起方、刷新面板，DESIGN §103.2/§103.7）。
     """
     envelope = load_dict(outbox.get("envelope_json"))
     kind = envelope.get("kind")
     proven = state in ("refused", "rejected")  # expired/revoked 不证明对方未投，只记事件
+    derived = False
     with store.transaction():
         if proven and kind in ("handoff", "review", "notice"):
             attempt = store.attempt_by_msg(envelope.get("msg_id", ""))
             if attempt is not None and attempt.evidence_no == 0 and attempt.delivery.get("receiverReported") is not True:
                 delivery = dict(attempt.delivery, state="failed", reason=reason or state, at=now, transport=state)
                 store.update_attempt_columns(attempt.msg_id, delivery=delivery)
+                derived = True
         elif proven and kind == "report":
             store.add_decision(reporter_device=ident.device_id, report_operation_id=envelope["operationId"],
                                authority_revision=int(envelope.get("authorityRevision", 1)), decision="rejected",
@@ -327,6 +335,7 @@ def transport_failed(store: FederatedStore, ident: authority.Identity, outbox: d
         if is_hex32(envelope.get("authorityDeviceId")) and is_hex32(envelope.get("taskId")):
             store.add_event(envelope["authorityDeviceId"], envelope["taskId"], f"transport_{state}", now=now,
                             attempt_seq=envelope.get("attempt"), detail={"kind": kind, "reason": reason})
+    return derived
 
 
 def _from_authority(store: FederatedStore, ident: authority.Identity, envelope: dict[str, Any], *,
@@ -571,6 +580,8 @@ class LocalReport:
     reporter: WireActor
     reporter_class: str
     source: str  # agent / manual
+    # 提问（DESIGN §104.9 五）：kind=progress，随汇报帧作为可选键 ask 传给 A；旧 A 只记成 progress
+    ask: bool = False
 
 
 @dataclass(frozen=True)
@@ -657,6 +668,8 @@ def submit_report(store: FederatedStore, ident: authority.Identity, report: Loca
                                 "source": report.source, "observedRevision": current.revision}
         if report.commit is not None:
             body["commit"] = report.commit
+        if report.ask:
+            body["ask"] = True
         fact = {**body, "authorityDeviceId": current.authority_device, "taskId": current.task_id,
                 "attempt": attempt.seq, "operationId": operation_id, "reporter": report.reporter.to_dict(),
                 "reporterClass": report.reporter_class}

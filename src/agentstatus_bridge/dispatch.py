@@ -26,6 +26,9 @@ from .ids import short
 from .naming import command_name
 from .paths import device_name
 from .model import (
+    AUTO_RETRY_DELAY_SECONDS,
+    AUTO_RETRY_REASONS,
+    NUDGE_KIND,
     Attempt,
     Consumption,
     Delivery,
@@ -34,19 +37,30 @@ from .model import (
     UNRESOLVED_NATIVE_ID,
     Provider,
     Role,
+    Runtime,
     TERMINAL_WORK,
     Task,
+    auto_retry_final_detail,
+    auto_retry_pending,
+    defer_pending,
     note_may_steer,
+    pre_send_subset,
 )
+from .hints import stopped_without_report
+from .labels import RUNTIME_LABELS
+from .nudges import NUDGE_CHECK_SECONDS, NUDGE_GRACE_SECONDS, ProgressBasis, nudge_body, nudge_candidate, \
+    nudge_candidates, progress_basis, target_pane_state, worth_watching
+from .observer_dbus import ObserverView
 from .reminders import (
     REMINDER_OPTION,
     PendingReminder,
-    attention_declined,
-    pending_reminder,
+    nudge_token,
+    pending_notices,
     reminder_body,
     reminder_candidate,
+    reminder_current,
+    reminder_event_detail,
     reminder_sender_class,
-    reminder_token,
 )
 from .store import Store, StoreError
 from .transports import DeliveryContext, DeliveryOutcome, Transport
@@ -217,7 +231,7 @@ def _needs_worker(
         return True
     # 还没到提醒时刻也要驻留，到点由 run_once 排队（DESIGN §45.28.3）；先按任务字段预筛，再读尝试
     return reminders and any(
-        reminder_candidate(task) and pending_reminder(task, store.attempts(task.id)) is not None
+        reminder_candidate(task) and bool(pending_notices(task, store.attempts(task.id)))
         for task in store.list_tasks()
     )
 
@@ -284,6 +298,11 @@ class Dispatcher:
     _reminder_scan_errors: int = 0
     # (账本标识, 修订号) → 待提醒列表：判定不依赖时间，账本没变就不重读全部尝试（Opus 审计 F3）
     _reminder_cache: tuple[tuple[str, int], list[tuple[str, PendingReminder]]] | None = None
+    # 催执行方（DESIGN §104.9 一）的观察取样：只有 Linux worker 接入；None 时不催
+    observe: Callable[[], tuple[list[Endpoint], ObserverView]] | None = None
+    _nudge_next_check: float = 0.0
+    # 上一轮盯守时还有「读得到、正在忙、还没催过」的执行方：worker 为它驻留（上限见 nudges.MAX_NUDGE_WATCH_SECONDS）
+    _nudge_watching: bool = False
 
     def endpoints(self, *, fresh: bool = False) -> list[Endpoint]:
         now = self.clock()
@@ -309,11 +328,28 @@ class Dispatcher:
                 self.queue_reminders()
             except Exception as error:
                 self._reminder_scan_failed(error)
+        if self.observe is not None and self.clock() >= self._nudge_next_check:
+            try:
+                self.queue_nudges()
+            except Exception as error:  # 催促是附属功能：任何异常都不能拖住既有投递
+                self._nudge_watching = False
+                self.log("nudge_error", {"error": type(error).__name__, "code": getattr(error, "code", None)})
         pending = self.store.attempts_in((Delivery.PENDING,))
         pending_ids = {attempt.id for attempt in pending}
         for attempt_id in tuple(self._discovery_wait_since):
             if attempt_id not in pending_ids:
                 self._clear_discovery_wait(attempt_id)
+        # 等自动重试到期的尝试（DESIGN §103.1）：本轮不做发现、不交给 Windows 发现退避；到期时以新 ID 集合出现，退避随之复位
+        now = self.clock()
+        # 延迟投递未到期的（§104.9 二）同样不做发现、不计目标缺席，到期时以新 ID 集合出现
+        retrying = {attempt.id for attempt in pending
+                    if auto_retry_pending(attempt.options, now) or defer_pending(attempt.options, now)}
+        # 所补的工作尝试正在等自动重试的补充消息：dispatch 里也只会等待（§103.8 修 4），同样不做发现
+        waiting_work = {(attempt.task_id, attempt.seq) for attempt in pending if attempt.id in retrying}
+        held = {attempt.id for attempt in pending
+                if attempt.is_note and (attempt.task_id, attempt.note_for_seq) in waiting_work}
+        summary.waiting += len(retrying) + len(held)
+        pending = [attempt for attempt in pending if attempt.id not in retrying and attempt.id not in held]
         ready = self.pending_ready is None or self.pending_ready({a.id for a in pending})
         if pending and ready:
             try:
@@ -343,9 +379,8 @@ class Dispatcher:
             for task in self.store.list_tasks():
                 if not reminder_candidate(task):
                     continue
-                reminder = pending_reminder(task, self.store.attempts(task.id))
-                if reminder is not None:
-                    found.append((task.id, reminder))
+                # 主提醒与补充消息未送达的告知（§103.2）各自一条，同一令牌只发一次
+                found.extend((task.id, reminder) for reminder in pending_notices(task, self.store.attempts(task.id)))
             self._reminder_cache = (mark, found)
         return self._reminder_cache[1]
 
@@ -372,8 +407,11 @@ class Dispatcher:
         for task_id, reminder in self.pending_reminders():
             if not reminder.due(now) or reminder.token in self._reminder_retry_at:
                 continue
+            # 沉默提醒写「对方：空闲/忙/未发现/未知」：排队前（事务外）现取一次发现，只用于显示（§104.9 一）
+            state = self._target_state_label(reminder.view.current.target) \
+                if reminder.kind == "silent" and reminder.view.current is not None else "未知"
             try:
-                if self._queue_reminder(task_id, reminder.token, now):
+                if self._queue_reminder(task_id, reminder.token, now, state=state):
                     queued += 1
             except StoreError as error:
                 self._reminder_retry_at[reminder.token] = now + REMINDER_RETRY_SECONDS
@@ -382,7 +420,90 @@ class Dispatcher:
         self._reminder_scan_errors = 0
         return queued
 
-    def _queue_reminder(self, task_id: str, token: str, now: float) -> bool:
+    def queue_nudges(self) -> int:
+        """给停下却没汇报的本机执行方各排一条催促（§104.9 一），返回排队条数；有候选时才取发现与 observer。
+
+        读不到（端点不在、没有 pane、observer 行缺失或不新鲜）就跳过、不为它驻留；读得到但还没停满宽限（含仍在忙、
+        有后台任务）就记下「还在盯」，worker 据此驻留，30 秒后再看。
+        """
+        now = self.clock()
+        self._nudge_next_check = now + NUDGE_CHECK_SECONDS
+        candidates = nudge_candidates(self.store, now)
+        if not candidates or self.observe is None:
+            self._nudge_watching = False
+            return 0
+        endpoints, view = self.observe()
+        watching = False
+        queued = 0
+        for candidate in candidates:
+            live, _problem = select_generation(candidate.work.target, endpoints)
+            pane = target_pane_state(view, live) if live is not None and live.ref.pane else None
+            if live is None or pane is None or not pane.fresh:
+                continue
+            # since=锚点：回答提问或催问的补充交出之后，对方得再结束一轮才算「停下未汇报」（§104.11 第 2 条）
+            ended = stopped_without_report(candidate.work, live, pane, now=now, grace=NUDGE_GRACE_SECONDS,
+                                           attempts=candidate.attempts, since=candidate.anchor)
+            if ended is None:
+                # 只在执行方确实在忙（或刚停下、宽限未满）时驻留；空闲且交出后没开过新一轮的不为它驻留（§104.11 第 4 条）
+                watching = watching or worth_watching(candidate.work, live, pane, anchor=candidate.anchor, now=now,
+                                                      queue_window=CONSUMPTION_WATCH_SECONDS)
+                continue
+            try:
+                if self._queue_nudge(candidate.task.id, nudge_token(candidate.work), candidate.basis, now):
+                    queued += 1
+            except StoreError as error:
+                self.log("nudge_failed", {"task": short(candidate.task.id), "code": error.code})
+        self._nudge_watching = watching
+        return queued
+
+    def _queue_nudge(self, task_id: str, token: str, basis: ProgressBasis | None, now: float) -> bool:
+        # 事务内重新判定：检查与写入之间对方可能已经汇报、发起方可能已经 retry；取候选之后有新进展或新交出的补充
+        # （进展基准变了）就不催——这次观察到的停下早于新进展，不能作证（§104.12 第 6 条）。比基准（含 progress 事件
+        # 序号，§104.13 第 5 条）而不比时刻：同一时刻或时钟回拨的新进展不推后锚点，却照样是新进展。
+        # 领取时的复核仍按时刻（已知限制，见 docs/ab.md）
+        with self.store.transaction():
+            task = self.store.get_task(task_id)
+            if task is None:
+                return False
+            attempts = self.store.attempts(task_id)
+            candidate = nudge_candidate(task, attempts)
+            if (candidate is None or nudge_token(candidate.work) != token
+                    or progress_basis(self.store, attempts, candidate.work) != basis):
+                return False
+            work = candidate.work
+            notice = self.store.add_attempt(
+                task_id,
+                role=Role.NOTICE,
+                target=work.target,
+                body=nudge_body(task, work, command=self.command),
+                refs=[],
+                now=now,
+                # 由桥自己生成；声明与这次工作消息相同的权限类别，Claude 是否要批准与当初那条交接一致
+                sender=None,
+                sender_class=work.sender_class,
+                options={"noticeKind": NUDGE_KIND, REMINDER_OPTION: token},
+                event="nudge_created",
+            )
+        self.log("nudge_queued", {"task": short(task_id), "attempt": notice.seq, "forSeq": work.seq})
+        return True
+
+    def _target_state_label(self, target: EndpointRef) -> str:
+        """沉默提醒里对方此刻的状态（§104.9 一）：worker 是 runtime 的只读显示读方（§96.3 补记），不影响任何决定。
+
+        发现为空或出错写「未知」；发现到别的会话却找不到这个目标写「未发现」；代际歧义等问题也写「未知」。
+        """
+        try:
+            endpoints = self.endpoints(fresh=True)
+        except Exception:  # noqa: BLE001 - 显示用的现取发现失败不能拖住提醒
+            return "未知"
+        if not endpoints:
+            return "未知"
+        live, problem = select_generation(target, endpoints)
+        if live is None:
+            return "未发现" if problem is None else "未知"
+        return "未知" if live.runtime is Runtime.UNKNOWN else RUNTIME_LABELS[live.runtime]
+
+    def _queue_reminder(self, task_id: str, token: str, now: float, *, state: str = "未知") -> bool:
         # 事务内重新判定：检查与写入之间用户可能已经 accept/retry，令牌变了就不再提醒
         with self.store.transaction():
             task = self.store.get_task(task_id)
@@ -391,15 +512,17 @@ class Dispatcher:
             if not can_notify(task.origin):
                 return False
             attempts = self.store.attempts(task_id)
-            reminder = pending_reminder(task, attempts)
-            if reminder is None or reminder.token != token or not reminder.due(now):
+            reminder = next((item for item in pending_notices(task, attempts) if item.token == token), None)
+            if reminder is None or not reminder.due(now):
                 return False
             notice = self.store.add_attempt(
                 task_id,
                 role=Role.NOTICE,
                 target=task.origin,
                 body=reminder_body(task, attempts, reminder.view, command=self.command,
-                                   names=NameBook.of(self._endpoints)),
+                                   names=NameBook.of(self._endpoints), immediate=reminder.immediate,
+                                   note=reminder.note, silent=reminder if reminder.kind == "silent" else None,
+                                   state=state, now=now),
                 refs=[],
                 now=now,
                 # 提醒由桥自己生成，不冒充接收方；消息头照常显示 from=user
@@ -407,10 +530,9 @@ class Dispatcher:
                 sender_class=reminder_sender_class(attempts),
                 options={REMINDER_OPTION: token},
             )
-            self.store.add_event(
-                task_id, "origin_reminded", now=now, attempt_seq=notice.seq, detail={"reason": reminder.view.reason}
-            )
-        self.log("reminder_queued", {"task": short(task_id), "attempt": notice.seq, "reason": reminder.view.reason})
+            detail = reminder_event_detail(reminder, now)
+            self.store.add_event(task_id, "origin_reminded", now=now, attempt_seq=notice.seq, detail=detail)
+        self.log("reminder_queued", {"task": short(task_id), "attempt": notice.seq, **detail})
         return True
 
     def _claim(self, attempt: Attempt, *, now: float, pid: int, start_ticks: str, provider_ref: str | None) -> bool:
@@ -435,10 +557,8 @@ class Dispatcher:
         token = attempt.options.get(REMINDER_OPTION)
         if token is None:
             return False
-        attempts = self.store.attempts(task.id)
-        current = reminder_token(task, attempts)
-        # 令牌没变且本次关注没被拒绝才照发：拒绝晚于提醒排队到达时同样作废（Codex 复审 S01）
-        if current is not None and current[0] == token and not attention_declined(task, attempts, current[1]):
+        # 令牌没变且本次关注没被拒绝才照发：拒绝晚于提醒排队到达时同样作废（Codex 复审 S01）；note 支按 note 复核
+        if reminder_current(task, self.store.attempts(task.id), token):
             return False
         if self.store.transition_delivery(
             attempt.id, expected=(Delivery.PENDING,), new=Delivery.CANCELLED, reason="reminder_outdated", now=now
@@ -469,6 +589,17 @@ class Dispatcher:
             self.log("note_cancelled", {"task": short(attempt.task_id), "attempt": attempt.seq})
         return True
 
+    def _note_held(self, attempt: Attempt) -> bool:
+        """补充消息所补的工作尝试仍是 PENDING 或 SENDING（例如等发送前失败的自动重试）时先不发（§103.8 修 4）。
+
+        原生队列先进先出：补充先送到，对方会先读到「补充」、后读到它补的那条工作消息。只在这两种状态等——
+        工作尝试落定为任何状态（含 FAILED、UNKNOWN）都放行，补充不会因此永久等待。
+        """
+        if not attempt.is_note:
+            return False
+        work = self._note_work(attempt)
+        return work is not None and work.delivery in (Delivery.PENDING, Delivery.SENDING)
+
     @staticmethod
     def _may_steer(attempt: Attempt, note_work: Attempt | None) -> bool:
         """这条消息给不给 steer 信号：告知照给；补充消息要等所补的工作尝试离开队列或已确认（G4 审计 r1 P3-1）。"""
@@ -479,20 +610,13 @@ class Dispatcher:
     def _flush_unrecorded(self) -> None:
         for attempt_id, (outcome, detail) in list(self._unrecorded.items()):
             try:
-                self.store.finish_send(
-                    attempt_id,
-                    delivery=outcome.delivery,
-                    reason=outcome.reason,
-                    provider_ref=outcome.provider_ref,
-                    detail=detail,
-                    now=self.clock(),
-                    native_root=outcome.native_root,
-                )
+                requeued = self._settle(attempt_id, outcome, detail)
             except StoreError as error:
                 self.log("delivery_record_retry_failed", {"code": error.code})
                 continue
             del self._unrecorded[attempt_id]
-            self.log("delivery_record_completed", {"delivery": outcome.delivery.value, "reason": outcome.reason})
+            self.log("delivery_retry_scheduled" if requeued else "delivery_record_completed",
+                     {"delivery": outcome.delivery.value, "reason": outcome.reason})
             # 转入重放队列，由 _drain_replays 逐条应用；不在这里一次性取出后直接应用
             self._queue_replay(self._deferred_receipts.pop(attempt_id, []))
 
@@ -523,8 +647,11 @@ class Dispatcher:
 
     def _fail(self, attempt: Attempt, reason: str, now: float) -> str:
         self._clear_discovery_wait(attempt.id)
+        # 自动重试到期后在发送前就失败（例如目标已不在）：最终 detail 同样补 autoRetried/firstReason，
+        # 与立即告知正文「已自动重试 1 次」一致（不经 finish_send 的补记，§103.8 修 7）
         if self.store.transition_delivery(
-            attempt.id, expected=(Delivery.PENDING,), new=Delivery.FAILED, reason=reason, now=now
+            attempt.id, expected=(Delivery.PENDING,), new=Delivery.FAILED, reason=reason, now=now,
+            detail=auto_retry_final_detail(attempt.options),
         ):
             self.log("delivery_failed", {"task": short(attempt.task_id), "attempt": attempt.seq, "reason": reason})
         return "failed"
@@ -534,6 +661,12 @@ class Dispatcher:
         self._parked_pending.discard(attempt_id)
 
     def _pending_requires_worker(self, attempt: Attempt) -> bool:
+        if attempt.is_note:
+            work = self._note_work(attempt)
+            if work is not None and work.delivery is Delivery.PENDING:
+                # 等在工作消息后面的补充（§103.8 修 4）跟随工作尝试的驻留判断：工作尝试已停泊（§79）时，
+                # 补充不能凭自己没有发现等待记录把 worker 一直留住
+                return self._pending_requires_worker(work)
         first = self._discovery_wait_since.get(attempt.id)
         if first is None:
             return True  # 新 PENDING 或其他等待原因，不继承旧尝试的停泊。
@@ -556,11 +689,17 @@ class Dispatcher:
             self._clear_discovery_wait(attempt.id)
             return "skipped"
         now = self.clock()
+        if auto_retry_pending(attempt.options, now):
+            return "waiting"  # 发送前瞬时失败后等 D 秒再重试（§103.1）；不发现、不计目标缺席
+        if defer_pending(attempt.options, now):
+            return "waiting"  # 延迟投递未到期（§104.9 二）：到点前不外调
         if get_platform().name == 'windows' and attempt.target.provider not in (Provider.CODEX, Provider.CLAUDE):
             return self._fail(attempt, 'windows_provider_not_enabled', now)
         if self._reminder_outdated(task, attempt, now) or self._note_outdated(attempt, now):
             self._clear_discovery_wait(attempt.id)
             return "skipped"
+        if self._note_held(attempt):
+            return "waiting"  # 补充不抢在它所补的工作消息前面（§103.8 修 4）；不发现、不计目标缺席
         # ADAPTERS 覆盖全部 Provider（守卫见 test_bridge_endpoints），漏成员就该是 KeyError 而不是静默放行
         if not ADAPTERS[attempt.target.provider].inbox:
             # 有没有收件通道是注册表里的静态能力：发现不到、发现整体为空、对方离线都不会让它变得能收，
@@ -652,7 +791,8 @@ class Dispatcher:
         except Exception as error:
             # 尚未外调：可证明未发送，不能让记录停在发送中
             self.store.transition_delivery(
-                attempt.id, expected=(Delivery.SENDING,), new=Delivery.FAILED, reason="render_failed", now=self.clock()
+                attempt.id, expected=(Delivery.SENDING,), new=Delivery.FAILED, reason="render_failed", now=self.clock(),
+                detail=auto_retry_final_detail(attempt.options),
             )
             self.log("delivery_failed", {"task": short(attempt.task_id), "attempt": attempt.seq, "error": type(error).__name__})
             return "failed"
@@ -671,15 +811,7 @@ class Dispatcher:
             "deliveredServerPid": live.ref.server_pid,
         }
         try:
-            self.store.finish_send(
-                attempt.id,
-                delivery=outcome.delivery,
-                reason=outcome.reason,
-                provider_ref=outcome.provider_ref,
-                detail=detail,
-                now=self.clock(),
-                native_root=outcome.native_root,
-            )
+            requeued = self._settle(attempt.id, outcome, detail)
         except StoreError as error:
             self._unrecorded[attempt.id] = (outcome, detail)
             self.log(
@@ -687,6 +819,10 @@ class Dispatcher:
                 {"task": short(attempt.task_id), "attempt": attempt.seq, "code": error.code},
             )
             return "sent"
+        if requeued:
+            self.log("delivery_retry_scheduled", {"task": short(attempt.task_id), "attempt": attempt.seq,
+                                                  "reason": outcome.reason, **pre_send_subset(outcome.detail)})
+            return "waiting"
         self.log(
             "delivery_result",
             {
@@ -698,6 +834,27 @@ class Dispatcher:
             },
         )
         return "failed" if outcome.delivery is Delivery.FAILED else "sent"
+
+    def _settle(self, attempt_id: str, outcome: DeliveryOutcome, detail: dict[str, object]) -> bool:
+        """落下一次外调的结果；返回是否改为等待自动重试（DESIGN §103.1）。dispatch 与补记共用，补记不会绕过重试判定。
+
+        确定未被接收（FAILED）且原因在闭集内、还没自动重试过时：sending→pending，到期再发同一消息 ID；
+        否则照常 finish_send（重试过的，最终 detail 由 Store 补记 autoRetried/firstReason）。写库失败抛 StoreError。
+        """
+        if outcome.delivery is Delivery.FAILED and outcome.reason in AUTO_RETRY_REASONS:
+            if self.store.requeue_for_retry(attempt_id, due=self.clock() + AUTO_RETRY_DELAY_SECONDS,
+                                            first=outcome.reason, first_detail=outcome.detail):
+                return True
+        self.store.finish_send(
+            attempt_id,
+            delivery=outcome.delivery,
+            reason=outcome.reason,
+            provider_ref=outcome.provider_ref,
+            detail=detail,
+            now=self.clock(),
+            native_root=outcome.native_root,
+        )
+        return False
 
     def _windows_boundary(self, attempt: Attempt) -> None:
         with self.store.transaction():
@@ -890,7 +1047,7 @@ class Dispatcher:
     def has_live_work(self) -> bool:
         """worker 是否需要继续驻留。"""
         pending_local = self._unrecorded or self._replay_receipts or self._replay_replies
-        if pending_local or _needs_worker(
+        if pending_local or self._nudge_watching or _needs_worker(
             self.store, self.clock(), reminders=False, pending_required=self._pending_requires_worker,
         ):
             return True

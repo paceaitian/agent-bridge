@@ -261,7 +261,9 @@ class ReasonTextCommandTests(unittest.TestCase):
         # §93.1 的 mine_requires_session 提示改用当前入口名的不带 --mine 的 tasks。
         # §94.2 的 follows_not_found 注明联邦库读不了时只查了本机账本，提示用当前入口名查 federation status（§101.3 改主句，条数不变）。
         # §95.5 的 note_no_active_attempt（改用 retry/send）与 note_task_paused（先 resume）提示用当前入口名。
-        self.assertEqual(len(carriers), 20, carriers)
+        # §103.3 的 target_remote_invalid 提示用当前入口名的 peers --device 核对对方目录。
+        # §104.9 二的 remind_requires_session 用当前入口名写 remind 命令。
+        self.assertEqual(len(carriers), 22, carriers)
         for code in labels.REASON_TEXTS:
             with self.subTest(code=code):
                 self.assertNotIn(labels.PLACEHOLDER, labels.reason_text(code, command="testcmd"))

@@ -378,20 +378,28 @@ class BoundaryTests(FedCliCase):
         self.assertIn("federation_withdraw_unsupported", err)
         self.assertEqual(local_flow.call_count, 0)  # 写前退出：不进入本机撤回流程
 
-    def test_local_task_wins_the_namespace_and_origin_device_selects_federation(self) -> None:
+    def test_same_reference_in_both_stores_is_ambiguous_and_origin_device_selects_federation(self) -> None:
         fed_id = self.send()
         self.run_on("vm", "send", "--to", "codex@review", "-m", "本机任务", "--no-wait", caller=as_agent(ORIGIN))
         with cli.Store.open(self.states["vm"]) as local:
             [local_task] = local.list_tasks()
-        # 让联邦任务与本机任务同 ID：无参数时只能指向本机，联邦必须带 --origin-device（§88.7）
+        # 让联邦任务与本机任务同 ID：不带参数时两库都命中，报 task_ambiguous（§104.13 第 1 条，不再本机优先）；
+        # 联邦那项带 --origin-device 选；本机那项在完整 ID 也相同时选不了（已知限制）
         conn = sqlite3.connect(self.states["vm"] / FED_DB_NAME)
         with conn:
             for table in ("fed_tasks", "fed_attempts", "fed_routes", "fed_events"):
                 conn.execute(f"UPDATE {table} SET task_id=? WHERE task_id=?", (local_task.id, fed_id))
         conn.close()
-        code, out, err = self.run_on("vm", "status", local_task.id)
-        self.assertEqual(code, 0, err)
-        self.assertNotIn("跨设备任务", out)
+        for ref in (local_task.id, local_task.id[:8]):
+            with self.subTest(ref=ref):
+                code, out, err = self.run_on("vm", "status", ref)
+                self.assertEqual((code, out), (cli.EXIT_TARGET, ""))
+                self.assertIn("[task_ambiguous]", err)
+                self.assertIn(f"{local_task.id} --origin-device vm", err)  # 提示给出联邦那项可照抄的写法
+                # 完整 ID 也相同：写完整 ID 消不了歧义，提示写明本机那项目前选不了（§104.14 第 7 条）
+                self.assertIn("只能用 --origin-device 选跨设备那项", err)
+                self.assertIn("本机那项目前选不了", err)
+                self.assertNotIn("本机那项请写完整任务 ID", err)
         code, out, err = self.run_on("vm", "status", local_task.id, "--origin-device", "vm")
         self.assertEqual(code, 0, err)
         self.assertIn("跨设备任务", out)
@@ -409,7 +417,8 @@ class BoundaryTests(FedCliCase):
             code, out, err = self.run_on("vm", "status", local_task.id)
         self.assertEqual(code, 0, err)
         self.assertEqual((resolved.call_count, probe.call_count, opened.call_count), (0, 0, 0))
-        self.assertEqual(readonly.call_count, 1)
+        # 只读连接两次：§104.13 第 1 条查联邦有没有同引用的任务（跨库歧义），§93.3 查后续任务
+        self.assertEqual(readonly.call_count, 2)
 
         def steady(text: str) -> str:
             return re.sub(r"[0-9]+ 秒前", "N 秒前", text)  # 两次运行之间可能跨过一秒

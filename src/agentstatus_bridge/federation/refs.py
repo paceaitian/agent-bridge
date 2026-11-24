@@ -9,7 +9,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..model import EndpointRef, Provider
+from ..model import EndpointRef, NameSource, Provider
+from ..native_names import copyable
 from .codec import (
     MAX_CHECKPOINT_BYTES,
     MAX_TITLE_CHARS,
@@ -33,6 +34,16 @@ ROLES = frozenset({"handoff", "review", "notice"})
 # A 本机账本把这两种类别记在 localNoticeKind（fedstore.LOCAL_NOTICE_KIND），回滚后的旧 build_checkpoint 也读不到，
 # 写出的定义与新代码逐字相同；新读方仍认得它们，只作宽容读方（G4 审计 r1 P3-2）
 NOTICE_KINDS = frozenset({"result", "reminder", "closure", "note", "fyi"})
+
+
+def verified_label(name: object, verified: object) -> str | None:
+    """对端名字能否当作已核实的可复制主名（§103.3 第 3 条的共用判据）：namesVerified 明确为 true、是字符串、不超过
+    120 字符（§91 上限，诚实写方不发布更长的），且过 copyable（无会被消费者改动的字符、首尾无空白、不是 `id:` 开头
+    或 UUID 形状）。peers 文字行、resolve_remote（含 label）与 remote_text 共用：判不过的只作展示、不按名字选中。
+    新旧帧同一口径：诚实写方（native_names.project）只把 copyable 的名字标为已核实，现网不受影响。"""
+    if verified is not True or not isinstance(name, str) or len(name) > MAX_LABEL_CHARS:
+        return None
+    return name if copyable(NameSource("named", name)) else None
 
 
 def _native_id(value: object) -> str:

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from ..ids import new_id
+from ..native_names import altered_char
 from .codec import BLOB_CHUNK_BYTES, MAX_BLOB_BYTES, MAX_MESSAGE_BLOB_BYTES, MAX_REFS
 
 # 源端与接收端的闭集失败原因（§88.3）；too_many_files 沿用本机报告的 16 个文件上限与文案
@@ -84,9 +85,15 @@ def _reserved(name: str) -> bool:
 
 
 def sanitize_name(raw: str) -> str:
-    """交付文件显示名清洗（两平台共用）：basename、去控制符与 Windows 非法字符、去尾点/空格、保留名加 file-。"""
+    """交付文件显示名清洗（两平台共用）：basename、去控制符与 Windows 非法字符、去尾点/空格、保留名加 file-。
+
+    C0 与 DEL 照旧去掉；copyable 拒绝集合里的其余字符（C1 控制如 NEL/CSI、格式字符如 RLO/零宽、行/段分隔符、私用与
+    未分配码位）换成 `_`（§103.8 修 2）：落地文件名本身就不含会断行或倒排的字符，路径原样进 status 与 agent 正文也安全，
+    agent 照抄路径能打开。叶名带内容 SHA，改名只影响新落地的叶：同内容复用仍按 SHA/size 核对，已落地的旧叶不动。
+    """
     base = re.split(r"[\\/]", raw)[-1]
-    base = "".join(ch for ch in base if ord(ch) >= 32 and ord(ch) != 127 and ch not in _FORBIDDEN)
+    base = "".join("_" if altered_char(ch) else ch
+                   for ch in base if ord(ch) >= 32 and ord(ch) != 127 and ch not in _FORBIDDEN)
     for _ in range(3):  # 截短/加前缀后重做空名与保留名检查
         base = _truncate(base.rstrip(" ."))
         base = base.rstrip(" .")
@@ -116,6 +123,59 @@ def _named_path(raw: str, cwd: Path) -> str:
     if any(ord(ch) < 32 for ch in path) or len(path) > 4096:
         raise AttachmentError("attachment_unreadable")
     return path
+
+
+def named_paths(paths: Sequence[str], cwd: Path) -> list[str]:
+    """点名附件规范成绝对路径并折叠重复（与 freeze 同一规则）；retry 冻结前预判合并后的个数用（§104.4）。"""
+    named: list[str] = []
+    for raw in paths:
+        path = _named_path(raw, cwd)
+        if path not in named:
+            named.append(path)
+    return named
+
+
+def merge_refs(inherited: Sequence[dict[str, Any]], extra: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """retry --ref 的附件合并（§104.4）：新附件追加在继承的之后，按（来源路径, sha256）去重。
+
+    只有新增部分让合并结果超过 16 项才报 too_many_files（§104.11 第 5 条，与本机 reports.refs_over_limit 同一口径）。
+    """
+    merged = list(inherited)
+    seen = {(item.get("originalPath"), item.get("sha256")) for item in merged}
+    for item in extra:
+        key = (item.get("originalPath"), item.get("sha256"))
+        if key not in seen:
+            seen.add(key)
+            merged.append(item)
+    if len(merged) > MAX_REFS and len(merged) > len(inherited):
+        raise AttachmentError("too_many_files")
+    return merged
+
+
+def blob_bytes(refs: Sequence[dict[str, Any]]) -> int:
+    """已冻结 blob 的字节合计（仅引用不算）：retry --ref 冻结新附件前计入 32 MiB 预算（§104.11 第 5 条）。"""
+    return sum(int(item.get("size") or 0) for item in refs if item.get("transfer") == "blob")
+
+
+def drop_inherited(named: Sequence[str], inherited: Sequence[dict[str, Any]]) -> list[str]:
+    """retry --ref 冻结前去掉与继承 blob 完全相同的点名（同一来源路径、大小与 sha256，§104.11 第 5 条）。
+
+    它们合并时本来就会被去重，不该再占 32 MiB 预算；预算紧时还会被降成「仅引用」（sha256 为空，去不了重，同一个文件
+    会列两次）。只在路径与大小都相同时才读一遍算 sha256；读不了的保留，交给 freeze 报原来的错误。
+    """
+    blobs = {(item.get("originalPath"), item.get("size"), item.get("sha256"))
+             for item in inherited if item.get("transfer") == "blob"}
+    sized = {(path, size) for path, size, _ in blobs}
+    kept: list[str] = []
+    for path in named:
+        try:
+            size = os.stat(path).st_size
+            if (path, size) in sized and (path, size, file_digest(Path(path))[0]) in blobs:
+                continue
+        except (OSError, AttachmentError):
+            pass
+        kept.append(path)
+    return kept
 
 
 def _handle_path(fd: int, fallback: str) -> str:
@@ -192,20 +252,18 @@ def _freeze_blob(path: str, initial: os.stat_result, staging: Path) -> tuple[str
 
 
 def freeze(paths: Sequence[str], *, cwd: Path, origin_device: str, staging: Path,
-           available: int | None = None) -> list[Frozen]:
+           available: int | None = None, used: int = 0) -> list[Frozen]:
     """冻结点名附件：重复点名折叠；超过 16 项拒绝；单项 8 MiB、合计 32 MiB 按点名顺序贪心，超出的降级为仅引用。
 
     available 是设备内容预算的剩余字节（§88.11）：要冻结的副本合计超过它就在复制前拒绝 device_storage_full。
+    used 是同一条消息里已占用的 blob 字节（retry 继承的附件，§104.11 第 5 条）：只计入 32 MiB，不计入 available
+    （那些副本已经在 staging 里，不再复制）。
     """
-    named: list[str] = []
-    for raw in paths:
-        path = _named_path(raw, cwd)
-        if path not in named:
-            named.append(path)
+    named = named_paths(paths, cwd)
     if len(named) > MAX_REFS:
         raise AttachmentError("too_many_files")
     planned: list[tuple[str, os.stat_result, str | None]] = []
-    total = 0
+    total = used
     for path in named:
         try:
             info = os.stat(path)  # 跟随链接：源端允许 symlink/junction/OneDrive 占位
@@ -221,7 +279,7 @@ def freeze(paths: Sequence[str], *, cwd: Path, origin_device: str, staging: Path
         else:
             total += info.st_size
         planned.append((path, info, reason))
-    if available is not None and total > available:
+    if available is not None and total - used > available:
         raise AttachmentError("device_storage_full")  # 写前拒绝：一个副本都还没复制
     result: list[Frozen] = []
     for path, info, reason in planned:

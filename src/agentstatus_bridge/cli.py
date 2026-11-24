@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING, Any
 from . import __version__, claude_titles, summary
 from .platforms import process as procfs
 from .codex_metadata import command_scope
-from .native_names import NO_NAMES, NameBook, SelectorError, parse_selector, shown_name, workdir_suffix, workdir_text
+from .native_names import (NO_NAMES, NameBook, SelectorError, parse_selector, remote_display, shown_name, workdir_suffix,
+                           workdir_text)
 from .endpoints import (
     Caller,
     DiscoverySources,
@@ -30,7 +31,7 @@ from .endpoints import (
     permission_class,
     resolve_target,
 )
-from .hints import PaneState, stopped_without_report, target_session_missing
+from .hints import stopped_without_report, target_session_missing
 from .ids import short
 from .labels import (  # 标签表移至 labels 供摘要与 worker 共用；此处保留同名导出
     CONSUMPTION_LABELS,
@@ -41,18 +42,28 @@ from .labels import (  # 标签表移至 labels 供摘要与 worker 共用；此
     ROLE_LABELS,
     RUNTIME_LABELS,
     WORK_LABELS,
+    clock_text,
     next_step,
     reason_text,
+    shown_reason,
     role_label,
     review_capacity_hint,
     notification_capacity_hint,
 )
 from .model import (
+    DEFER_OPTION,
+    DEFINITELY_UNDELIVERED,
+    EXPECT_OPTION,
     FOR_SEQ_OPTION,
     HANDED_OVER,
+    MAX_DEFER_SECONDS,
+    MAX_EXPECT_SECONDS,
     MAY_HAVE_ARRIVED,
+    MIN_EXPECT_SECONDS,
     NOTE_KIND,
+    REMIND_OPTION,
     NOTICE_KIND_OPTION,
+    ORIGIN_WATCH_OPTION,
     PHASE_LABELS,
     PROVEN_UNDELIVERED,
     UNRESOLVED_NATIVE_ID,
@@ -69,16 +80,28 @@ from .model import (
     TaskView,
     Verdict,
     Work,
+    defer_time,
     describe,
     work_attempts,
 )
 from .naming import command_name
+from .nudges import target_pane_state
 from .observer_dbus import ObserverView
+from .todo import TodoItem, local_items as todo_items, report_item as todo_report_item, text_line as todo_line
 from .platforms.factory import get_platform, using_platform
 from .paths import codex_home, codex_sqlite_home, device_name, state_dir
-from .reports import ReportError, ReportInput, apply_report, file_reference
-from .store import ATTEMPT_WARNING_THRESHOLD, DB_NAME, MAX_BODY_BYTES, Store, StoreError
-from .task_filter import TASK_LIST_LIMIT, FilterError, SessionMatch, TaskFilter, accepts_local, parse_since
+from .reports import (MAX_NOTE_CHARS, ReportError, ReportInput, apply_report, checked_note, file_reference,
+                      refs_over_limit, retry_inherits_first, retry_is_rework)
+from .store import ATTEMPT_WARNING_THRESHOLD, DB_NAME, MAX_BODY_BYTES, MAX_FILES, Store, StoreError
+from .task_filter import (
+    TASK_LIST_LIMIT,
+    FilterError,
+    SessionMatch,
+    TaskFilter,
+    accepts_local,
+    parse_duration,
+    parse_since,
+)
 from .closure import ACCEPTED, CLOSED, ClosureOutcome, delivered_endpoint, queue_closures
 from .dispatch import needs_worker, select_generation
 from .doctor import collect_checks, federation_text, print_checks, relay_diagnostics_text
@@ -104,7 +127,7 @@ from .federation.errors import FedCliError
 
 if TYPE_CHECKING:
     from .federation.commands import Runtime as FedRuntime
-    from .federation.fedstore import FederatedStore, FedTask
+    from .federation.fedstore import FedAttempt, FederatedStore, FedTask
 
 EXIT_OK = 0
 EXIT_TARGET = 2
@@ -246,25 +269,9 @@ def _target_hint(
     live, problem = select_generation(current.target, endpoints)
     if target_session_missing(current, live, problem, discovered=bool(endpoints)):
         return _TargetHint(missing=True)
-    pane = _target_state(view, live) if live is not None and live.ref.pane else None
-    return _TargetHint(stopped_at=stopped_without_report(current, live, pane, now=now))
-
-
-def _target_state(view: ObserverView, live: Endpoint) -> PaneState | None:
-    """停下提示只认目标自己的行（DESIGN §62 ⑤，候选 C）。
-
-    按活端点算出的 observer 键取行，与摘要的 `endpoint_binding` 同一套键：Codex 按进程代际键；Claude 代际键优先，
-    没有代际行时兼容回退到同 pane 的同一逻辑会话行（与 `endpoints._claude_background_row` 同口径，回退不证明
-    pid/start 相同）。算不出键或键上没有行就不提示：同 pane 上被保持的旧代际、别的会话，它们的结束时刻都不能替目标作证。
-    """
-    for item in summary.endpoint_binding(live.ref)["observerKeys"]:
-        row = view.row(item["key"])
-        if row is None:
-            continue
-        if item["match"] == "session" and row.pane != live.ref.pane:
-            return None
-        return row.pane_state()
-    return None
+    # 只认目标自己的 observer 行（§62 ⑤ 候选 C）；与 worker 催执行方同一份实现（§104.11 P3 去重）
+    pane = target_pane_state(view, live) if live is not None and live.ref.pane else None
+    return _TargetHint(stopped_at=stopped_without_report(current, live, pane, now=now, attempts=attempts))
 
 
 def _observations() -> tuple[list[Endpoint], ObserverView]:
@@ -524,23 +531,128 @@ def _federation_needs_worker(now: float) -> bool:
         return False
 
 
-def _read_body(args: argparse.Namespace) -> str:
-    if args.file and args.message is not None:
-        raise CliError("message_and_file_conflict")
-    if args.file:
-        path = Path(args.file).expanduser()
+def _read_input(text: str | None, path: str | None, *, conflict: str, too_large: str,
+                implicit_stdin: bool) -> str | None:
+    """正文/说明的三种来源（DESIGN §104.4）：命令行文本、`-`（标准输入）、文件；都没给时返回 None。
+
+    implicit_stdin 只给必填正文（send/note）用：没给文本且 stdin 不是终端时照旧读 stdin。可选正文（retry 的
+    `-m/--file`、report 的 `--note/--note-file`）只在显式 `-` 时读，否则 agent shell 里的 `ab retry`、
+    `ab report --ack` 会被非终端 stdin 卡住（§104.9 四）。超长报 too_large，读前即判，不落账。
+    """
+    if path and text is not None:
+        raise CliError(conflict)
+    if path:
+        source = Path(path).expanduser()
         try:
-            data = path.read_bytes() if path.stat().st_size <= MAX_BODY_BYTES else None
+            data = source.read_bytes() if source.stat().st_size <= MAX_BODY_BYTES else None
         except OSError as error:
             raise CliError("file_unreadable") from error
         if data is None:
-            raise CliError("message_too_large")
-        return _strict_body(data)
-    if args.message == "-" or (args.message is None and not sys.stdin.isatty()):
-        return _strict_body(sys.stdin.buffer.read(MAX_BODY_BYTES + 1))
-    if args.message is None:
+            raise CliError(too_large)
+        return _strict_body(data, too_large=too_large)
+    if text == "-" or (implicit_stdin and text is None and not sys.stdin.isatty()):
+        return _strict_body(sys.stdin.buffer.read(MAX_BODY_BYTES + 1), too_large=too_large)
+    return text  # 编码不成 UTF-8 的命令行文本已在 _main 的统一参数检查里拒绝（§101.2）
+
+
+def _read_body(args: argparse.Namespace) -> str:
+    """必填正文（send、note，以及 ab remind）：`-m 文本`、`-m -`、`--file 路径`；都没给且 stdin 是终端时报 empty_message。"""
+    body = _read_input(args.message, getattr(args, "file", None), conflict="message_and_file_conflict",
+                       too_large="message_too_large", implicit_stdin=True)
+    if body is None:
         raise CliError("empty_message")
-    return args.message  # 编码不成 UTF-8 的 -m 文本已在 _main 的统一参数检查里拒绝（§101.2）
+    return body
+
+
+def _read_optional_body(args: argparse.Namespace) -> str | None:
+    """可选正文（retry 的补充或返工要求）：`-m 文本`、`-m -`、`--file 路径`，只在显式 `-` 时读标准输入；没给为 None。"""
+    return _read_input(args.message, getattr(args, "file", None), conflict="message_and_file_conflict",
+                       too_large="message_too_large", implicit_stdin=False)
+
+
+def _read_note(args: argparse.Namespace) -> str | None:
+    """report 的说明（§104.4）：`--note 文本`、`--note -`、`--note-file 路径`；没给为 None。
+
+    超过 MAX_NOTE_CHARS（strip 后按字符计）或文件超过 64 KiB 报 note_too_large，在任何写入之前（不再静默截断）。
+    """
+    note = _read_input(args.note, getattr(args, "note_file", None), conflict="note_and_file_conflict",
+                       too_large="note_too_large", implicit_stdin=False)
+    if note is not None:
+        try:
+            checked_note(note)
+        except ReportError as error:
+            raise CliError(error.code) from error
+    return note
+
+
+def _ref_key(raw: str, cwd: Path) -> str:
+    """点名路径的去重键：与 file_reference 存的路径同一解析（展开 ~、相对 cwd、跟随链接）；解析不了的用绝对路径，
+    留给 file_reference 报 file_unreadable。"""
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = cwd / candidate
+    try:
+        return str(candidate.resolve())
+    except (OSError, RuntimeError):
+        return os.path.abspath(candidate)
+
+
+def _named_refs(paths: list[str], cwd: Path) -> dict[str, str]:
+    """--ref 点名按解析后的路径去重（不读文件内容）：键与 file_reference 存的路径同一解析，值是原样点名，保持点名顺序。"""
+    unique: dict[str, str] = {}
+    for raw in paths:
+        unique.setdefault(_ref_key(raw, cwd), raw)
+    return unique
+
+
+def _local_refs(paths: list[str]) -> list[dict[str, object]]:
+    """note 的 --ref（§104.4）：先按解析后的路径去重再计数，超过上限在算 sha256 之前拒绝（note 对自己的附件单独限额）。"""
+    cwd = Path.cwd()
+    unique = _named_refs(paths, cwd)
+    if len(unique) > MAX_FILES:
+        raise CliError("too_many_files")
+    return _merge_refs([], [file_reference(raw, cwd=cwd) for raw in unique.values()])
+
+
+def _retry_base_refs(task: Task, work: list[Attempt]) -> list[dict[str, object]]:
+    """retry 新尝试继承的附件（§104.11 第 5 条，判据 retry_inherits_first 与跨设备共用）；work 是工作尝试，按序号。"""
+    if not work:
+        return []
+    first, current = work[0], work[-1]
+    return list(first.refs if retry_inherits_first(task, current) else current.refs)
+
+
+def _retry_fresh_refs(store: Store, args: argparse.Namespace, named: dict[str, str],
+                      cwd: Path) -> dict[str, dict[str, object]]:
+    """retry --ref 在事务外只为真正新增的路径算 sha256（§104.12 第 9 条）。
+
+    先只读看一眼将继承的附件：已在其中的点名不读文件；净增量让合并结果超过上限时，在读任何文件之前拒绝。
+    事务内按那时真正的继承集合再判一次（_retry_in_transaction）；这里没算到的新增路径（并发改变了继承集合）
+    在事务内补算。
+    """
+    if not named:
+        return {}
+    task = _task(store, args.task)
+    base = _retry_base_refs(task, work_attempts(store.attempts(task.id)))
+    known = {item.get("path") for item in base}
+    fresh = [key for key in named if key not in known]
+    if refs_over_limit(len(base), len(base) + len(fresh)):
+        raise CliError("too_many_files")
+    return {key: file_reference(named[key], cwd=cwd) for key in fresh}
+
+
+def _merge_refs(inherited: list[dict[str, object]], extra: list[dict[str, object]]) -> list[dict[str, object]]:
+    """把新附件追加在继承的附件之后，按路径去重；只有新增部分让合并结果超过 MAX_FILES 才报 too_many_files
+    （§104.11 第 5 条，与跨设备同一口径）。"""
+    merged = list(inherited)
+    seen = {item.get("path") for item in merged}
+    for item in extra:
+        if item.get("path") not in seen:
+            seen.add(item.get("path"))
+            merged.append(item)
+    if refs_over_limit(len(inherited), len(merged)):
+        raise CliError("too_many_files")
+    return merged
 
 
 def _utf8_encodable(text: str) -> bool:
@@ -555,12 +667,13 @@ def _unencodable_argument(args: argparse.Namespace) -> str | None:
     """命令行参数的统一 UTF-8 检查（§101.2）：解析后、任何读写之前，找出编码不成 UTF-8 的 str 参数（Linux argv 里的
     非法字节经 surrogateescape、Windows 命令行的孤立代理），否则它们会在写账本或输出时抛 UnicodeEncodeError。
     正文 -m 报 message_invalid_utf8，其余参数报 argument_invalid_utf8，退出码都是 3；没有返回 None。
-    例外：send/note 的 --file 只是正文来源路径，只交给文件系统打开、不保存不显示，非 UTF-8 文件名照常可用。
+    例外：send/note/retry 的 --file 与 report 的 --note-file 只是正文来源路径，只交给文件系统打开、不保存不显示，
+    非 UTF-8 文件名照常可用（report 的 --file 是要记录的结果附件，不在此列）。
     """
     values = vars(args)
     for key in ('message', *sorted(name for name in values if name != 'message')):
         value: object = values.get(key)
-        if key == 'file' and isinstance(value, str):
+        if key in ('file', 'note_file') and isinstance(value, str):
             continue
         items: list[object] = list(value) if isinstance(value, list) else [value]  # pyright: ignore[reportUnknownArgumentType]
         if any(isinstance(item, str) and not _utf8_encodable(item) for item in items):
@@ -568,11 +681,12 @@ def _unencodable_argument(args: argparse.Namespace) -> str | None:
     return None
 
 
-def _strict_body(data: bytes) -> str:
-    """正文按原始字节严格 UTF-8 解码，两平台同一判定（§77.14、§101.2）：超过 MAX_BODY_BYTES 报 message_too_large，
-    非法 UTF-8 报 message_invalid_utf8，都退出 3、都在落账前；不按本机编码猜、不替换字符，BOM 保留为 U+FEFF。"""
+def _strict_body(data: bytes, *, too_large: str = 'message_too_large') -> str:
+    """正文按原始字节严格 UTF-8 解码，两平台同一判定（§77.14、§101.2）：超过 MAX_BODY_BYTES 报 too_large（缺省
+    message_too_large，report 说明为 note_too_large），非法 UTF-8 报 message_invalid_utf8，都退出 3、都在落账前；
+    不按本机编码猜、不替换字符，BOM 保留为 U+FEFF。"""
     if len(data) > MAX_BODY_BYTES:
-        raise CliError('message_too_large')
+        raise CliError(too_large)
     try:
         return data.decode('utf-8', errors='strict')
     except UnicodeDecodeError as error:
@@ -590,6 +704,18 @@ def _wait_first_delivery(store: Store, task_id: str, timeout: float) -> Attempt 
         if time.monotonic() >= deadline:
             return current
         time.sleep(0.25)
+
+
+def _printed_delivery(document: dict[str, object], seq: int, fallback: Delivery) -> Delivery:
+    """`--json` 文档里第 seq 号尝试的投递状态（即实际打印给调用方的那个）；文档里找不到时用 fallback。"""
+    attempts = document.get("attempts")
+    for item in attempts if isinstance(attempts, list) else []:  # pyright: ignore[reportUnknownVariableType]
+        if isinstance(item, dict) and item.get("seq") == seq:  # pyright: ignore[reportUnknownMemberType]
+            try:
+                return Delivery(item.get("delivery"))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+            except ValueError:
+                return fallback
+    return fallback
 
 
 def _delivery_exit(delivery: Delivery) -> int:
@@ -610,11 +736,27 @@ def _reject_blank_selectors(args: argparse.Namespace, names: tuple[str, ...]) ->
             raise CliError("target_explicit_required", EXIT_TARGET)
 
 
+def _duration_arg(raw: str | None, code: str, *, minimum: float, maximum: float) -> float | None:
+    """--after/--expect/--in 的时长（§104.9 一、二）：没给为 None；格式或范围不对在任何写入之前报 code。"""
+    if raw is None:
+        return None
+    seconds = parse_duration(raw, minimum=minimum, maximum=maximum)
+    if seconds is None:
+        raise CliError(code)
+    return seconds
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     # --review-by/--device/--review-device 显式空值不静默忽略（Windows 的 --review-by 由命令作用域先拒、同码同退出码）
     _reject_blank_selectors(args, ("review_by", "device", "review_device"))
+    # 延迟投递与沉默阈值（§104.9 一、二）：时长先解析，格式错误不写任何东西
+    args.defer_seconds = _duration_arg(getattr(args, "after", None), "after_invalid", minimum=60.0,
+                                       maximum=MAX_DEFER_SECONDS)
+    args.expect_seconds = _duration_arg(getattr(args, "expect", None), "expect_invalid", minimum=MIN_EXPECT_SECONDS,
+                                        maximum=MAX_EXPECT_SECONDS)
     # 一句话告知只建立即关闭的单向消息：只对工作有意义的参数一律互斥，任何写入之前拒绝（§95.5.7）
-    if getattr(args, "fyi", False) and (args.review_by or args.review_device or args.no_notify):
+    if getattr(args, "fyi", False) and (args.review_by or args.review_device or args.no_notify
+                                        or args.expect_seconds is not None):
         raise CliError("fyi_conflict", EXIT_TARGET)
     # 关联只是元数据：写任何东西之前先解析，解析不了就不落账（§93.3）
     follows = _resolve_follows(args.follows) if args.follows is not None else None
@@ -691,6 +833,9 @@ def _local_send(args: argparse.Namespace, *, body: str | None = None, follows: s
     except ValueError as error:
         raise CliError(str(error)) from error
     now = time.time()
+    defer_until = _defer_until(args, now)
+    # 定时发出不等首投、不盖章（§104.9 二）：到点前命令早已返回，之后的确定未送达照常立即告知
+    wait = not args.no_wait and defer_until is None
     with _open_store() as store:
         try:
             task, attempt = store.create_task(
@@ -704,14 +849,18 @@ def _local_send(args: argparse.Namespace, *, body: str | None = None, follows: s
                 refs=refs,
                 now=now,
                 task_options={"notify": not args.no_notify, "allowShared": bool(args.allow_shared), **receipts,
-                              **({"follows": follows} if follows is not None else {})},
-                attempt_options={"allowShared": bool(args.allow_shared)},
+                              **({"follows": follows} if follows is not None else {}),
+                              **_expect_option(args)},
+                # 预先盖章（DESIGN §103.2）：命令会等首次投递结果；打印出确定未送达就留着（= 发起方已见）
+                attempt_options={"allowShared": bool(args.allow_shared),
+                                 **({ORIGIN_WATCH_OPTION: True} if wait else {}),
+                                 **({DEFER_OPTION: defer_until} if defer_until is not None else {})},
             )
         except StoreError as error:
             raise CliError(error.code, _exit_for_store_error(error.code)) from error
         started = _start_worker()
         current = attempt
-        if not args.no_wait:
+        if wait:
             current = _wait_first_delivery(store, task.id, SEND_WAIT_SECONDS) or attempt
         worker_up = (
             current.delivery is not Delivery.PENDING
@@ -720,10 +869,26 @@ def _local_send(args: argparse.Namespace, *, body: str | None = None, follows: s
         )
         hint = _hold_hint(target, origin_class)
         names = NameBook.of(endpoints)
+        document: dict[str, object] | None = None
+        printed = current.delivery
         if args.json:
+            # --json 的文档是此刻重读账本得到的：清不清章按文档里实际打印的状态，与文字模式一致（§103.8 修 5）
             document = _task_document(store, task, names=names)
             document["hint"] = hint
+            printed = _printed_delivery(document, attempt.seq, printed)
+        if wait and printed not in DEFINITELY_UNDELIVERED:
+            # 这次没打印确定未送达：清章，之后落定的失败由 worker 立即告知；清不掉只会退化成 30 分钟提醒
+            try:
+                store.clear_attempt_option(attempt.id, ORIGIN_WATCH_OPTION)
+            except StoreError:
+                pass
+        if document is not None:
             _print_json(document)
+        elif defer_until is not None:
+            cmd = command_name()
+            print(f"任务 {short(task.id)} 已排定，交给 {names.text(target.ref)}：定时 {clock_text(defer_until)} 发出"
+                  f"（到点由后台 worker 发送；不需要了可 {cmd} cancel {short(task.id)}）")
+            print(f"查看进展：{cmd} status {short(task.id)}；等待结果：{cmd} wait {short(task.id)}")
         else:
             print(f"任务 {short(task.id)} 已交给 {names.text(target.ref)}：{DELIVERY_LABELS[current.delivery]}")
             warning = _no_pane_warning([current])
@@ -751,6 +916,18 @@ def _local_send(args: argparse.Namespace, *, body: str | None = None, follows: s
         return _delivery_exit(current.delivery)
 
 
+def _defer_until(args: argparse.Namespace, now: float) -> float | None:
+    """`send --after` 的到期时刻（epoch 秒）；没给为 None。"""
+    seconds = getattr(args, "defer_seconds", None)
+    return None if seconds is None else now + seconds
+
+
+def _expect_option(args: argparse.Namespace) -> dict[str, object]:
+    """`send --expect` 写进任务 options 的沉默阈值（秒，§104.9 一）；没给不写，读方按缺省 30 分钟。"""
+    seconds = getattr(args, "expect_seconds", None)
+    return {} if seconds is None else {EXPECT_OPTION: seconds}
+
+
 def _local_fyi(args: argparse.Namespace, *, body: str, refs: list[dict[str, Any]], origin: EndpointRef | None,
                origin_class: str | None, target: Endpoint, title: str, follows: str | None,
                endpoints: list[Endpoint]) -> int:
@@ -760,12 +937,15 @@ def _local_fyi(args: argparse.Namespace, *, body: str, refs: list[dict[str, Any]
     """
     with _open_store() as store:
         try:
+            now = time.time()
+            defer_until = _defer_until(args, now)
             task, attempt = store.create_fyi(
                 title=title, origin=origin, origin_class=origin_class, target=target.ref, body=body, refs=refs,
-                now=time.time(),
+                now=now,
                 task_options={"allowShared": bool(args.allow_shared),
                               **({"follows": follows} if follows is not None else {})},
-                attempt_options={"allowShared": bool(args.allow_shared)},
+                attempt_options={"allowShared": bool(args.allow_shared),
+                                 **({DEFER_OPTION: defer_until} if defer_until is not None else {})},
             )
         except StoreError as error:
             raise CliError(error.code, _exit_for_store_error(error.code)) from error
@@ -776,7 +956,8 @@ def _local_fyi(args: argparse.Namespace, *, body: str, refs: list[dict[str, Any]
             document = _task_document(store, task, names=names)
         else:
             cmd = command_name()
-            print(f"告知 {short(task.id)} 已排队，发给 {names.text(attempt.target)}；对方只需读到，不汇报、不验收")
+            when = f"定时 {clock_text(attempt.defer_until)} 发出" if attempt.defer_until is not None else "已排队"
+            print(f"告知 {short(task.id)} {when}，发给 {names.text(attempt.target)}；对方只需读到，不汇报、不验收")
             print(f"查看投递：{cmd} status {short(task.id)}")
     unavailable = _queued_without_worker(started)
     if document is not None:
@@ -890,7 +1071,7 @@ def cmd_tasks(args: argparse.Namespace) -> int:
             flag = "，未发现对方会话" if hint.missing else "，对方已停下未汇报" if hint.stopped_at is not None else ""
             print(
                 f"{short(task.id)}  {PHASE_LABELS[view.phase]:<4} {target:<28}"
-                f" {task.title[:40]}  （{reason_text(view.reason)}{flag}{withdrawal_note}，{_age(task.updated_at, now)}）"
+                f" {task.title[:40]}  （{reason_text(shown_reason(view, now))}{flag}{withdrawal_note}，{_age(task.updated_at, now)}）"
             )
         for line in federation[1] if federation is not None else []:
             print(line)
@@ -971,7 +1152,8 @@ def _follow_links(task_id: str, follows: str | None, *, store: Store | None = No
                 if old is not None:
                     title = old.title
                 elif fed_store is not None and (hits := fed_store.find_tasks(follows)):
-                    title = hits[0].title
+                    # 联邦库里的旧任务可能是镜像（标题来自发起设备）：与其余远端字符串同一套转义（§103.3）
+                    title = remote_display(hits[0].title) or ""
             except Exception:  # noqa: BLE001 - 与打开同口径：查不到就当旧任务已不在
                 title = None
             note = "已不在账本" if title is None else title  # 旧任务已过保留期被删除时只剩 ID
@@ -1003,11 +1185,17 @@ _REPORT_KINDS: tuple[tuple[str, ReportKind], ...] = (
     ("failed", ReportKind.FAILED),
     ("approve", ReportKind.APPROVE),
     ("changes", ReportKind.CHANGES),
+    # 提问（DESIGN §104.9 五）：一次 progress 加可选标记 ask，不新增 ReportKind 枚举值
+    ("ask", ReportKind.PROGRESS),
 )
+# 提问回执在本机任务里总能叫醒发起方；跨设备时发起设备版本较旧会只记成进展（§104.9 五）
+ASK_OLD_AUTHORITY_HINT = "对方设备版本较旧时可能不会叫醒；急事改用 --blocked"
 
 
 def cmd_report(args: argparse.Namespace) -> int:
     kind = next(value for name, value in _REPORT_KINDS if getattr(args, name))
+    # 说明的三种来源统一读进 args.note（§104.4）：超长、冲突在找任务与任何写入之前拒绝，后面两条路径照旧只读 args.note
+    args.note = _read_note(args)
     found = _fed_lookup(args, write=True)
     if found is not None:
         return _fed_report(args, kind, *found)
@@ -1027,6 +1215,7 @@ def cmd_report(args: argparse.Namespace) -> int:
                     files=tuple(args.file),
                     commit=args.commit,
                     manual=args.manual,
+                    ask=bool(getattr(args, "ask", False)),
                 ),
                 caller=caller,
                 caller_class=permission_class(caller),
@@ -1055,7 +1244,8 @@ def cmd_report(args: argparse.Namespace) -> int:
             document['warnings'] = warnings
             _print_json(document)
             return exit_code
-        print(f"已记录：{EVENT_LABELS[kind.value]}（任务 {short(outcome.task.id)} #{outcome.attempt.seq}）")
+        label = "提问（任务仍在进行）" if getattr(args, "ask", False) else EVENT_LABELS[kind.value]
+        print(f"已记录：{label}（任务 {short(outcome.task.id)} #{outcome.attempt.seq}）")
         for followup in outcome.followups:
             label = "已排队发给复核方" if followup.role is Role.REVIEW else "已排队通知发起方"
             print(f"{label} {names.text(followup.target)}")
@@ -1085,6 +1275,8 @@ def _wait_outcome(view: TaskView, until: str) -> int | None:
                 "failure_reported",
                 "changes_requested",
                 "review_verdict_missing",
+                # 执行方提问（§104.9 五）：需要发起方回答，与受阻同一组返回 5
+                "question_asked",
             }:
                 reached = EXIT_FAILURE_REPORTED
             else:
@@ -1119,7 +1311,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 return reached
             if time.monotonic() >= deadline:
                 if not args.json:
-                    print(f"等待超时：{PHASE_LABELS[view.phase]}（{reason_text(view.reason)}）")
+                    print(f"等待超时：{PHASE_LABELS[view.phase]}（{reason_text(shown_reason(view))}）")
                 return EXIT_TIMEOUT
             time.sleep(1.0)
 
@@ -1393,52 +1585,119 @@ def cmd_withdraw(args: argparse.Namespace) -> int:
                 "unknown": EXIT_UNKNOWN}.get(current["state"], EXIT_UNAVAILABLE)
 
 
-def _rework_body(first: Attempt, current: Attempt, task: Task, extra: str | None,
+# 返工/重发正文的固定措辞（DESIGN §104.4、§104.9 四）
+REWORK_HEADER = "【返工】"
+RESEND_HEADER = "【重发】上一条消息可能已经送达；如果你已经在做，按这一条继续，不要重复执行。"
+# --force 的另两种首行（§104.11 一并修）：改派到另一个会话时对方没收到过上一条，「可能已送达、不要重复」不成立；
+# 复核已通过后再 --force 是请复核方重新复核（retry 会清掉原结论），不是重发
+REASSIGN_HEADER = "【改派】这项任务改由你接手，请按下面的内容处理。"
+REREVIEW_HEADER = "【重新复核】请重新复核下面的内容；之前的复核结论已作废。"
+_FORCE_HEADERS = (RESEND_HEADER, REASSIGN_HEADER, REREVIEW_HEADER)
+
+
+def _rework_body(first: Attempt, current: Attempt, task: Task, extra: str | None, reassigned: bool = False,
                  names: NameBook = NO_NAMES) -> str:
-    lines = ["【返工】"]
+    """返工或强制重发的新正文；本机 retry 与跨设备 retry_task 共用（后者经回调传入）。
+
+    reassigned：`--to` 改派到另一个会话，新执行方没有给过「上次的结论／说明」，改称「上一位执行方的…」。
+    交过结果后的返工把发起方的要求放在最前；--force 而对方还没交结果时不写「意见」，正文接最近一次实际发出的那条
+    （不是首条任务正文），首行三选一：改派到另一个会话写「改由你接手」（改派优先），复核已通过后写「请重新复核」，
+    其余写【重发】「可能已经送达」。
+    超过正文上限时截断末尾并标「…（已截断）」（长要求请改用 --ref，docs/ab.md 写明）。
+    """
+    result = current.result if isinstance(current.result, dict) else {}
+    note = result.get("note")
+    note = note if isinstance(note, str) and note else None
+    whose = "上一位执行方的" if reassigned else "你上次的"
+    files = [line for line in _describe_result(result or None) if not line.startswith("说明：")]
     if current.role is Role.REVIEW and task.verdict is Verdict.CHANGES:
-        lines.append(f"复核方 {names.local_wire(current.target)} 要求修改。")
+        # 「意见」是复核方的话，标签不变
+        lines = [REWORK_HEADER, f"复核方 {names.local_wire(current.target)} 要求修改。"]
+        if note:
+            lines.append(f"意见：{note}")
+        lines.extend(files)
+        if extra:
+            lines.append(f"补充：{extra}")
     elif current.work is Work.BLOCKED:
-        lines.append("上次处理受阻，情况已处理，请继续。")
+        lines = [REWORK_HEADER, "上次处理受阻，情况已处理，请继续。"]  # 措辞照旧（受阻时没有结果记录）
+        if note:
+            lines.append(f"意见：{note}")
+        lines.extend(files)
+        if extra:
+            lines.append(f"补充：{extra}")
     elif current.work is Work.FAILED:
-        lines.append("上次未能完成，请按下面的要求重新处理。")
+        lines = [REWORK_HEADER, "上次未能完成，请按下面的要求重新处理。"]
+        if note:
+            lines.append(f"{whose}说明：{note}")
+        lines.extend(files)
+        if extra:
+            lines.append(f"补充：{extra}")
+    elif current.work is Work.RESULT and current.role is Role.HANDOFF:
+        # 交过结果后：发起方的要求在最前，执行方自己的结论不再标成「意见」
+        if extra:
+            lines = [REWORK_HEADER, "发起方看过结果，请按下面的要求继续：", extra.rstrip()]
+        else:
+            lines = [REWORK_HEADER, "发起方看过结果，请继续处理。"]
+        if note:
+            lines.append(f"{whose}结论：{note}")
+        lines.extend(files)
     else:
-        lines.append("请按下面的意见继续修改。")
-    result = current.result or {}
-    note = result.get("note") if isinstance(result, dict) else None
-    if isinstance(note, str) and note:
-        lines.append(f"意见：{note}")
-    for line in _describe_result(result if isinstance(result, dict) else None):
-        if not line.startswith("说明："):
-            lines.append(line)
-    if extra:
-        lines.append(f"补充：{extra}")
+        # --force：对方还没交结果（或复核方已给过结论）。正文取最近一次实际发出的那条（§104.9 四补定）：上一轮的返工
+        # 要求不会丢，复核尝试收到的是复核请求本身；去掉其中已有的首行以免嵌套
+        if reassigned:
+            header = REASSIGN_HEADER
+        elif current.role is Role.REVIEW and task.verdict is Verdict.APPROVED:
+            header = REREVIEW_HEADER
+        else:
+            header = RESEND_HEADER
+        lines = [header]
+        if extra:
+            lines.append(f"补充：{extra}")
+        lines.extend(["", _without_resend_header(current.body).rstrip()])
+        return _bounded_body("\n".join(lines))
     lines.extend(["", "【原始任务要求】", first.body.rstrip()])
-    text = "\n".join(lines)
+    return _bounded_body("\n".join(lines))
+
+
+def _without_resend_header(body: str) -> str:
+    """去掉上一次 --force 加的首行（重发、改派、重新复核三种之一；连续 --force 只保留一个首行）；其余内容（含当时的
+    「补充：」）原样保留。"""
+    head, _, rest = body.partition("\n")
+    return rest.lstrip("\n") if head in _FORCE_HEADERS else body
+
+
+def _bounded_body(text: str) -> str:
+    """返工/重发正文的上限：超过 MAX_BODY_BYTES 截断末尾并标「…（已截断）」（长要求请改用 --ref）。"""
     encoded = text.encode("utf-8")
     if len(encoded) > MAX_BODY_BYTES:
-        text = encoded[: MAX_BODY_BYTES - 64].decode("utf-8", errors="ignore") + "\n…（已截断）"
+        return encoded[: MAX_BODY_BYTES - 64].decode("utf-8", errors="ignore") + "\n…（已截断）"
     return text
 
 
 def cmd_retry(args: argparse.Namespace) -> int:
     _reject_blank_selectors(args, ("to", "device"))  # retry --to "" 不再静默变成不改派（§101.2）
+    # 可选正文：-m 文本、-m -、--file 统一读进 args.message（§104.4）；没给时不碰 stdin，「-」不再被当成字面文本
+    args.message = _read_optional_body(args)
     found = _fed_lookup(args, write=True)
     if found is not None:
         return _fed_retry(args, *found)
     if args.device:
         raise CliError("target_is_local_device", EXIT_TARGET)
+    cwd = Path.cwd()
+    named = _named_refs(args.ref, cwd)  # 只解析、去重路径；读不读文件要看继承集合（§104.12 第 9 条）
     endpoints = discover()
     caller = identify_caller(endpoints)
     now = time.time()
     with _open_store() as store:
+        hashed = _retry_fresh_refs(store, args, named, cwd)  # 事务外只为新增路径算 sha256
         # 校验、作废过时回执、追加返工尝试必须在同一个事务里（Codex 复审 F01）。分成多次提交时，
         # 提交间隙里另一连接可能已经汇报出新一轮结果、或并发 close 排了结束回执，随后的全量扫描
         # 会把它们一起作废；追加成功而作废失败还会留下「返工已落账却返回错误」的半完成命令。
         # 端点发现在事务外做，事务内重做全部校验——世界变了就照常抛原来那些错误。
         try:
             with store.transaction():
-                attempt, undelivered, rework = _retry_in_transaction(store, args, endpoints, caller, now)
+                attempt, undelivered, rework = _retry_in_transaction(store, args, endpoints, caller, now,
+                                                                     named_refs=named, hashed_refs=hashed, cwd=cwd)
         except StoreError as error:
             raise CliError(error.code, _exit_for_store_error(error.code)) from error
         started = _start_worker()
@@ -1476,9 +1735,14 @@ def _retry_notes(seq: int, *, duplicate: bool) -> list[str]:
 
 
 def _retry_in_transaction(
-    store: Store, args: argparse.Namespace, endpoints: list[Endpoint], caller: Caller, now: float
+    store: Store, args: argparse.Namespace, endpoints: list[Endpoint], caller: Caller, now: float,
+    *, named_refs: dict[str, str] | None = None, hashed_refs: dict[str, dict[str, object]] | None = None,
+    cwd: Path | None = None,
 ) -> tuple[Attempt, bool, bool]:
-    """在调用方开启的事务内完成返工：重新校验 → 作废过时回执 → 追加新尝试 → 更新任务。"""
+    """在调用方开启的事务内完成返工：重新校验 → 作废过时回执 → 追加新尝试 → 更新任务。
+
+    named_refs 是去重后的 --ref 点名（解析后的路径 → 原样点名），hashed_refs 是事务外已为新增路径算好的引用。
+    """
     task = _task(store, args.task)
     if task.finished:
         raise CliError("task_finished")
@@ -1492,23 +1756,16 @@ def _retry_in_transaction(
     if current.delivery is Delivery.PENDING:
         raise CliError("still_pending")
     undelivered = current.delivery in PROVEN_UNDELIVERED
-    rework = current.work in (Work.BLOCKED, Work.FAILED) or (
-        current.role is Role.REVIEW and task.verdict is Verdict.CHANGES
-    ) or (current.work is Work.RESULT and current.role is Role.HANDOFF)
+    rework = retry_is_rework(task, current)
     if not (undelivered or rework or args.force):
         raise CliError("retry_requires_force")
     role = current.role
     target_ref = current.target
-    if undelivered and not rework:
-        body = current.body
-        if args.message:
-            body = f"{body}\n\n补充：{args.message}"
-    else:
-        if current.role is Role.REVIEW and task.verdict is Verdict.CHANGES:
-            role = Role.HANDOFF
-            implementer = next((item for item in reversed(attempts) if item.role is Role.HANDOFF), first)
-            target_ref = implementer.target
-        body = _rework_body(first, current, task, args.message, NameBook.of(endpoints))
+    resend = undelivered and not rework
+    if not resend and current.role is Role.REVIEW and task.verdict is Verdict.CHANGES:
+        role = Role.HANDOFF
+        implementer = next((item for item in reversed(attempts) if item.role is Role.HANDOFF), first)
+        target_ref = implementer.target
     allow_shared = bool(args.allow_shared or current.allow_shared)
     if args.to:
         target = _resolve(args.to, endpoints)
@@ -1523,6 +1780,25 @@ def _retry_in_transaction(
             target_ref = live.ref
         elif get_platform().name == 'windows':
             raise CliError('target_not_found', EXIT_TARGET)
+    if resend:
+        body = current.body
+        if args.message:
+            body = f"{body}\n\n补充：{args.message}"
+    else:
+        # 正文在目标解析之后生成：--to 改派到另一个会话时，结论／说明改称「上一位执行方的…」（§104.4）
+        body = _rework_body(first, current, task, args.message, reassigned=not target_ref.same_session(current.target),
+                            names=NameBook.of(endpoints))
+    # retry --ref 追加在继承的附件之后（§104.4）；继承哪一条见 retry_inherits_first（§104.11 第 5 条）。
+    # 按此刻真正的继承集合算净增量（§104.12 第 9 条）：已继承的点名不读文件，先判个数再补算事务外没算到的新增路径；
+    # 在作废旧回执之前判合并后的上限，超出时事务里还没有任何写入
+    base = _retry_base_refs(task, attempts)
+    known = {item.get("path") for item in base}
+    fresh = {key: raw for key, raw in (named_refs or {}).items() if key not in known}
+    if refs_over_limit(len(base), len(base) + len(fresh)):
+        raise CliError("too_many_files")
+    hashed = hashed_refs or {}
+    extra = [hashed[key] if key in hashed else file_reference(raw, cwd=cwd or Path.cwd()) for key, raw in fresh.items()]
+    refs = _merge_refs(base, extra)
     # 先作废再追加：全局尝试槽有上限，别让即将作废的回执占着位置（Codex 复审 F01）。
     # 返工意味着「这个结果不作数」，还没发出的通知随之作废；已经发出去的不追，那是对方已经看到的事实。
     # **不再额外排除结束回执**：结束回执只在 accept/close 的事务里与 accepted_at/closed_at 同写，
@@ -1541,7 +1817,7 @@ def _retry_in_transaction(
         role=role,
         target=target_ref,
         body=body,
-        refs=first.refs if role is Role.HANDOFF else current.refs,
+        refs=refs,
         now=now,
         sender=first.sender,
         sender_class=first.sender_class,
@@ -1570,6 +1846,7 @@ def cmd_note(args: argparse.Namespace) -> int:
     if found is not None:
         return _fed_note(args, *found)
     body = _read_body(args)
+    refs = _local_refs(args.ref)
     endpoints = discover()
     caller = identify_caller(endpoints)
     _check_sender(caller)
@@ -1577,7 +1854,7 @@ def cmd_note(args: argparse.Namespace) -> int:
     with _open_store() as store:
         try:
             with store.transaction():
-                note = _note_in_transaction(store, args, body, caller, now)
+                note = _note_in_transaction(store, args, body, caller, now, refs=refs)
         except StoreError as error:
             raise CliError(error.code, _exit_for_store_error(error.code)) from error
         started = _start_worker()
@@ -1603,7 +1880,8 @@ def cmd_note(args: argparse.Namespace) -> int:
     return EXIT_UNAVAILABLE if unavailable else EXIT_OK
 
 
-def _note_in_transaction(store: Store, args: argparse.Namespace, body: str, caller: Caller, now: float) -> Attempt:
+def _note_in_transaction(store: Store, args: argparse.Namespace, body: str, caller: Caller, now: float,
+                         *, refs: list[dict[str, object]] | None = None) -> Attempt:
     """在调用方开启的事务内：重新校验可补充的工作尝试并追加 note，校验与写入之间不留窗口（同 retry）。"""
     task = _task(store, args.task)
     if task.finished:
@@ -1620,13 +1898,173 @@ def _note_in_transaction(store: Store, args: argparse.Namespace, body: str, call
         # 投给对方实际收到工作尝试的那个端点（与结束回执同口径）；选定代际退出时由 worker 接续同会话
         target=delivered_endpoint(current),
         body=body,
-        refs=[],
+        refs=list(refs or []),  # note --ref（§104.4）：envelope 照常渲染「引用文件：」
         now=now,
         sender=caller.endpoint.ref if caller.endpoint is not None else None,
         sender_class=permission_class(caller),
         options={NOTICE_KIND_OPTION: NOTE_KIND, FOR_SEQ_OPTION: current.seq, "allowShared": current.allow_shared},
         event="note_created",
     )
+
+
+def _agent_session(caller: Caller, code: str) -> Endpoint:
+    """remind/todo 的调用方必须是认得出的 agent 会话（按会话 ID 认）；用户终端、认不出的会话与子代理报 code。"""
+    if caller.rejection is not None or caller.endpoint is None or caller.endpoint.ref.native_id == UNRESOLVED_NATIVE_ID:
+        raise CliError(code)
+    return caller.endpoint
+
+
+def _remind_body(args: argparse.Namespace) -> str:
+    """remind 的提醒内容：-m 文本、-m -（标准输入）或 --file；都没给时报空，不隐式读标准输入（agent shell 里会卡住）。"""
+    if args.message is None and not args.file:
+        raise CliError("empty_message")
+    body = _read_body(args)
+    if not body.strip():
+        raise CliError("empty_message")
+    return body
+
+
+def cmd_remind(args: argparse.Namespace) -> int:
+    """`ab remind`（DESIGN §104.9 二）：给调用会话自己排一条定时提醒，到点作为 role=notice 送回本会话。
+
+    实现是「发给自己的告知」加延迟投递：建即关闭的 fyi 任务，尝试 options {deferUntil, remind:true}；消息由桥代发
+    （from=user），叫醒的那一轮不静默。只有这条命令允许目标等于调用方；`--list` 列出本会话未发出的定时提醒，
+    取消用 `ab cancel <ID>`。
+    """
+    if args.list:
+        return _remind_list(args)
+    seconds = _duration_arg(args.in_, "in_invalid", minimum=60.0, maximum=MAX_DEFER_SECONDS)
+    if seconds is None:
+        raise CliError("in_invalid")
+    body = _remind_body(args)
+    endpoints = discover()
+    caller = identify_caller(endpoints)
+    me = _agent_session(caller, "remind_requires_session")
+    # 自己就收不了（只读 provider、没有收件 socket 等）时写前就拒绝；共享 thread 与 send 同一判定（§104.11 P3）：
+    # 调用方自己的 thread 被多个进程加载时，提醒可能由另一个进程执行，要显式 --allow-shared
+    allow_shared = bool(args.allow_shared)
+    _check_target(me, allow_shared=allow_shared)
+    now = time.time()
+    due = now + seconds
+    first_line = body.strip().splitlines()[0]
+    with _open_store() as store:
+        try:
+            task, attempt = store.create_fyi(
+                title=(args.title or first_line)[:60], origin=me.ref, origin_class=permission_class(caller),
+                target=me.ref, body=body, refs=[], now=now,
+                task_options={"allowShared": allow_shared},
+                attempt_options={"allowShared": allow_shared, DEFER_OPTION: due, REMIND_OPTION: True},
+                bridge_sender=True)
+        except StoreError as error:
+            raise CliError(error.code, _exit_for_store_error(error.code)) from error
+        started = _start_worker()
+        document = _task_document(store, task, names=NameBook.of(endpoints)) if args.json else None
+    unavailable = _queued_without_worker(started)
+    if document is not None:
+        document["remindAt"] = due
+        document["notes"] = ["worker_not_running"] if unavailable else []
+        _print_json(document)
+    else:
+        cmd = command_name()
+        print(f"定时提醒 {short(task.id)} 已排定：{clock_text(due)} 送回本会话（#{attempt.seq}）")
+        print(f"取消：{cmd} cancel {short(task.id)}；查看未到期的：{cmd} remind --list")
+    return EXIT_UNAVAILABLE if unavailable else EXIT_OK
+
+
+def _remind_list(args: argparse.Namespace) -> int:
+    """本会话还没发出的定时提醒（本机账本里 PENDING 且 remind 的尝试），按到期时刻排序。"""
+    caller = identify_caller(discover())
+    me = _agent_session(caller, "remind_requires_session")
+    rows: list[dict[str, object]] = []
+    with _open_store() as store:
+        pending = [item for item in store.attempts_in((Delivery.PENDING,))
+                   if item.is_remind and item.target.same_session(me.ref)]
+        for item in sorted(pending, key=lambda attempt: attempt.defer_until or 0.0):
+            task = store.get_task(item.task_id)
+            rows.append({"taskId": item.task_id, "short": short(item.task_id), "remindAt": item.defer_until,
+                         "title": task.title if task is not None else ""})
+    if args.json:
+        _print_json({"reminders": rows})
+        return EXIT_OK
+    if not rows:
+        print("没有未发出的定时提醒")
+    for row in rows:
+        due = row["remindAt"]
+        when = clock_text(due) if isinstance(due, float) else "-"
+        print(f"{row['short']}  {when}  {str(row['title'])[:60]}")
+    return EXIT_OK
+
+
+def cmd_todo(args: argparse.Namespace) -> int:
+    """`ab todo`（DESIGN §104.3、§104.9 六）：只列调用会话要动手的事，每行一项带可照抄的命令；没有就什么都不输出。
+
+    身份与 `ab tasks --mine` 同口径（按会话 ID），认不出的会话报 mine_requires_session。包括本机任务、本机为权威的
+    联邦任务，以及发给本会话的镜像尝试（命令带 --origin-device）。联邦库读不了时 stdout 不出联邦行、stderr 注明，退出 0。
+    """
+    now = time.time()
+    caller = identify_caller(discover())
+    me = _agent_session(caller, "mine_requires_session").ref
+    cmd = command_name()
+    items: list[TodoItem] = []
+    if (state_dir() / DB_NAME).is_file():
+        with _open_store() as store:
+            for task in store.list_tasks():
+                items.extend(todo_items(task, store.attempts(task.id), me, now=now, command=cmd))
+    federated = _fed_todo(me, now, cmd)
+    if federated is None:
+        print(f"跨设备任务：联邦库不可读，没有列出（{cmd} doctor 查看原因）", file=sys.stderr)
+    else:
+        items.extend(federated)
+    if args.json:
+        _print_json([item.to_dict() for item in items])
+        return EXIT_OK
+    for item in items:
+        print(todo_line(item))
+    return EXIT_OK
+
+
+def _fed_todo(me: EndpointRef, now: float, cmd: str) -> list[TodoItem] | None:
+    """todo 的联邦部分：未配置为 []；库读不了为 None。A 上的权威任务按本机同一判定，镜像只看发给本会话的汇报项。"""
+    root = state_dir()
+    if not _fed_configured(root):
+        return []
+    from .federation import authority as fed_authority, commands as fed, mirror  # layout: allow 联邦按需加载
+    from .federation.codec import is_slug  # layout: allow 联邦按需加载
+    from .federation.views import model_attempts, model_task  # layout: allow 联邦按需加载
+    try:
+        rt = fed.try_runtime(root)
+    except (StoreError, sqlite3.Error):
+        rt = None
+    if rt is None:
+        return None
+    items: list[TodoItem] = []
+    try:
+        for task in rt.store.tasks():
+            if task.is_authority:
+                # 标题保留原值：--json 照给，文字行由 todo.text_line 按来源转义（§104.12 第 11 条）
+                # 命令用完整 ID 加 --origin-device <本机>（§104.13 第 2 条）：两库同 ID 时也只作用到联邦这一项
+                items.extend(todo_items(model_task(task), model_attempts(rt.store.attempts(task.authority_device,
+                                                                                         task.task_id)),
+                                        me, now=now, command=cmd, scope="federation",
+                                        command_ref=fed_authority.command_ref(rt.ident, task.task_id)))
+                continue
+            work = mirror.local_report_target(rt.store, rt.ident, task) if rt.config.enabled else None
+            local = mirror.local_binding(work) if work is not None else None
+            if work is None or local is None or not local.same_session(me):
+                continue
+            view = model_attempts([work])[0]
+            if view.delivery not in HANDED_OVER:
+                continue  # 待你汇报只列已交出的尝试，与本机同一判据（§104.12 第 2 条）
+            name = fed.device_name(rt, task.authority_device)
+            # 与镜像页脚同口径：登记名是 slug 就用名，否则完整 deviceId（§101.1）
+            reference = name if is_slug(name) else task.authority_device
+            items.append(todo_report_item(task.task_id, task.title, view, command=cmd, scope="federation",
+                                          origin_device=reference))
+    except (StoreError, sqlite3.Error):
+        return None
+    finally:
+        rt.close()
+    return items
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
@@ -1738,18 +2176,70 @@ def cmd_summary(args: argparse.Namespace) -> int:
 # ---- 跨设备（DESIGN §88）：显式 --device/--origin-device，或本机找不到时的唯一联邦命中 ----
 
 
-def _local_task_exists(root: Path, reference: str) -> bool:
-    """本机账本能否解析该任务；找不到才轮到联邦。歧义或账本错误一律交本机路径原样报错（§88.7 命名空间）。"""
+def _local_task_state(root: Path, reference: str) -> tuple[str, str | None]:
+    """本机账本对该引用的解析结果与命中的完整 ID：found（恰好命中一项）、absent（没有）、error（本机歧义或账本错误）。
+
+    error 一律交本机路径原样报错（§88.7 命名空间），联邦不再参与；只有 found 才与联邦命中比较是否跨库歧义。
+    """
     if not (root / DB_NAME).is_file():
-        return False
+        return "absent", None
     try:
         with Store.open(root) as store:
-            store.resolve_task(reference)
+            found = store.resolve_task(reference)
     except StoreError as error:
-        return error.code != "task_not_found"
+        return ("absent" if error.code == "task_not_found" else "error"), None
     except PermissionError:
-        return True
-    return True
+        return "error", None
+    return "found", found.id
+
+
+def _federation_twin(root: Path, reference: str, local_id: str) -> str | None:
+    """本机已命中时，联邦库里有没有也匹配这个引用的任务（§104.13 第 1 条）；有就返回提示文字，没有返回 None。
+
+    只用只读连接（不走可写的联邦运行时、不迁移）。判定与提示分开（§104.14 第 1 条）：
+    - 配置读不了、根不符、库打不开、实例身份（deviceId/hubId）与配置不配对（§104.14 第 6 条，与普通运行时同一判据），
+      或任务索引本身读不了：按「没有」处理，只看本机；
+    - 索引里查到了就一定拒绝；设备名只用于提示，读不了时提示改用这条记录自带的 authorityDeviceId。
+    两库完整 ID 相同时提示写明只能用 --origin-device 选联邦，本机那项目前选不了（§104.14 第 7 条）。
+    """
+    from .federation import config as fed_config  # layout: allow 联邦按需加载
+    from .federation.codec import is_slug  # layout: allow 联邦按需加载
+    from .federation.fedstore import FederatedStore as FedStore  # layout: allow 联邦按需加载
+    try:
+        config = fed_config.load(root)
+        if config is None:
+            return None
+        fed_config.check_state_root(config, root)
+        fed_store = FedStore.open_readonly(root)
+    except Exception:  # noqa: BLE001 - 联邦库读不了时只看本机（§104.13 第 1 条）
+        return None
+    try:
+        try:
+            if (fed_store.meta("deviceId"), fed_store.meta("hubId")) != (config.device_id, config.hub_id):
+                return None  # 实例身份不配对：这份索引不属于当前联邦实例，不参与查重
+            found = fed_store.find_tasks(reference)
+        except Exception:  # noqa: BLE001 - 任务索引本身读不了：只看本机
+            return None
+        if not found:
+            return None
+        twin = found[0]
+        try:
+            if twin.authority_device == config.device_id:
+                name = config.device_name
+            else:
+                name = next((str(row["name"]) for row in fed_store.device_states()
+                             if row["device_id"] == twin.authority_device and row["name"]), "")
+        except Exception:  # noqa: BLE001 - 设备名只影响提示：读不了就用记录里的 authorityDeviceId
+            name = ""
+    finally:
+        fed_store.close()
+    device = name if is_slug(name) else twin.authority_device
+    routed = f"{twin.task_id} --origin-device {device}"
+    if twin.task_id == local_id:
+        return (f"本机账本与跨设备账本里有完整 ID 相同的任务：只能用 --origin-device 选跨设备那项，例如 {routed}；"
+                "本机那项目前选不了（已知限制）")
+    return (f"本机账本与跨设备账本都有匹配「{remote_display(reference) or ''}」的任务：本机那项请写完整任务 ID；"
+            f"跨设备那项请加 --origin-device，例如 {routed}")
 
 
 def _fed_configured(root: Path) -> bool:
@@ -1758,9 +2248,12 @@ def _fed_configured(root: Path) -> bool:
 
 
 def _fed_lookup(args: argparse.Namespace, *, write: bool) -> tuple[FedRuntime, FedTask] | None:
-    """显式 --origin-device 只查联邦；否则本机精确任务优先，本机找不到才查联邦唯一索引。
+    """显式 --origin-device 只查联邦；否则本机与联邦都查，同时命中报 task_ambiguous（§104.13 第 1 条）。
 
-    联邦库损坏/停用不能让已命中的本机任务失败；写命令要求联邦已启用（停用后仍可读历史）。
+    以前本机精确命中优先，生成的短号命令会在两库前八位相同时作用到本机那一项；现在一律拒绝并提示写法。
+    本机歧义或账本错误交本机路径原样报错；联邦库读不了（打不开、损坏）时只看本机，不挡住本机命中。
+    两库完整 ID 相同时只能用 --origin-device 选联邦，本机那项选不了（随机 128 位 ID 不会相撞，已知限制）。
+    写命令要求联邦已启用（停用后仍可读历史）。
     """
     root = state_dir()
     origin = getattr(args, "origin_device", None)
@@ -1768,7 +2261,14 @@ def _fed_lookup(args: argparse.Namespace, *, write: bool) -> tuple[FedRuntime, F
         return None
     from .federation import commands as fed  # layout: allow 联邦按需加载：未配置的机器不导入联邦实现
     if origin is None:
-        if _local_task_exists(root, args.task):
+        local, local_id = _local_task_state(root, args.task)
+        if local == "error":
+            return None
+        if local == "found" and local_id is not None:
+            # 本机命中：只读查联邦有没有同样匹配的，有就拒绝（不再本机优先）；联邦读不了照常走本机
+            hint = _federation_twin(root, args.task, local_id)
+            if hint is not None:
+                raise FedCliError("task_ambiguous", EXIT_TARGET, hint=hint)
             return None
         rt = fed.try_runtime(root)
         if rt is None:
@@ -1885,17 +2385,19 @@ def _fed_send(args: argparse.Namespace, *, follows: str | None = None) -> int:
             rt, target=target, body=body, title=(args.title or first_line)[:60], ref_paths=list(args.ref),
             cwd=Path.cwd(), origin=caller.endpoint.ref if caller.endpoint is not None else None,
             origin_class=permission_class(caller), reviewer=reviewer, allow_shared=bool(args.allow_shared),
-            no_notify=bool(args.no_notify), follows=follows, fyi=fyi)
+            no_notify=bool(args.no_notify), follows=follows, fyi=fyi,
+            expect=getattr(args, "expect_seconds", None), after=getattr(args, "defer_seconds", None))
         missing = _fed_relay_missing(rt)
         task_id = outcome.task.task_id
         if args.json:
             _print_json(fed.task_document(rt, outcome.task, now=int(time.time() * 1000)))
         elif fyi:
-            print(f"跨设备告知 {short(task_id)} 已排队，发给 {_fed_target_text(rt, outcome.target)}：等待 relay 发出；"
-                  "对方只需读到，不汇报、不验收")
+            print(f"跨设备告知 {short(task_id)} 已排队，发给 {_fed_target_text(rt, outcome.target)}："
+                  f"{_fed_send_when(rt, outcome.attempt)}；对方只需读到，不汇报、不验收")
             print(f"查看投递：{command_name()} status {short(task_id)}")
         else:
-            print(f"跨设备任务 {short(task_id)} 已记录，交给 {_fed_target_text(rt, outcome.target)}：等待 relay 发出")
+            print(f"跨设备任务 {short(task_id)} 已记录，交给 {_fed_target_text(rt, outcome.target)}："
+                  f"{_fed_send_when(rt, outcome.attempt)}")
             if outcome.blobs or outcome.references:
                 print(f"附件：{outcome.blobs} 个随消息传输（{outcome.blob_bytes} B），"
                       f"{outcome.references} 个超出大小上限只作引用（对方没有这些文件）")
@@ -1904,6 +2406,14 @@ def _fed_send(args: argparse.Namespace, *, follows: str | None = None) -> int:
     finally:
         rt.close()
     return EXIT_UNAVAILABLE if missing else EXIT_OK
+
+
+def _fed_send_when(rt: FedRuntime, attempt: FedAttempt) -> str:
+    """跨设备 send/--fyi 的「何时发出」（§104.11 P3）：远端目标由 relay 交给 hub；目标在本机（A 本机执行方）由本机后台
+    worker 投递，定时项到点由 relay 拉起 worker。带 --after 时写出定时时刻。"""
+    due = defer_time(attempt.options)
+    who = "本机后台 worker " if attempt.target_device == rt.ident.device_id else " relay "
+    return f"定时 {clock_text(due)} 由{who}发出" if due is not None else f"等待{who}发出"
 
 
 def _fed_task_list(include_finished: bool, now: float,
@@ -1938,8 +2448,9 @@ def _fed_task_list(include_finished: bool, now: float,
                 # 一句话告知（§95.5.7）：阶段列写「告知」，目标取那条告知，原因写投递状态
                 first = rows[0]
                 target = f"{fed.device_text(first['targetDeviceName'])}:{fed.target_text(first['target'])}"
-                phase, reason = FYI_LABEL, f"投递 {first['delivery']}"
-            lines.append(f"{short(task.task_id)}  {phase:<4} {target:<28} {task.title[:40]}"
+                phase, reason = FYI_LABEL, f"投递 {fed.delivery_text(first['delivery'])}"
+            # 标题先截后转义：免得把转义序列截成半截（§103.3）
+            lines.append(f"{short(task.task_id)}  {phase:<4} {target:<28} {fed.title_text(task.title[:40])}"
                          f"  （跨设备·{role}，{reason}{flag}，{_age(task.last_sync_at / 1000, now)}）")
         return documents, lines
     finally:
@@ -1954,7 +2465,7 @@ def _fed_status(args: argparse.Namespace, rt: FedRuntime, task: FedTask) -> int:
         relations, followed_by = _follow_links(task.task_id, follows if isinstance(follows, str) else None,
                                                fed_store=rt.store)
         if args.json:
-            document = fed.task_document(rt, task, now=now_ms, include_body=args.body)
+            document = fed.task_document(rt, task, now=now_ms, include_body=args.body, events=True)
             if followed_by:
                 document["followedBy"] = followed_by
             _print_json(document)
@@ -1977,11 +2488,14 @@ def _fed_report(args: argparse.Namespace, kind: ReportKind, rt: FedRuntime, task
         attempt, result = fed.report(
             rt, task=task, kind=kind, attempt_seq=args.attempt, note=args.note, files=list(args.file),
             commit=args.commit, manual=args.manual, caller=caller, caller_class=permission_class(caller),
-            cwd=Path.cwd())
+            cwd=Path.cwd(), ask=bool(getattr(args, "ask", False)))
         started: bool | None = True
         if result.decision == "accepted":
             started = _start_worker()  # A 本机采纳可能排出本机通知/复核
         missing = _fed_relay_missing(rt)
+        # 对方设备没声明 ask 能力（旧版或判断不了）时提示改用 --blocked；文字与 --json 都给（§104.11 P3）
+        warnings = ([ASK_OLD_AUTHORITY_HINT] if getattr(args, "ask", False) and not fed.authority_supports_ask(rt, task)
+                    else [])
         if result.decision is None:
             status = "已提交，等待发起设备确认"
         elif result.decision == "accepted":
@@ -1993,10 +2507,14 @@ def _fed_report(args: argparse.Namespace, kind: ReportKind, rt: FedRuntime, task
                                          now=int(time.time() * 1000))
             document["report"] = {"reportNo": result.report_no, "operationId": result.operation_id,
                                   "decision": result.decision, "reason": result.reason}
+            document["warnings"] = warnings
             _print_json(document)
         else:
-            print(f"已记录：{EVENT_LABELS[kind.value]}（跨设备任务 {short(task.task_id)} #{attempt.seq}，"
+            label = "提问（任务仍在进行）" if getattr(args, "ask", False) else EVENT_LABELS[kind.value]
+            print(f"已记录：{label}（跨设备任务 {short(task.task_id)} #{attempt.seq}，"
                   f"第 {result.report_no} 号报告）；{status}")
+            for warning in warnings:
+                print(f"提示：{warning}")
     finally:
         rt.close()
     if result.decision == "rejected":
@@ -2104,7 +2622,8 @@ def _fed_note(args: argparse.Namespace, rt: FedRuntime, task: FedTask) -> int:
         endpoints = discover()
         caller = identify_caller(endpoints)
         _check_sender(caller)
-        note = fed.note(rt, task, caller=caller, caller_class=permission_class(caller), body=body)
+        note = fed.note(rt, task, caller=caller, caller_class=permission_class(caller), body=body,
+                        ref_paths=list(args.ref), cwd=Path.cwd())
         local = note.target_device == rt.ident.device_id
         started = _start_worker() if local else True
         missing = False if local else _fed_relay_missing(rt)
@@ -2147,7 +2666,8 @@ def _fed_retry(args: argparse.Namespace, rt: FedRuntime, task: FedTask) -> int:
         elif args.device:
             raise CliError("target_explicit_required")
         outcome = fed.retry(rt, task, caller=caller, message=args.message, force=bool(args.force),
-                            new_target=new_target, allow_shared=bool(args.allow_shared), rework_body=_rework_body)
+                            new_target=new_target, allow_shared=bool(args.allow_shared), rework_body=_rework_body,
+                            ref_paths=list(args.ref), cwd=Path.cwd())
         attempt = outcome.attempt
         local = attempt.target_device == rt.ident.device_id
         started = _start_worker() if local else True
@@ -2275,8 +2795,31 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
                       help="承接的旧任务（任务 ID 或唯一前缀）；只在本机记关联，不进消息，接收方需要时请写在正文里")
     send.add_argument("--fyi", action="store_true",
                       help="一句话告知：只需对方读到，不汇报、不验收（任务建立即关闭）；不能与 --review-by/--review-device/--no-notify 同用")
+    send.add_argument("--after", metavar="DUR",
+                      help="定时发出：1m～24h 后才投递（如 30m、2h）；到点前可 cancel，命令不等首投")
+    send.add_argument("--expect", metavar="DUR",
+                      help="对方多久没汇报算沉默（5m～24h，缺省 30m）：满了提醒发起方一次；长任务用 --progress 保活")
     send.add_argument("--json", action="store_true")
     send.set_defaults(handler=cmd_send)
+
+    remind = commands.add_parser(
+        "remind", help="给本会话排一条定时提醒（到点送回本会话）",
+        description="给调用会话自己排一条定时提醒：到点作为 role=notice 送回本会话，取消用 cancel <ID>。")
+    remind.add_argument("--in", dest="in_", metavar="DUR", help="多久之后提醒：1m～24h（如 31m、2h）")
+    remind.add_argument("-m", "--message", help="提醒内容；- 表示从标准输入读取")
+    remind.add_argument("--file", help="从文件读取提醒内容")
+    remind.add_argument("--title", help="标题（默认取内容第一行）")
+    remind.add_argument("--list", action="store_true", help="列出本会话还没发出的定时提醒")
+    remind.add_argument("--allow-shared", action="store_true",
+                        help="本会话的 thread 同时被多个进程加载时仍排提醒（与 send 的 --allow-shared 同义）")
+    remind.add_argument("--json", action="store_true")
+    remind.set_defaults(handler=cmd_remind)
+
+    todo = commands.add_parser("todo", help="只列本会话要动手的事（每行带可照抄的命令）",
+                               description="列出调用会话的待办：待你验收、待你处理、待你汇报、待你复核、对方沉默；"
+                                           "没有待办时什么都不输出。")
+    todo.add_argument("--json", action="store_true")
+    todo.set_defaults(handler=cmd_todo)
 
     tasks = commands.add_parser("tasks", help="列出协作任务")
     tasks.add_argument("--all", action="store_true", help="包含已结束的任务")
@@ -2301,7 +2844,8 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
         help="汇报自己承接的任务",
         description=(
             "汇报自己承接的任务。--result/--blocked/--failed/--approve/--changes 会给发起方发结果回执（会叫醒对方；发起时加了 --no-notify 的除外）；"
-            "--ack/--progress 只记进账本，不通知、不叫醒发起方。需要发起方或用户处理时用 --blocked。"
+            "--ask 提问也会叫醒发起方，但任务不结束（发起方用 note 回答）；"
+            "--ack/--progress 只记进账本，不通知、不叫醒发起方（长任务用 --progress 保活）。需要发起方或用户处理时用 --blocked。"
         ),
     )
     report.add_argument("task")
@@ -2315,7 +2859,10 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     kinds.add_argument("--failed", action="store_true", help="无法完成（通知发起方）")
     kinds.add_argument("--approve", action="store_true", help="复核通过（通知发起方）")
     kinds.add_argument("--changes", action="store_true", help="复核要求修改（通知发起方）")
-    report.add_argument("--note", help="一句话说明")
+    kinds.add_argument("--ask", action="store_true",
+                       help="提问：任务不结束，立即通知发起方回答（要用 --note 写问题；发起方用 note 回答）")
+    report.add_argument("--note", help=f"一句话说明（上限 {MAX_NOTE_CHARS} 字，超长报错；- 表示从标准输入读取）")
+    report.add_argument("--note-file", help="从文件读取说明（与 --note 二选一）；长内容请用 --file 交附件")
     report.add_argument("--file", action="append", default=[], help="结果文件（记录 sha256）")
     report.add_argument("--commit", help="结果提交")
     report.add_argument("--manual", action="store_true", help="用户在终端里代为补记")
@@ -2367,7 +2914,10 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     retry.add_argument("--origin-device", help="跨设备任务的发起设备")
     retry.add_argument("--to", help="改派到其他会话")
     retry.add_argument("--device", help="改派目标所在设备（跨设备任务；与 --to 一起用）")
-    retry.add_argument("-m", "--message", help="补充说明")
+    retry.add_argument("-m", "--message", help="补充说明或返工要求；- 表示从标准输入读取（不给 -m 时不读标准输入）")
+    retry.add_argument("--file", help="从文件读取补充说明或返工要求（与 -m 二选一）")
+    retry.add_argument("--ref", action="append", default=[],
+                       help="追加引用文件（记录 sha256；接在原有附件之后，合计上限 16 个）")
     retry.add_argument("--force", action="store_true", help="上一条可能已送达时仍重发")
     retry.add_argument("--allow-shared", action="store_true")
     retry.add_argument("--json", action="store_true", help="成功与失败都输出结构化结果")
@@ -2382,6 +2932,7 @@ def build_parser(*, include_alias: bool = False) -> argparse.ArgumentParser:
     note.add_argument("--origin-device", help="跨设备任务的发起设备（只能在发起设备上补充）")
     note.add_argument("-m", "--message", help="补充内容；- 表示从标准输入读取")
     note.add_argument("--file", help="从文件读取补充内容")
+    note.add_argument("--ref", action="append", default=[], help="附带引用文件（记录 sha256，上限 16 个）")
     note.add_argument("--json", action="store_true", help="成功与失败都输出结构化结果")
     note.set_defaults(handler=cmd_note, json_errors=True)
 
@@ -2472,6 +3023,12 @@ def _main(argv: Sequence[str] | None = None) -> int:
         # 先于平台解析、Windows 命令作用域、发现与任何读写（§101.2）
         _report_error(args, invalid)
         return EXIT_REJECTED
+    origin_device = getattr(args, "origin_device", None)
+    if isinstance(origin_device, str) and not origin_device.strip():
+        # 显式空白的 --origin-device 与 --device "" 同一拒绝（§104.14 第 2 条、§101.2）：不当作「没指定」去本机或
+        # 联邦查任务，也不当作「不限权威」；两个库都不碰
+        _report_error(args, "target_explicit_required")
+        return EXIT_TARGET
     try:
         platform = get_platform()
     except ValueError as error:

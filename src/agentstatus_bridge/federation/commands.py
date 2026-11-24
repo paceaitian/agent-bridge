@@ -12,7 +12,7 @@ import os
 import re
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -21,28 +21,47 @@ from ..closure import ACCEPTED
 from ..endpoints import ADAPTERS, Caller, DiscoverySources, Endpoint, discover
 from ..endpoints import _ids_complete  # pyright: ignore[reportPrivateUsage]  与本机解析/名字投影同一身份判据（§94.1）
 from ..ids import short
-from ..labels import FYI_LABEL, FYI_STATUS_LABEL, NOTE_LABEL, reason_text
-from ..model import PHASE_LABELS, Attempt, EndpointRef, Phase, Provider, ReportKind, Task, TaskView
+from ..labels import (
+    DELIVERY_LABELS,
+    EVENT_LABELS,
+    FEDERATION_EVENT_LABELS,
+    FYI_LABEL,
+    FYI_STATUS_LABEL,
+    NOTE_LABEL,
+    REASON_TEXTS,
+    TRANSPORT_EVENT_LABELS,
+    notification_capacity_hint,
+    deferred_due,
+    reason_registered,
+    reason_text,
+    shown_reason,
+    reminded_label,
+    review_capacity_hint,
+    silent_minutes,
+)
+from ..model import PHASE_LABELS, Attempt, Delivery, EndpointRef, Phase, Provider, ReportKind, Task, TaskView
 from ..naming import command_name
-from ..native_names import UUID_SHAPE, full_id_token, remote_display
+from ..native_names import UUID_SHAPE, full_id_token, remote_display, remote_path
 from ..platforms import process as procfs
 from ..platforms.factory import get_platform
 from ..platforms.types import Capability
 from ..reports import (  # pyright: ignore[reportPrivateUsage]
-    MAX_NOTE_CHARS,
     ReportError,
     ReportInput,
     _attribute,
     _commit_reference,
     _git_resolve_commit,
+    checked_note,
+    refs_over_limit,
 )
-from ..store import MAX_BODY_BYTES, MAX_FILES, StoreError
+from ..store import CAPACITY_CODES, MAX_BODY_BYTES, MAX_FILES, StoreError
 from ..task_filter import TASK_LIST_LIMIT, Party, TaskFilter
+from ..views import deferred_text, timeline_lines
 from ..worker import ensure_worker
 from . import attachments, authority, budget, config as fed_config, directory, mirror
 from .attachments import AttachmentError, Frozen
 from .authority import Identity
-from .codec import is_hex32, is_slug
+from .codec import CodecError, is_hex32, is_slug
 from .errors import FedCliError
 from .fedstore import FED_DB_NAME, FederatedStore, FedAttempt, FedTask, load_dict, now_ms
 from .refs import TargetRef, WireActor
@@ -218,24 +237,30 @@ class SendOutcome:
     device_name: str
 
 
-def freeze_refs(rt: Runtime, paths: list[str], cwd: Path) -> list[Frozen]:
-    """冻结 --ref/--file 点名的文件；有点名时先按设备内容预算预检（§88.11），不足在写任务/报告前拒绝。"""
+def freeze_refs(rt: Runtime, paths: list[str], cwd: Path, *, used: int = 0) -> list[Frozen]:
+    """冻结 --ref/--file 点名的文件；有点名时先按设备内容预算预检（§88.11），不足在写任务/报告前拒绝。
+
+    used 是同一条消息已占的 blob 字节（retry 继承的附件），只计入 32 MiB 预算（§104.11 第 5 条）。
+    """
     if not paths:
         return []
     left = budget.available(rt.store, rt.paths, rt.config.storage_budget)
     try:
         return attachments.freeze(paths, cwd=cwd, origin_device=rt.ident.device_id, staging=rt.paths.staging,
-                                  available=left)
+                                  available=left, used=used)
     except AttachmentError as error:
         raise FedCliError(error.code) from error
 
 
 def send(rt: Runtime, *, target: TargetRef, body: str, title: str, ref_paths: list[str], cwd: Path,
          origin: EndpointRef | None, origin_class: str | None, reviewer: TargetRef | None, allow_shared: bool,
-         no_notify: bool, follows: str | None = None, fyi: bool = False) -> SendOutcome:
+         no_notify: bool, follows: str | None = None, fyi: bool = False, expect: float | None = None,
+         after: float | None = None) -> SendOutcome:
     """A 上建联邦任务（L0）。至少一方在别的设备（本机目标 + 远端复核也算）；参与设备超过两台写前拒绝（§88.14/T16）。
 
     follows 是 `--follows` 解析出的旧任务完整 ID，只写进本机 state（§93.3），不进 checkpoint 与信封。
+    expect（秒）与 after（秒，§104.9 一、二）同样只在 A 本机：沉默阈值进 state，延迟投递进尝试 options 与 outbox 的
+    next_try_at，线上不加键。
     """
     if len(body.encode("utf-8")) > MAX_BODY_BYTES:
         raise FedCliError("message_too_large")
@@ -256,19 +281,22 @@ def send(rt: Runtime, *, target: TargetRef, body: str, title: str, ref_paths: li
     frozen = freeze_refs(rt, ref_paths, cwd)
     blobs, blob_bytes, references = attachments.transfer_summary(frozen)
     reviewer_token = full_id_token(reviewer.local) if reviewer is not None and reviewer.local is not None else None
+    now = now_ms()
+    defer_until = (now / 1000.0 + after) if after is not None else None
     try:
         if fyi:
             task, attempt = authority.create_fyi(
                 rt.store, rt.ident, title=title, body=body, refs=[item.manifest for item in frozen],
                 origin=origin_target, origin_actor=origin_actor, origin_class=origin_class or "unknown",
-                target=target, allow_shared=allow_shared, now=now_ms(), follows=follows)
+                target=target, allow_shared=allow_shared, now=now, follows=follows, defer_until=defer_until)
             return SendOutcome(task, attempt, target, blobs, blob_bytes, references,
                                device_name(rt, target.remote.device_id))
         task, attempt = authority.create_task(
             rt.store, rt.ident, title=title, flow="review" if reviewer else "handoff", body=body,
             refs=[item.manifest for item in frozen], origin=origin_target, origin_actor=origin_actor,
             origin_class=origin_class or "unknown", target=target, reviewer=reviewer, reviewer_token=reviewer_token,
-            notify_origin=not no_notify, allow_shared=allow_shared, now=now_ms(), follows=follows)
+            notify_origin=not no_notify, allow_shared=allow_shared, now=now, follows=follows, expect=expect,
+            defer_until=defer_until)
     except StoreError as error:
         raise FedCliError(error.code) from error
     return SendOutcome(task, attempt, target, blobs, blob_bytes, references, device_name(rt, target.remote.device_id))
@@ -320,8 +348,12 @@ def _delivery_detail(rt: Runtime, attempt: FedAttempt) -> dict[str, Any]:
 
 def report(rt: Runtime, *, task: FedTask, kind: ReportKind, attempt_seq: int | None, note: str | None,
            files: list[str], commit: str | None, manual: bool, caller: Caller, caller_class: str | None,
-           cwd: Path) -> tuple[FedAttempt, mirror.ReportResult]:
+           cwd: Path, ask: bool = False) -> tuple[FedAttempt, mirror.ReportResult]:
     """目标设备上的联邦报告：核本机真实接收方与当前 attempt，冻结附件，事务分配 reportNo；A 本机参与方立即裁决。"""
+    try:
+        note_text = checked_note(note)  # 说明超长在冻结附件（写 staging）之前拒绝，与本机同一口径（§104.4）
+    except ReportError as error:
+        raise FedCliError(error.code) from error
     if task.finished:
         raise FedCliError("task_finished")
     attempts = rt.store.attempts(task.authority_device, task.task_id)
@@ -340,6 +372,8 @@ def report(rt: Runtime, *, task: FedTask, kind: ReportKind, attempt_seq: int | N
         raise FedCliError("review_requires_verdict")
     if len(files) > MAX_FILES:
         raise FedCliError("too_many_files")
+    if ask and (kind is not ReportKind.PROGRESS or not (note or "").strip()):
+        raise FedCliError("ask_requires_note")  # 与本机同一判据，任何写入与附件冻结之前（§104.9 五）
     local = mirror.local_binding(attempt)
     if local is None:
         raise FedCliError("reporter_mismatch")  # 与镜像页脚同一判定（§98 r1）
@@ -363,12 +397,21 @@ def report(rt: Runtime, *, task: FedTask, kind: ReportKind, attempt_seq: int | N
     reporter = authority.actor_for(attempt.target, wire_token=full_id_token(local))
     try:
         result = mirror.submit_report(rt.store, rt.ident, mirror.LocalReport(
-            task=task, attempt=attempt, kind=kind.value, note=(note or "").strip()[:MAX_NOTE_CHARS],
+            task=task, attempt=attempt, kind=kind.value, note=note_text,
             refs=[item.manifest for item in frozen], commit=commit_ref, reporter=reporter,
-            reporter_class=caller_class or "unknown", source=source), now=now_ms(), command=command_name())
+            reporter_class=caller_class or "unknown", source=source, ask=ask), now=now_ms(), command=command_name())
     except StoreError as error:
         raise FedCliError(error.code) from error
     return attempt, result
+
+
+def authority_supports_ask(rt: Runtime, task: FedTask) -> bool:
+    """发起设备认不认汇报帧的可选键 ask（§104.9 五）：本机就是权威时恒认；否则看缓存目录里 A 声明的 features。
+
+    旧 A、目录还没缓存，或快照超限丢了 features 都按不认处理（执行方的输出加一句提示，不拒绝）。
+    """
+    return task.authority_device == rt.ident.device_id or "ask" in directory.device_features(
+        rt.store, task.authority_device)
 
 
 # ---- 控制（只在权威设备 A） ----
@@ -439,7 +482,8 @@ def finish(rt: Runtime, task: FedTask, state: str, *, caller: Caller, caller_cla
         raise FedCliError(error.code) from error
 
 
-def note(rt: Runtime, task: FedTask, *, caller: Caller, caller_class: str | None, body: str) -> FedAttempt:
+def note(rt: Runtime, task: FedTask, *, caller: Caller, caller_class: str | None, body: str,
+         ref_paths: list[str] | None = None, cwd: Path | None = None) -> FedAttempt:
     """跨设备任务的 `ab note`（DESIGN §95.5.5）：只在权威设备建尝试，经现有 notice 信封送到目标设备投递。
 
     不做权限校验（寻址由任务决定）；发送者按调用方会话的结构化身份记（与 send 同口径）。
@@ -451,9 +495,12 @@ def note(rt: Runtime, task: FedTask, *, caller: Caller, caller_class: str | None
     if not body.strip():
         raise FedCliError("empty_message")
     sender = _actor(rt, caller.endpoint.ref) if caller.endpoint is not None else None
+    # note --ref（§104.4）：正文校验之后才冻结（写 staging），与 send 同一预算与 16 项上限
+    frozen = freeze_refs(rt, list(ref_paths or []), cwd or Path.cwd())
     try:
         _, attempt = authority.add_note(rt.store, rt.ident, task, body=body, sender=sender,
-                                        sender_class=caller_class or "unknown", now=now_ms())
+                                        sender_class=caller_class or "unknown", now=now_ms(),
+                                        refs=[item.manifest for item in frozen])
     except StoreError as error:
         raise FedCliError(error.code) from error
     return attempt
@@ -461,13 +508,38 @@ def note(rt: Runtime, task: FedTask, *, caller: Caller, caller_class: str | None
 
 def retry(rt: Runtime, task: FedTask, *, caller: Caller, message: str | None, force: bool,
           new_target: TargetRef | None, allow_shared: bool,
-          rework_body: Callable[[Attempt, Attempt, Task, str | None], str]) -> authority.RetryOutcome:
-    """A 上重发/返工：判定与本机 retry 相同（未投/返工/--force），新目标按 send 核。"""
+          rework_body: Callable[[Attempt, Attempt, Task, str | None, bool], str],
+          ref_paths: list[str] | None = None, cwd: Path | None = None) -> authority.RetryOutcome:
+    """A 上重发/返工：判定与本机 retry 相同（未投/返工/--force），新目标按 send 核。
+
+    --ref（§104.4）追加在继承的附件之后：
+    - 与继承 blob 完全相同的点名先剔掉（同路径、大小与 sha256）；
+    - 冻结前按「继承 + 新点名（同路径视为重复）」预判，新增部分让合并结果超过 16 就不复制任何副本；同一路径内容已变的
+      会在冻结后的精确合并里再判一次（retry_task 内，按来源路径与 sha256）；
+    - 继承 blob 的字节计入 32 MiB 预算，超出的新附件降为仅引用（§104.11 第 5 条）。
+    预判之后任务若被并发改动、继承集合变大，信封校验会在 retry_task 的事务里拒绝（整体回滚）：这里兜住 CodecError，
+    报闭集码、退出 3，不打出堆栈。
+    """
     task = _decidable(task, caller)
+    frozen: list[Frozen] = []
+    if ref_paths:
+        inherited = authority.retry_inherited_refs(task, rt.store.attempts(task.authority_device, task.task_id))
+        try:
+            named = attachments.drop_inherited(attachments.named_paths(ref_paths, cwd or Path.cwd()), inherited)
+        except AttachmentError as error:
+            raise FedCliError(error.code) from error
+        known = {item.get("originalPath") for item in inherited}
+        added = len([path for path in named if path not in known])
+        if refs_over_limit(len(inherited), len(inherited) + added, MAX_FILES):
+            raise FedCliError("too_many_files")
+        frozen = freeze_refs(rt, named, cwd or Path.cwd(), used=attachments.blob_bytes(inherited))
     try:
         return authority.retry_task(rt.store, rt.ident, task, force=force, message=message, new_target=new_target,
-                                    allow_shared=allow_shared, rework_body=rework_body, now=now_ms())
+                                    allow_shared=allow_shared, rework_body=rework_body, now=now_ms(),
+                                    extra_refs=[item.manifest for item in frozen])
     except StoreError as error:
+        raise FedCliError(error.code) from error
+    except CodecError as error:
         raise FedCliError(error.code) from error
 
 
@@ -510,6 +582,36 @@ def target_text(token: str) -> str:
     return remote_display(token) or token
 
 
+_DELIVERY_VALUES = frozenset(item.value for item in Delivery)
+_REPORT_KIND_VALUES = frozenset(item.value for item in ReportKind)
+
+
+def unknown_text(value: object) -> str:
+    """闭集外取值的人读写法（§103.3）：「未知取值（转义原文）」；非字符串按其文字形式转义，入库与 --json 不变。"""
+    return f"未知取值（{remote_display(value if isinstance(value, str) else str(value)) or ''}）"
+
+
+def delivery_text(value: object) -> str:
+    """投递状态的人读文字（§103.3）：B 出具的证据 state 入库不校验；合法值照旧写英文码，闭集外写「未知取值」。"""
+    return value if isinstance(value, str) and value in _DELIVERY_VALUES else unknown_text(value)
+
+
+def report_kind_text(value: object) -> str:
+    """报告类别的人读文字（§103.3）：A 先存报告、后校验类别，被拒报告的原始 kind 也会显示；闭集外写「未知取值」。"""
+    return value if isinstance(value, str) and value in _REPORT_KIND_VALUES else unknown_text(value)
+
+
+def code_text(value: object) -> str:
+    """来自远端的原因码（裁决 reason 等）的人读文字（§103.3）：与 deliveryReason 同一形状判据，不枚举闭集，
+    免得读方比写方严；形状不合规写「未知取值」。"""
+    return value if isinstance(value, str) and _REASON_SHAPE.fullmatch(value) else unknown_text(value)
+
+
+def title_text(title: str) -> str:
+    """跨设备任务文字行里的标题（§103.3）：镜像标题来自发起设备，codec 只限长度；一律与 peers 文字行同一套转义。"""
+    return remote_display(title) or ""
+
+
 def display_attempts(rt: Runtime, task: FedTask) -> list[FedAttempt]:
     """显示与 `ab wait` 用的尝试：镜像上本机工作尝试的 work 改读读时推导值，权威端原样（§97.2 第 3 条）。"""
     return mirror.display_attempts(rt.store, task, device_id=rt.ident.device_id)
@@ -520,13 +622,17 @@ def view_of(rt: Runtime, task: FedTask) -> TaskView:
     return mirror.describe_view(task, display_attempts(rt, task), device_id=rt.ident.device_id)
 
 
-def reason_label(rt: Runtime, task: FedTask, view: TaskView) -> str:
-    """原因的人读文本；当前尝试由别的设备处理时写出是哪台设备（§97.2 第 2 条）。"""
+def reason_label(rt: Runtime, task: FedTask, view: TaskView, now: float | None = None) -> str:
+    """原因的人读文本；当前尝试由别的设备处理时写出是哪台设备（§97.2 第 2 条）。now（秒）只用于定时项是否已到点。"""
     if view.reason == mirror.HANDLED_ON_OTHER_DEVICE:
         definition = mirror.current_definition(task)
         if definition is not None:
             return f"当前由 {device_text(device_name(rt, definition.target.device_id))} 处理，完整状态以发起设备为准"
-    return reason_text(view.reason)
+    if view.phase is Phase.CLOSED and not task.is_authority:
+        # 镜像的关闭原因是发起设备 `ab close --reason` 的自由文本（checkpoint 只限 64 字），reason_text 查不到时原样回退，
+        # 与其余远端字符串同一套转义（§103.3）；登记过的原因码照旧映射成文案
+        return reason_text(view.reason) if view.reason in REASON_TEXTS else (remote_display(view.reason) or "")
+    return reason_text(shown_reason(view, now))  # 定时项到点后按等待对方写（§104.11 P3）
 
 
 def phase_of(rt: Runtime, task: FedTask) -> tuple[Phase, str]:
@@ -535,11 +641,16 @@ def phase_of(rt: Runtime, task: FedTask) -> tuple[Phase, str]:
 
 
 def stalled(rt: Runtime, task: FedTask, *, now: int) -> bool:
-    """本任务有待传操作超过 30 分钟（远端离线/hub 不可达/relay 未运行）。"""
+    """本任务有待传操作超过 30 分钟（远端离线/hub 不可达/relay 未运行）。
+
+    延迟投递（§104.9 二）的信封从到期时刻起算，不从建立时刻：定时项在到点前不算「待传」。
+    """
     row = rt.store.connection.execute(
-        "SELECT COUNT(*) FROM fed_outbox WHERE state IN ('ready','submitting')"
-        " AND json_extract(envelope_json,'$.authorityDeviceId')=? AND json_extract(envelope_json,'$.taskId')=?"
-        " AND json_extract(envelope_json,'$.createdAt')<?",
+        "SELECT COUNT(*) FROM fed_outbox o LEFT JOIN fed_attempts a ON a.msg_id=o.msg_id"
+        " WHERE o.state IN ('ready','submitting')"
+        " AND json_extract(o.envelope_json,'$.authorityDeviceId')=? AND json_extract(o.envelope_json,'$.taskId')=?"
+        " AND MAX(json_extract(o.envelope_json,'$.createdAt'),"
+        " COALESCE(CAST(json_extract(a.options_json,'$.deferUntil') * 1000 AS INTEGER), 0))<?",
         (task.authority_device, task.task_id, now - STALLED_MS)).fetchone()
     return int(row[0]) > 0
 
@@ -604,8 +715,86 @@ def _attempt_rows(rt: Runtime, attempts: list[FedAttempt]) -> list[dict[str, Any
             "delivery": attempt.delivery.get("state", "pending"), "deliveryReason": delivery_reason(attempt),
             "receiverReported": attempt.delivery.get("receiverReported") is True,
             "work": attempt.effective_work.get("work"), "attachments": files,
+            # §104.9 七：与本机同名同单位（epoch 秒）；createdAt 是 A 的钟，远端尝试的 deliveryAt 来自 B 的证据（B 的钟）
+            "createdAt": _seconds(attempt.authority_state.get("createdAt")),
+            "deliveryAt": _seconds(attempt.delivery.get("at")),
         })
     return rows
+
+
+def _seconds(value: object) -> float | None:
+    """联邦库的毫秒整数换成 epoch 秒（与本机 status --json 同单位）；缺值或形状不对为 None。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value / 1000.0
+    return None
+
+
+# 时间线条数（与本机一致）：文字 20 条，status --json 50 条
+TIMELINE_TEXT_EVENTS = 20
+TIMELINE_JSON_EVENTS = 50
+
+
+def _event_rows(rt: Runtime, task: FedTask, limit: int) -> list[dict[str, Any]]:
+    """本设备 fed_events 的记录，at 换成秒；kind/detail 原值（JSON 不转义，文字行另转义）。"""
+    rows: list[dict[str, Any]] = []
+    for event in rt.store.events(task.authority_device, task.task_id, limit=limit):
+        at = _seconds(event["at"])
+        if at is not None:
+            rows.append({**event, "at": at})
+    return rows
+
+
+def _evidence_rows(rt: Runtime, attempt: FedAttempt) -> list[dict[str, Any]]:
+    """A 收到的该尝试全部投递证据（fed_evidence），每条只取闭集的四个键；at 是投递设备的钟（秒）。"""
+    return [{"no": row.get("evidenceNo"), "state": row.get("state"), "reason": row.get("reason"),
+             "at": _seconds(row.get("at"))} for row in rt.store.evidence(attempt.msg_id)]
+
+
+def _fed_reason_text(value: object) -> str:
+    """时间线附注里的原因码：登记过的写文案，形状合规的原样写码，其余（来自远端的异常取值）写「未知取值」。
+
+    先显式查是否登记（§104.12 第 10 条），命中才展开本地文案；未知取值不进 reason_text，免得被当成模板替换占位。
+    """
+    if not isinstance(value, str) or not value:
+        return ""
+    if reason_registered(value):
+        return reason_text(value)  # 登记过的码（含 delivery_* 的投递标签）与本机时间线同一文案
+    return code_text(value)
+
+
+def fed_event_text(event: Mapping[str, Any]) -> tuple[str, object]:
+    """联邦时间线一行的标签与附注（§104.9 七）。kind 可能嵌着远端取值（delivery_<B 的 state>、B 上
+    report_<A 的裁决>），没登记的部分一律按 §103.3 写「未知取值（转义原文）」，不原样输出。"""
+    kind = event.get("kind")
+    raw_detail = event.get("detail")
+    detail: dict[str, Any] = raw_detail if isinstance(raw_detail, dict) else {}  # pyright: ignore[reportUnknownVariableType]
+    if not isinstance(kind, str):
+        return unknown_text(kind), ""
+    label = FEDERATION_EVENT_LABELS.get(kind) or EVENT_LABELS.get(kind)
+    if kind == "origin_reminded":
+        label = reminded_label(detail) or label
+    if label is None:
+        if kind.startswith("delivery_"):
+            state = kind.removeprefix("delivery_")
+            label = DELIVERY_LABELS[Delivery(state)] if state in _DELIVERY_VALUES else f"投递证据：{unknown_text(state)}"
+        elif kind.startswith("transport_"):
+            state = kind.removeprefix("transport_")
+            label = f"传输：{TRANSPORT_EVENT_LABELS.get(state) or unknown_text(state)}"
+        elif kind.startswith("report_") and kind.endswith("_saved") and len(kind) > len("report__saved"):
+            label = f"已提交汇报（{report_kind_text(kind[len('report_'):-len('_saved')])}），等待发起设备确认"
+        elif kind.startswith("report_"):
+            label = f"发起设备裁决：{unknown_text(kind.removeprefix('report_'))}"
+        else:
+            label = unknown_text(kind)
+    reason = detail.get("reason")
+    extra: object = "" if kind == "origin_reminded" and silent_minutes(detail) is not None else _fed_reason_text(reason)
+    if kind == "report_rejected" and "kind" in detail:
+        extra = "；".join(part for part in (str(extra), f"类别 {report_kind_text(detail.get('kind'))}") if part)
+    if kind == "notification_skipped" and reason in CAPACITY_CODES:
+        extra = notification_capacity_hint(str(reason))
+    elif kind == "review_skipped_capacity" and reason in CAPACITY_CODES:
+        extra = review_capacity_hint(str(reason))
+    return label, extra
 
 
 def _report_rows(rt: Runtime, task: FedTask) -> list[dict[str, Any]]:
@@ -619,8 +808,13 @@ def _report_rows(rt: Runtime, task: FedTask) -> list[dict[str, Any]]:
     return rows
 
 
-def task_document(rt: Runtime, task: FedTask, *, now: int, include_body: bool = False) -> dict[str, Any]:
-    """status/tasks --json 的联邦形状：scope=federation，不伪造本机进程字段。"""
+def task_document(rt: Runtime, task: FedTask, *, now: int, include_body: bool = False,
+                  events: bool = False) -> dict[str, Any]:
+    """status/tasks --json 的联邦形状：scope=federation，不伪造本机进程字段。
+
+    events=True 只给 status --json（§104.9 七）：本设备记录的时间线 events（50 条），权威设备另给每次尝试收到的
+    投递证据 evidence；tasks、send/retry/note 等复用本函数的输出不带这两项。
+    """
     attempts = display_attempts(rt, task)
     view = mirror.describe_view(task, attempts, device_id=rt.ident.device_id)
     document: dict[str, Any] = {
@@ -630,6 +824,11 @@ def task_document(rt: Runtime, task: FedTask, *, now: int, include_body: bool = 
         "lastSyncAt": task.last_sync_at, "syncRequired": task.sync_required, "archived": task.local_archived,
         "stalled": stalled(rt, task, now=now), "attempts": _attempt_rows(rt, attempts), "reports": _report_rows(rt, task),
     }
+    if events:
+        document["events"] = _event_rows(rt, task, TIMELINE_JSON_EVENTS)
+        if task.is_authority:
+            for row, attempt in zip(document["attempts"], attempts):
+                row["evidence"] = _evidence_rows(rt, attempt)
     follows = task.state.get("follows")
     if isinstance(follows, str):
         document["follows"] = follows  # 只在发起设备本机有（§93.3）；无关联时不出现该键
@@ -644,7 +843,7 @@ def task_document(rt: Runtime, task: FedTask, *, now: int, include_body: bool = 
 def _fyi_delivery(document: dict[str, Any]) -> str:
     """告知任务唯一那条 notice 的投递状态（联邦 L3 原值）。"""
     rows = document.get("attempts") or []
-    return str(rows[0].get("delivery", "pending")) if rows else "-"
+    return delivery_text(rows[0].get("delivery", "pending")) if rows else "-"
 
 
 _NETWORK_LABELS = {"ready": "待传", "submitting": "提交中", "accepted": "hub 已收", "received": "对端已落账",
@@ -666,12 +865,12 @@ def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False)
     age = max(0, (now - task.last_sync_at) // 1000)
     flags = ("；需同步" if task.sync_required else "") + ("；仅本机已归档" if task.local_archived else "")
     state = (f"{FYI_STATUS_LABEL}（{_fyi_delivery(document)}）" if task.is_fyi
-             else f"{PHASE_LABELS[view.phase]}（{reason_label(rt, task, view)}）")
-    lines = [f"跨设备任务 {short(task.task_id)}  {task.title}",
+             else f"{PHASE_LABELS[view.phase]}（{reason_label(rt, task, view, now / 1000.0)}）")
+    lines = [f"跨设备任务 {short(task.task_id)}  {title_text(task.title)}",
              f"  {role}；{state}；最近同步 {age} 秒前{flags}"]
     if document["stalled"]:
         lines.append("  需处理：远端离线/传输未恢复（待传超过 30 分钟；不改变任务状态）")
-    for row in document["attempts"]:
+    for row, attempt in zip(document["attempts"], display_attempts(rt, task)):
         network = _NETWORK_LABELS.get(str(row["network"]), "-")
         reported = "，对方已汇报" if row["receiverReported"] else ""
         causes = [str(row["deliveryReason"])] if row["deliveryReason"] else []
@@ -684,15 +883,24 @@ def task_lines(rt: Runtime, task: FedTask, *, now: int, show_body: bool = False)
         label = (f"{NOTE_LABEL} #{row['seq']}" if row.get("noticeKind") == "note"
                  else f"{FYI_LABEL} #{row['seq']}" if row.get("noticeKind") == "fyi" else f"#{row['seq']} {row['role']}")
         lines.append(f"  {label} → {device_text(row['targetDeviceName'])} {target_text(row['target'])}"
-                     f"  网络 {network}  投递 {row['delivery']}{cause}{reported}")
+                     f"  网络 {network}  投递 {delivery_text(row['delivery'])}{cause}{reported}")
         for item in row["attachments"]:
-            where = f" {item['path']}" if "path" in item else ""
+            # 落地路径：新落地的叶名已清洗；按旧规则落地的叶名可能带 C1/RLO/零宽等，显示时再转义一次（§103.8 修 2）
+            where = f" {remote_path(str(item['path'])) or ''}" if "path" in item else ""
             state = "已过留存期" if item["state"] == "expired" else item["state"]
-            lines.append(f"     附件 {item['name']}：{state}（{item['size']} B）{where}")
+            # 附件名来自发起方（镜像上即远端）：codec 只拒 0x20 以下控制字符，与其余远端字符串同一套转义（§103.3）
+            lines.append(f"     附件 {remote_display(item['name']) or ''}：{state}（{item['size']} B）{where}")
+        # 延迟投递（§104.9 二）：与本机同一判据 labels.deferred_due，到点后或在等自动重试时不写（§104.11 P3）
+        due = deferred_due(attempt.options, pending=row["delivery"] == "pending", now=now / 1000.0)
+        if due is not None:
+            lines.append(f"     {deferred_text(due)}")
     for row in document["reports"]:
         status = row["decision"] or "等待发起设备确认"
-        reason = f"（{row['reason']}）" if row["reason"] else ""
-        lines.append(f"  报告 #{row['attempt']}.{row['reportNo']} {row['kind']}：{status}{reason}")
+        reason = f"（{code_text(row['reason'])}）" if row["reason"] else ""
+        lines.append(f"  报告 #{row['attempt']}.{row['reportNo']} {report_kind_text(row['kind'])}：{status}{reason}")
+    # 时间线（§104.9 七）：本设备 fed_events 的记录，格式同本机；镜像端没有投递证据事件
+    lines.extend(timeline_lines(_event_rows(rt, task, TIMELINE_TEXT_EVENTS), describe=fed_event_text,
+                                note="本设备记录"))
     if show_body:
         lines.extend(["", str(document.get("body", ""))])
     # 本机联邦停用时 ab report 报 federation_disabled，判据与 cli._fed_lookup(write=True) 相同，不给汇报提示（§98 r1）

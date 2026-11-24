@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from ..ids import new_id
+from ..model import DELIVERY_NEEDS_ATTENTION
 from ..store import StoreError
 from . import attachments, budget, mirror, retention
 from .attachments import AttachmentError
@@ -266,6 +267,18 @@ class _Timers:
     sync_sent: dict[str, int] = field(default_factory=dict)
 
 
+# 需要发起方处理的投递状态（与 model.DELIVERY_NEEDS_ATTENTION 同一组）：B 回传这些证据时 A 立即叫醒 worker
+_ATTENTION_STATES = frozenset(delivery.value for delivery in DELIVERY_NEEDS_ATTENTION)
+
+
+def _needs_attention(envelope: dict[str, Any]) -> bool:
+    """delivery_status 信封里的证据状态是否属于需处理集合；形状不对一律 False（只决定叫不叫醒，不影响应用）。"""
+    data = envelope.get("data")
+    evidence = data.get("evidence") if isinstance(data, dict) else None
+    state = evidence.get("state") if isinstance(evidence, dict) else None
+    return isinstance(state, str) and state in _ATTENTION_STATES
+
+
 class Relay:
     """一个设备的 relay；`connect_and_run` 跑一条连接直到断开或停止。"""
 
@@ -494,10 +507,13 @@ class Relay:
         now = self._clock()
         uncertain = item["state"] == "submitting"
         state = "expired" if uncertain else "refused"
+        derived = False
         with self.store.transaction():
             if self.store.set_outbox_state(item["msg_id"], state=state, expected=("ready", "submitting"),
                                            receipt={"error": reason, "at": now, "uncertain": uncertain}):
-                mirror.transport_failed(self.store, self.ident, item, state=state, reason=reason, now=now)
+                derived = mirror.transport_failed(self.store, self.ident, item, state=state, reason=reason, now=now)
+        if derived:
+            self._wake_for_attention()
 
     def _settled_by_receipt(self, item: dict[str, Any], now: int) -> bool:
         """上次 submit 结果不明（submitting）：先按 msg_id 查 hub 收据，查到就照收据推进，不再重传附件或重交。"""
@@ -579,6 +595,7 @@ class Relay:
 
     def _apply_receipts(self, receipts: list[dict[str, Any]]) -> None:
         now = self._clock()
+        derived = False
         for receipt in receipts:
             target = _RECEIPT_TARGETS.get(str(receipt.get("state")))
             row = self.store.outbox_item(str(receipt.get("msgId")))
@@ -591,8 +608,11 @@ class Relay:
                                                                "reason": receipt.get("reason")})
                 if changed and state in ("rejected", "expired", "revoked"):
                     # 只有收件方持久 never-intent 拒绝是已证明未投；expired/revoked 只记事件（mirror 内区分）
-                    mirror.transport_failed(self.store, self.ident, row, state=state,
-                                            reason=str(receipt["reason"]) if receipt.get("reason") else None, now=now)
+                    derived = mirror.transport_failed(
+                        self.store, self.ident, row, state=state,
+                        reason=str(receipt["reason"]) if receipt.get("reason") else None, now=now) or derived
+        if derived:
+            self._wake_for_attention()
 
     def _poll_receipts(self) -> None:
         assert self.conn is not None
@@ -712,6 +732,8 @@ class Relay:
             self.conn.call("ack", msgId=msg_id, payloadHash=digest)
             return False
         self.conn.call("ack", msgId=msg_id, payloadHash=digest)
+        if envelope.get("kind") == "delivery_status" and _needs_attention(envelope):
+            self._wake_for_attention()
         return self.store.native(msg_id) is not None or envelope.get("kind") == "report"
 
     def _hub_reject_or_ack(self, msg_id: str, digest: str, reason: object) -> None:
@@ -885,6 +907,12 @@ class Relay:
             retention.sweep(self.store, self.paths, now=now)
         except (StoreError, OSError, AttachmentError):
             pass  # 回收失败只是晚点再删，不影响收发；下一小时重试
+
+    def _wake_for_attention(self) -> None:
+        """投递证据落在需处理集合、或 A 侧派生了 failed：立即叫醒 worker（DESIGN §103.2 立即告知、§103.7 面板刷新），
+        不等 15 秒的作业轮询；worker 启动时强制发布摘要。拉起失败或退避中由 on_work 自己处理，下个周期照常复查。"""
+        if not self._should_stop():
+            self._on_work()
 
     def _wake_if_needed(self) -> None:
         """有现在就能处理的作业时拉起 worker（拉起与退避由 on_work 负责，worker 已在跑时只探一下锁）。

@@ -201,7 +201,7 @@ class LocalDisplayTests(unittest.TestCase):
                                      f'状态同步：任务「合成任务」已由 {origin} 验收，协作结束。这不代表已部署或用户实机验收。'
                                      '不需要 ab report，也不用再给发起方发消息。')
                     changed = replace(task, flow=Flow.REVIEW, verdict=Verdict.CHANGES)
-                    retry = cli._rework_body(item, replace(item, role=Role.REVIEW), changed, None, names)
+                    retry = cli._rework_body(item, replace(item, role=Role.REVIEW), changed, None, names=names)
                     self.assertEqual(retry, f'【返工】\n复核方 {receiver} 要求修改。\n\n【原始任务要求】\n合成正文')
                     for generated in (header, notice, review, decider, retry):
                         for leaked in ('回复', 'vm claude', '〔', *(('w3-one', 'vm-claude') if case != 'named' else ())):

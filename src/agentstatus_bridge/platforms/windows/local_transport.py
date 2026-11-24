@@ -149,13 +149,19 @@ class DaemonStream:
         self.home: Path | None = None
         self.epoch: tuple[str, int, int, int] | None = None
         self.root: str | None = None
-        self.deadline = time.monotonic() + platform._budget.get()
+        # 总预算在构造时定下、之后不变；deadline 是当前这次 I/O 的截止（初值即总截止）
+        self.budget_deadline = time.monotonic() + platform._budget.get()
+        self.deadline = self.budget_deadline
 
     def settimeout(self, value: float) -> None:
-        if not 0 < value <= 600:
+        if not value > 0:  # 0、负数与 NaN：截止已过或值无效
             raise TimeoutError('windows_io_deadline')
-        # A later settimeout never renews the total budget.
-        self.deadline = min(self.deadline, time.monotonic() + value)
+        # 之后的 settimeout 从不续总预算；但一步的短时限只管这一步，不回写成整条流的截止
+        # （§103.1：steer 只读步骤的 15/30 秒曾被永久写进整条流，把能送达的补充消息变成 UNKNOWN）。
+        # 超过总预算的值截到总截止、不抛：调用方传的是「600 秒总截止 - now」，Windows 上 Python 3.12 的 monotonic
+        # 约 15.6 ms 才跳一次，同一 tick 内 (t0+600)-t0 可能比 600 多一个 ulp；原先「>600 就抛」会让投递在任何 I/O 之前
+        # 零耗时报 codex_deadline_before_send（§103.1 W3.18 现场 28 ms 失败的根因）
+        self.deadline = min(self.budget_deadline, time.monotonic() + value)
 
     def connect(self, target: Path) -> None:
         if self.handle is not None:
